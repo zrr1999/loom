@@ -1,0 +1,9 @@
+[project]
+name = "loom"
+
+[agent]
+inbox_plan_batch = 10
+task_batch = 1
+
+[threads]
+default_priority = 50

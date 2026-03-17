@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "loom"
+dynamic = ["version"]
+description = "A CLI tool where humans weave requirements and agents execute tasks."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "typer >= 0.15",
+    "pydantic >= 2.0",
+    "loguru >= 0.7",
+    "PyYAML >= 6.0",
+]
+
+[project.scripts]
+loom = "loom.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest >= 8.0",
+    "pytest-cov >= 6.0",
+    "syrupy >= 4.0",
+    "ty >= 0.0.23",
+]
+docs = [
+    "zensical >= 0.0.20",
+]
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loom"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "F",    # pyflakes
+  "I",    # isort
+  "UP",   # pyupgrade
+  "B",    # flake8-bugbear
+  "SIM",  # flake8-simplify
+  "C4",   # flake8-comprehensions
+  "FA",   # flake8-future-annotations
+  "PGH",  # pygrep-hooks
+  "RUF",  # ruff-specific rules
+  "YTT",  # flake8-2020
+  # "D",    # pydocstyle
+]
+ignore = ["D100", "D104", "D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "I002"]
+"tests/**" = ["D"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest]
+testpaths = ["tests"]
+addopts = ["-ra", "-q"]
+
+[tool.uv]
+default-groups = ["dev"]
