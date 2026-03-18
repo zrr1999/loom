@@ -20,16 +20,16 @@ Difference between `loom` and `loom review`:
 - `loom review`: non-interactive list of reviewing items only
 - `loom inbox`: interactive planning loop for pending inbox requirements
 
-- `paused`: choose `decide`, `skip`, `open`, or `detail`
-- `reviewing`: choose `accept`, `reject`, `skip`, `open`, or `detail`
-- `inbox`: choose `plan`, `skip`, `open`, or `detail`
+- `paused`: use compact keyed actions like `d`, `s`, `o`, or `?`
+- `reviewing`: use compact keyed actions like `a`, `r`, `s`, `o`, or `?`
+- `inbox`: use compact keyed actions like `p`, `s`, `o`, or `?`
 
 `loom init` ensures both `.loom/` and root `loom.toml` exist. It is idempotent. Pass `-g` to use the home-level loom workspace.
 
 ## Agent commands
 
 - `loom agent new-thread`
-- `loom agent new-task --thread AA`
+- `loom agent new-task --thread backend`
 - `loom agent next`
 - `loom agent start`
 - `loom agent spawn --manager`
@@ -46,7 +46,12 @@ Difference between `loom` and `loom review`:
 
 If `loom agent pause` is called without `--question`, it falls back to a small terminal wizard.
 
+`loom agent done` only sends work to `reviewing` when the task looks review-ready. If the task body or output still contains TODO markers, proposal-only output, or explicit follow-up-improvement notes, the command pauses the task instead and generates a decision block for the human queue.
+
 `loom agent next` first returns pending inbox items that should be planned into tasks, then returns ready tasks.
+
+- thread arguments still use human-facing thread names like `backend`
+- task ids shown in CLI output now use the short internal form like `thaa-001`
 
 - planning batch size comes from `agent.inbox_plan_batch` and defaults to `10`
 - ready-task batch size comes from `agent.task_batch` and defaults to `1`
@@ -59,6 +64,7 @@ If `loom agent pause` is called without `--question`, it falls back to a small t
 - `--retries <n>`: retry count when the action is idle
 
 By default (`0.0` seconds, `0` retries), behavior is unchanged: a single immediate check.
+Each retry re-checks both pending inbox planning work and ready tasks before the command finally returns `ACTION  idle`.
 
 Important: `loom agent next` is no longer read-only for task execution. It claims returned tasks for the current agent, but it still does not perform inbox-to-task planning for you.
 
@@ -70,9 +76,11 @@ That prompt includes a current-state summary, the practical command set for mana
 
 Global workspace guidance (`-g`) is only shown in `loom agent start` when global mode is currently active.
 
-Dedicated manager loop role definition lives at `.agents/roles/loom-loop.md`.
+Dedicated manager loop role definition lives at `roles/loom-manager.md`.
 
-For role-forge-style discovery in this repo, `roles.toml` points `roles_dir` to `.agents/roles`.
+The reviewer role definition lives at `roles/loom-reviewer.md`.
+
+Role generation/discovery settings for this repo live in `roles.toml`.
 
 Human commands keep two interactive surfaces separate:
 

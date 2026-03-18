@@ -6,7 +6,8 @@ from pathlib import Path
 
 from .config import config_path, load_settings
 from .frontmatter import read_model
-from .models import AgentRecord, InboxItem, ManagerRecord, Message, Task
+from .ids import split_task_id, task_filename
+from .models import AgentRecord, InboxItem, ManagerRecord, Message, Task, Thread
 from .runtime import resolve_root
 
 
@@ -40,6 +41,23 @@ def find_task_path(loom: Path, task_id: str) -> Path:
     if not threads_dir.exists():
         raise FileNotFoundError(f"task '{task_id}' not found")
 
+    parsed = split_task_id(task_id)
+    if parsed is not None:
+        thread_internal_id, seq = parsed
+        for thread_dir in sorted(threads_dir.iterdir()):
+            if not thread_dir.is_dir():
+                continue
+            meta_file = thread_dir / "_thread.md"
+            if not meta_file.exists():
+                continue
+            thread = read_model(meta_file, Thread)
+            if thread.id != thread_internal_id:
+                continue
+            path = thread_dir / task_filename(seq)
+            if path.exists():
+                return path
+            break
+
     for thread_dir in sorted(threads_dir.iterdir()):
         if not thread_dir.is_dir():
             continue
@@ -58,7 +76,7 @@ def load_task(loom: Path, task_id: str) -> tuple[Path, Task]:
 
 
 def task_file_path(loom: Path, task: Task) -> Path:
-    return loom / "threads" / task.thread / f"{task.id}.md"
+    return loom / "threads" / task.thread / task_filename(task.seq)
 
 
 def find_inbox_path(loom: Path, rq_id: str) -> Path:

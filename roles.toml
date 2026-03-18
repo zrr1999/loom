@@ -1,2 +1,31 @@
-[project]
-roles_dir = ".agents/roles"
+[targets.opencode]
+enabled = true
+output_dir = "."
+
+[targets.opencode.model_map]
+reasoning = "github-copilot/gpt-5.4"
+coding = "github-copilot/gpt-5.4"
+
+[targets.opencode.capability_map]
+context7 = { context7 = true }
+gh-search = { gh_grep = true }
+
+[targets.claude]
+enabled = true
+output_dir = "."
+
+[targets.claude.model_map]
+reasoning = "opus"
+coding = "sonnet"
+
+[targets.claude.capability_map]
+context7 = { context7 = true }
+gh-search = { gh_grep = true }
+
+[targets.copilot]
+enabled = true
+output_dir = "."
+
+[targets.copilot.model_map]
+reasoning = "GPT-5.4"
+coding = "GPT-5.4"

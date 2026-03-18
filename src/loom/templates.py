@@ -24,8 +24,8 @@ def thread_body() -> str:
 
 
 def task_body(background: str = "", implementation_direction: str = "") -> str:
-    background_text = background.strip() or "补充任务背景。"
-    implementation_text = implementation_direction.strip() or "补充实现方向。"
+    background_text = background.strip()
+    implementation_text = implementation_direction.strip()
     return f"## 背景\n\n{background_text}\n\n## 实现方向\n\n{implementation_text}"
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from datetime import date
 from enum import StrEnum
@@ -61,6 +62,18 @@ TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.PAUSED: {TaskStatus.SCHEDULED},
     TaskStatus.DONE: {TaskStatus.SCHEDULED},
 }
+
+REVIEW_INCOMPLETE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("TODOs", re.compile(r"(?im)(?:^|\b)TODO\b|^- \[ \]")),
+    ("proposal-only output", re.compile(r"(?im)\bproposal(?:-only)?\b|\btask proposal\b")),
+    (
+        "known follow-up improvements",
+        re.compile(
+            r"(?im)\b(?:known|needs|remaining|future|later)\s+"
+            r"(?:follow[- ]up|improvement|cleanup|work|pass)\b"
+        ),
+    ),
+)
 
 INBOX_TRANSITIONS: dict[InboxStatus, set[InboxStatus]] = {
     InboxStatus.PENDING: {InboxStatus.PLANNED, InboxStatus.MERGED},
@@ -160,7 +173,23 @@ class Task(BaseModel):
             msg = "Paused task must include a decision block"
             raise ValueError(msg)
 
+        if self.status == TaskStatus.REVIEWING:
+            blockers = find_review_blockers(self)
+            if blockers:
+                msg = f"Reviewing task must not include incomplete work markers: {', '.join(blockers)}"
+                raise ValueError(msg)
+
         return self
+
+
+def find_review_blockers(task: Task, *, output: str | None = None) -> list[str]:
+    combined_text = output if output is not None else (task.output or "")
+
+    blockers: list[str] = []
+    for label, pattern in REVIEW_INCOMPLETE_PATTERNS:
+        if pattern.search(combined_text):
+            blockers.append(label)
+    return blockers
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,15 @@ from typing import TYPE_CHECKING
 from .config import load_settings
 from .frontmatter import write_model
 from .history import append_event
-from .ids import next_agent_id, next_message_seq, next_task_seq, next_thread_id, slugify
+from .ids import (
+    canonical_thread_name,
+    next_agent_id,
+    next_message_seq,
+    next_task_seq,
+    next_thread_id,
+    task_filename,
+    task_id,
+)
 from .models import (
     AgentRecord,
     AgentRole,
@@ -24,6 +32,7 @@ from .models import (
     Task,
     TaskStatus,
     Thread,
+    find_review_blockers,
 )
 from .repository import (
     agent_dir,
@@ -64,23 +73,20 @@ def create_thread(
     *,
     name: str = "",
     priority: int = 50,
-    warn_duplicate: bool = True,
 ) -> tuple[Thread, Path, list[str]]:
-    """Return (thread, path, duplicate_ids) where duplicate_ids is non-empty if the name collides."""
+    """Create a thread with a human-facing name and a short internal id."""
     threads_dir = loom / "threads"
-    thread_id = next_thread_id(threads_dir)
-    thread_dir = threads_dir / thread_id
+    resolved_name = canonical_thread_name(name)
+    existing = load_all_threads(loom)
+    duplicate_ids = [thread.name for thread in existing.values() if thread.name == resolved_name]
+    if duplicate_ids:
+        raise ValueError(f"thread '{resolved_name}' already exists")
+
+    thread_dir = threads_dir / resolved_name
     thread_dir.mkdir(parents=True, exist_ok=False)
 
-    resolved_name = name or thread_id.lower()
-
-    duplicate_ids: list[str] = []
-    if warn_duplicate and name:
-        existing = load_all_threads(loom)
-        duplicate_ids = [t.id for t in existing.values() if t.name == resolved_name]
-
     thread = Thread(
-        id=thread_id,
+        id=next_thread_id(thread.id for thread in existing.values()),
         name=resolved_name,
         priority=priority,
         body=thread_body(),
@@ -91,8 +97,8 @@ def create_thread(
         loom,
         "thread.created",
         "thread",
-        thread.id,
-        {"name": thread.name, "priority": thread.priority},
+        thread.name,
+        {"id": thread.id, "priority": thread.priority},
     )
     return thread, path, duplicate_ids
 
@@ -271,14 +277,15 @@ def create_task(
     implementation_direction: str = "",
 ) -> tuple[Task, Path]:
     threads = load_all_threads(loom)
-    if thread_id not in threads:
-        raise FileNotFoundError(f"thread '{thread_id}' does not exist")
+    canonical_thread = canonical_thread_name(thread_id)
+    if canonical_thread not in threads:
+        raise FileNotFoundError(f"thread '{canonical_thread}' does not exist")
 
-    thread_dir = loom / "threads" / thread_id
+    thread_dir = loom / "threads" / canonical_thread
+    thread = threads[canonical_thread]
     seq = next_task_seq(thread_dir)
     normalized_title = title.strip() or f"task-{seq}"
-    slug = slugify(normalized_title)
-    task_id = f"{thread_id}-{seq:03d}-{slug or f'task-{seq}'}"
+    internal_task_id = task_id(thread.id, seq)
 
     normalized_acceptance = acceptance.strip()
     status = TaskStatus.SCHEDULED if normalized_acceptance else TaskStatus.DRAFT
@@ -293,8 +300,8 @@ def create_task(
             raise ValueError(f"depends_on references unknown task(s): {', '.join(missing)}")
 
     task = Task(
-        id=task_id,
-        thread=thread_id,
+        id=internal_task_id,
+        thread=canonical_thread,
         seq=seq,
         title=normalized_title,
         status=status,
@@ -304,7 +311,7 @@ def create_task(
         acceptance=normalized_acceptance or None,
         body=task_body(background=background, implementation_direction=implementation_direction),
     )
-    path = thread_dir / f"{task_id}.md"
+    path = thread_dir / task_filename(seq)
     write_model(path, task)
     append_event(
         loom,
@@ -339,7 +346,7 @@ def transition_task(
     if decision is not None:
         updates["decision"] = decision
 
-    updated = task.model_copy(update=updates)
+    updated = Task.model_validate(task.model_dump(mode="python") | updates)
     write_model(path, updated)
     append_event(
         loom,
@@ -349,6 +356,35 @@ def transition_task(
         {"from": task.status.value, "to": updated.status.value, "output": output, "rejection_note": rejection_note},
     )
     return path, updated
+
+
+def complete_task(loom: Path, task_id: str, *, output: str | None = None) -> tuple[Path, Task, list[str]]:
+    path, task = load_task(loom, task_id)
+    blockers = find_review_blockers(task, output=output)
+    if not blockers:
+        path, updated = transition_task(loom, task_id, TaskStatus.REVIEWING, output=output)
+        return path, updated, []
+
+    decision = Decision(
+        question=(
+            "This task still looks incomplete "
+            f"({', '.join(blockers)}). Should it return to scheduled for more work before review?"
+        ),
+        options=[
+            DecisionOption(
+                id="resume",
+                label="Resume implementation",
+                note="Return to scheduled and finish the remaining work before asking for review again.",
+            ),
+            DecisionOption(
+                id="split",
+                label="Split follow-up first",
+                note="Create or confirm follow-up work before this task can be reviewed.",
+            ),
+        ],
+    )
+    path, updated = transition_task(loom, task_id, TaskStatus.PAUSED, output=output, decision=decision)
+    return path, updated, blockers
 
 
 def claim_task(loom: Path, task_id: str, *, agent_id: str) -> tuple[Path, Task]:
@@ -422,15 +458,15 @@ def plan_inbox_item(loom: Path, rq_id: str) -> dict[str, object]:
             name="general",
             priority=settings.threads.default_priority,
         )
-        threads = {thread.id: thread}
-        created_thread_id = thread.id
+        threads = {thread.name: thread}
+        created_thread_id = thread.name
 
-    target_thread = max(threads.values(), key=lambda thread: (thread.priority, -ord(thread.id[0]), -ord(thread.id[1])))
+    target_thread = max(threads.values(), key=lambda thread: (thread.priority, thread.name))
     title = derive_task_title(item)
     acceptance = "- [ ] 覆盖需求描述中的核心行为\n- [ ] 产出可供人工验收的结果"
     task, path = create_task(
         loom,
-        thread_id=target_thread.id,
+        thread_id=target_thread.name,
         title=title,
         priority=target_thread.priority,
         acceptance=acceptance,
@@ -439,7 +475,8 @@ def plan_inbox_item(loom: Path, rq_id: str) -> dict[str, object]:
         implementation_direction=f"围绕 {item.id} 先拆出第一条可执行任务, 后续再继续细化。",
     )
 
-    planned_to = [*item.planned_to, task.id]
+    planned_link = f"{task.thread}/{task.id}"
+    planned_to = [*item.planned_to, planned_link]
     updated_item = item.model_copy(update={"status": InboxStatus.PLANNED, "planned_to": planned_to})
     write_model(inbox_path, updated_item)
     append_event(
@@ -453,7 +490,7 @@ def plan_inbox_item(loom: Path, rq_id: str) -> dict[str, object]:
     return {
         "rq_id": item.id,
         "status": updated_item.status.value,
-        "planned_to": task.id,
+        "planned_to": planned_link,
         "created_thread": created_thread_id,
         "tasks": [{"id": task.id, "file": str(path)}],
     }

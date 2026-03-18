@@ -10,3 +10,8 @@ build/
 __pycache__/
 *.pyc
 .loom/
+
+.claude/
+.agents/
+.opencode/
+.github/agents/

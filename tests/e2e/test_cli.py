@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from loom.cli import app
+from loom.models import Task, TaskStatus
 
 
 def test_init_creates_default_structure(runner, isolated_project):
@@ -50,7 +51,8 @@ def test_happy_path_lifecycle_and_status_summary(runner, isolated_project):
 
     thread_result = runner.invoke(app, ["agent", "new-thread", "--name", "backend", "--priority", "90"], env=env)
     assert thread_result.exit_code == 0, thread_result.output
-    assert "CREATED thread AA" in thread_result.output
+    assert "CREATED thread backend" in thread_result.output
+    assert "id       : thaa" in thread_result.output
 
     task_result = runner.invoke(
         app,
@@ -58,7 +60,7 @@ def test_happy_path_lifecycle_and_status_summary(runner, isolated_project):
             "agent",
             "new-task",
             "--thread",
-            "AA",
+            "backend",
             "--title",
             "实现 token 刷新接口",
             "--acceptance",
@@ -71,21 +73,26 @@ def test_happy_path_lifecycle_and_status_summary(runner, isolated_project):
     assert task_result.exit_code == 0, task_result.output
     assert "CREATED task" in task_result.output
     assert "status : scheduled" in task_result.output
-    # extract task_id from output: "CREATED task AA-001-..."
+    # extract task_id from output: "CREATED task thaa-001"
     task_id = task_result.output.splitlines()[0].split()[-1]
+    assert task_id == "thaa-001"
 
-    task_file = isolated_project / ".loom" / "threads" / "AA" / f"{task_id}.md"
+    task_file = isolated_project / ".loom" / "threads" / "backend" / "001.md"
     task_content = task_file.read_text(encoding="utf-8")
+    assert "id: thaa-001" in task_content
     assert "status: scheduled" in task_content
     assert "created_from:" in task_content
     assert "- RQ-001" in task_content
     assert "## 背景" in task_content
+    assert "## 实现方向" in task_content
+    assert "补充任务背景。" not in task_content
+    assert "补充实现方向。" not in task_content
 
     next_result = runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=env)
     assert next_result.exit_code == 0, next_result.output
     assert "ACTION  task" in next_result.output
     assert task_id in next_result.output
-    assert "none: false" in next_result.output
+    assert "none:" not in next_result.output
 
     done_result = runner.invoke(app, ["agent", "done", task_id, "--output", "./output/demo"], env=env)
     assert done_result.exit_code == 0, done_result.output
@@ -107,6 +114,55 @@ def test_happy_path_lifecycle_and_status_summary(runner, isolated_project):
     assert "done" in status_result.output
 
 
+def test_agent_done_pauses_incomplete_work_with_decision_request(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    env = {"LOOM_AGENT_ID": "x7k2"}
+    assert runner.invoke(app, ["agent", "new-thread", "--name", "backend"], env=env).exit_code == 0
+
+    task_result = runner.invoke(
+        app,
+        [
+            "agent",
+            "new-task",
+            "--thread",
+            "backend",
+            "--title",
+            "Incomplete task",
+            "--acceptance",
+            "- [ ] ready",
+        ],
+        env=env,
+    )
+    assert task_result.exit_code == 0, task_result.output
+    task_id = task_result.output.splitlines()[0].split()[-1]
+
+    claim_result = runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=env)
+    assert claim_result.exit_code == 0, claim_result.output
+    assert task_id in claim_result.output
+
+    done_result = runner.invoke(
+        app,
+        ["agent", "done", task_id, "--output", "proposal-only summary\nTODO: finish tests"],
+        env=env,
+    )
+    assert done_result.exit_code == 0, done_result.output
+    assert f"DONE task {task_id}" in done_result.output
+    assert "paused" in done_result.output
+    assert "blocked: TODOs, proposal-only output" in done_result.output
+    assert "Waiting for human decision" in done_result.output
+
+    review_result = runner.invoke(app, ["review"])
+    assert review_result.exit_code == 0, review_result.output
+    assert "No tasks in reviewing status." in review_result.output
+
+    task_content = (isolated_project / ".loom" / "threads" / "backend" / "001.md").read_text(encoding="utf-8")
+    assert "status: paused" in task_content
+    assert "output: 'proposal-only summary" in task_content
+    assert "This task still looks incomplete (TODOs, proposal-only output)." in task_content
+    assert "id: resume" in task_content
+    assert "id: split" in task_content
+
+
 def test_pause_decide_and_queue_listing(runner, isolated_project):
     assert runner.invoke(app, ["init"]).exit_code == 0
     env = {"LOOM_AGENT_ID": "x7k2"}
@@ -117,7 +173,7 @@ def test_pause_decide_and_queue_listing(runner, isolated_project):
             "agent",
             "new-task",
             "--thread",
-            "AA",
+            "backend",
             "--title",
             "OAuth provider selection",
             "--acceptance",
@@ -152,7 +208,7 @@ def test_pause_decide_and_queue_listing(runner, isolated_project):
 
     decide_result = runner.invoke(app, ["decide", task_id, "A"])
     assert decide_result.exit_code == 0, decide_result.output
-    task_content = (isolated_project / ".loom" / "threads" / "AA" / f"{task_id}.md").read_text(encoding="utf-8")
+    task_content = (isolated_project / ".loom" / "threads" / "backend" / "001.md").read_text(encoding="utf-8")
     assert "decided: A" in task_content
     assert "status: scheduled" in task_content
 
@@ -167,7 +223,7 @@ def test_pause_command_requires_question_flag(runner, isolated_project):
             "agent",
             "new-task",
             "--thread",
-            "AA",
+            "backend",
             "--title",
             "Need decision",
             "--acceptance",
@@ -199,7 +255,7 @@ def test_next_returns_plan_action_when_inbox_pending(runner, isolated_project):
     assert "ACTION  plan" in result.output
     assert "RQ-001" in result.output
     assert "loom agent new-thread" in result.output
-    assert "none: false" in result.output
+    assert "none:" not in result.output
 
     inbox_content = (isolated_project / ".loom" / "inbox" / "RQ-001.md").read_text(encoding="utf-8")
     assert "status: pending" in inbox_content
@@ -216,7 +272,7 @@ def test_default_queue_interactive_flow_handles_paused_and_reviewing_only(runner
             "agent",
             "new-task",
             "--thread",
-            "AA",
+            "backend",
             "--title",
             "Paused task",
             "--acceptance",
@@ -232,7 +288,7 @@ def test_default_queue_interactive_flow_handles_paused_and_reviewing_only(runner
             "agent",
             "new-task",
             "--thread",
-            "AA",
+            "backend",
             "--title",
             "Review task",
             "--acceptance",
@@ -273,18 +329,18 @@ def test_default_queue_interactive_flow_handles_paused_and_reviewing_only(runner
     result = runner.invoke(
         app,
         [],
-        input="detail\ndecide\nA\ndetail\nreject\nNeed fixes\n",
+        input="?\nd\nA\n?\nr\nNeed fixes\n",
     )
 
     assert result.exit_code == 0, result.output
+    assert "Paused task action [d / S / o / ?]" in result.output
+    assert "Reviewing task action [a / r / S / o / ?]" in result.output
     assert "Queue summary:" in result.output
     assert "decided: 1" in result.output
     assert "rejected: 1" in result.output
 
-    paused_content = (isolated_project / ".loom" / "threads" / "AA" / f"{paused_id}.md").read_text(encoding="utf-8")
-    reviewing_content = (isolated_project / ".loom" / "threads" / "AA" / f"{reviewing_id}.md").read_text(
-        encoding="utf-8"
-    )
+    paused_content = (isolated_project / ".loom" / "threads" / "backend" / "001.md").read_text(encoding="utf-8")
+    reviewing_content = (isolated_project / ".loom" / "threads" / "backend" / "002.md").read_text(encoding="utf-8")
     inbox_content = (isolated_project / ".loom" / "inbox" / "RQ-001.md").read_text(encoding="utf-8")
 
     assert "decided: A" in paused_content
@@ -305,6 +361,156 @@ def test_default_queue_ignores_pending_inbox_items(runner, isolated_project):
     assert "loom inbox add" in result.output
 
 
+def test_status_migrates_legacy_thread_ids_and_rewrites_references(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    legacy_thread_dir = isolated_project / ".loom" / "threads" / "AA"
+    legacy_thread_dir.mkdir(parents=True)
+    (legacy_thread_dir / "_thread.md").write_text(
+        ("---\nid: AA\nname: backend\npriority: 50\ncreated: '2026-03-18'\n---\n\n## 目标\n\nlegacy\n"),
+        encoding="utf-8",
+    )
+    (legacy_thread_dir / "AA-001-demo.md").write_text(
+        (
+            "---\n"
+            "id: AA-001-demo\n"
+            "thread: AA\n"
+            "seq: 1\n"
+            "title: Demo\n"
+            "status: scheduled\n"
+            "priority: 50\n"
+            "depends_on: []\n"
+            "created_from: []\n"
+            "created: '2026-03-18'\n"
+            "acceptance: '- [ ] ready'\n"
+            "---\n\n"
+            "## 背景\n\nlegacy\n\n## 实现方向\n\nlegacy\n"
+        ),
+        encoding="utf-8",
+    )
+    (legacy_thread_dir / "AA-002-follow-up.md").write_text(
+        (
+            "---\n"
+            "id: AA-002-follow-up\n"
+            "thread: AA\n"
+            "seq: 2\n"
+            "title: Follow up\n"
+            "status: scheduled\n"
+            "priority: 50\n"
+            "depends_on:\n"
+            "  - AA-001-demo\n"
+            "created_from: []\n"
+            "created: '2026-03-18'\n"
+            "acceptance: '- [ ] ready'\n"
+            "---\n\n"
+            "## 背景\n\nlegacy\n\n## 实现方向\n\nlegacy\n"
+        ),
+        encoding="utf-8",
+    )
+    (isolated_project / ".loom" / "inbox" / "RQ-001.md").write_text(
+        (
+            "---\n"
+            "id: RQ-001\n"
+            "created: '2026-03-18'\n"
+            "status: planned\n"
+            "planned_to:\n"
+            "  - AA-001-demo\n"
+            "---\n\n"
+            "Legacy request\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0, result.output
+    backend_dir = isolated_project / ".loom" / "threads" / "backend"
+    assert backend_dir.is_dir()
+    assert not legacy_thread_dir.exists()
+    assert (backend_dir / "_thread.md").exists()
+    assert "id: thaa" in (backend_dir / "_thread.md").read_text(encoding="utf-8")
+
+    first_task = backend_dir / "001.md"
+    second_task = backend_dir / "002.md"
+    assert first_task.exists()
+    assert second_task.exists()
+    assert "id: thaa-001" in first_task.read_text(encoding="utf-8")
+    assert "thread: backend" in first_task.read_text(encoding="utf-8")
+    assert "depends_on:" in second_task.read_text(encoding="utf-8")
+    assert "- thaa-001" in second_task.read_text(encoding="utf-8")
+    assert "- backend/thaa-001" in (isolated_project / ".loom" / "inbox" / "RQ-001.md").read_text(encoding="utf-8")
+
+
+def test_default_queue_does_not_repeat_processed_items_on_next_run(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    env = {"LOOM_AGENT_ID": "x7k2"}
+    assert runner.invoke(app, ["agent", "new-thread", "--name", "backend"], env=env).exit_code == 0
+
+    paused_task = runner.invoke(
+        app,
+        [
+            "agent",
+            "new-task",
+            "--thread",
+            "backend",
+            "--title",
+            "Paused task",
+            "--acceptance",
+            "- [ ] paused",
+        ],
+        env=env,
+    )
+    paused_id = paused_task.output.splitlines()[0].split()[-1]
+
+    reviewing_task = runner.invoke(
+        app,
+        [
+            "agent",
+            "new-task",
+            "--thread",
+            "backend",
+            "--title",
+            "Review task",
+            "--acceptance",
+            "- [ ] review",
+        ],
+        env=env,
+    )
+    reviewing_id = reviewing_task.output.splitlines()[0].split()[-1]
+
+    assert runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=env).exit_code == 0
+    assert (
+        runner.invoke(
+            app,
+            [
+                "agent",
+                "pause",
+                paused_id,
+                "--question",
+                "Ship now?",
+                "--options",
+                '[{"id":"A","label":"Yes","note":"ship it"}]',
+            ],
+            env=env,
+        ).exit_code
+        == 0
+    )
+    assert runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=env).exit_code == 0
+    assert runner.invoke(app, ["agent", "done", reviewing_id], env=env).exit_code == 0
+
+    first_run = runner.invoke(app, [], input="d\nA\na\n")
+    assert first_run.exit_code == 0, first_run.output
+    assert "Queue summary:" in first_run.output
+    assert "decided: 1" in first_run.output
+    assert "accepted: 1" in first_run.output
+
+    second_run = runner.invoke(app, [])
+    assert second_run.exit_code == 0, second_run.output
+    assert "No pending approvals." in second_run.output
+    assert paused_id not in second_run.output
+    assert reviewing_id not in second_run.output
+
+
 def test_inbox_command_without_subcommand_runs_interactive_planning(runner, isolated_project):
     assert runner.invoke(app, ["init"]).exit_code == 0
     assert runner.invoke(app, ["inbox", "add", "Add OAuth login"]).exit_code == 0
@@ -312,6 +518,7 @@ def test_inbox_command_without_subcommand_runs_interactive_planning(runner, isol
     result = runner.invoke(app, ["inbox"], input="\n")
 
     assert result.exit_code == 0, result.output
+    assert "Inbox item action [P / s / o / ?]" in result.output
     assert "[inbox] RQ-001:" in result.output
     assert "Planned RQ-001 ->" in result.output
     assert "Inbox planning summary:" in result.output
@@ -344,7 +551,7 @@ def test_scheduler_respects_dependencies_and_thread_priority(runner, isolated_pr
                 "agent",
                 "new-task",
                 "--thread",
-                "AA",
+                "backend",
                 "--title",
                 "backend base",
                 "--acceptance",
@@ -363,7 +570,7 @@ def test_scheduler_respects_dependencies_and_thread_priority(runner, isolated_pr
                 "agent",
                 "new-task",
                 "--thread",
-                "AB",
+                "frontend",
                 "--title",
                 "frontend shell",
                 "--acceptance",
@@ -382,7 +589,7 @@ def test_scheduler_respects_dependencies_and_thread_priority(runner, isolated_pr
                 "agent",
                 "new-task",
                 "--thread",
-                "AA",
+                "backend",
                 "--title",
                 "backend follow-up",
                 "--acceptance",
@@ -420,7 +627,7 @@ def test_agent_next_prioritizes_planning_pending_inbox_items(runner, isolated_pr
     assert "RQ-001" in result.output
     assert "RQ-002" in result.output
     assert "loom agent new-thread" in result.output
-    assert "none: false" in result.output
+    assert "none:" not in result.output
     inbox_content = (isolated_project / ".loom" / "inbox" / "RQ-001.md").read_text(encoding="utf-8")
     assert "status: pending" in inbox_content
 
@@ -470,7 +677,7 @@ def test_agent_next_returns_multiple_ready_tasks_when_configured(runner, isolate
                 "agent",
                 "new-task",
                 "--thread",
-                "AA",
+                "backend",
                 "--title",
                 "Task one",
                 "--acceptance",
@@ -488,7 +695,7 @@ def test_agent_next_returns_multiple_ready_tasks_when_configured(runner, isolate
                 "agent",
                 "new-task",
                 "--thread",
-                "AA",
+                "backend",
                 "--title",
                 "Task two",
                 "--acceptance",
@@ -524,6 +731,7 @@ def test_agent_next_idle_default_does_not_sleep(runner, isolated_project, monkey
     assert result.exit_code == 0, result.output
     assert "ACTION  idle" in result.output
     assert called["sleep"] == 0
+    assert "none:" not in result.output
 
 
 def test_agent_next_wait_retries_cli_overrides(runner, isolated_project, monkeypatch):
@@ -544,6 +752,51 @@ def test_agent_next_wait_retries_cli_overrides(runner, isolated_project, monkeyp
     assert result.exit_code == 0, result.output
     assert "ACTION  idle" in result.output
     assert sleeps == [0.25, 0.25]
+    assert "none:" not in result.output
+
+
+def test_agent_next_wait_retries_stop_when_work_appears(runner, isolated_project, monkeypatch):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    task = Task(
+        id="backend-001-late-work",
+        thread="backend",
+        seq=1,
+        title="Late work",
+        status=TaskStatus.SCHEDULED,
+        acceptance="- [ ] done",
+    )
+    attempts = {"tasks": 0}
+    sleeps: list[float] = []
+
+    def fake_pending_inbox_items(*_args, **_kwargs):
+        return []
+
+    def fake_get_next_tasks(*_args, **_kwargs):
+        attempts["tasks"] += 1
+        if attempts["tasks"] < 3:
+            return []
+        return [task]
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("loom.agent.get_pending_inbox_items", fake_pending_inbox_items)
+    monkeypatch.setattr("loom.agent.get_next_tasks", fake_get_next_tasks)
+    monkeypatch.setattr("loom.agent.time.sleep", fake_sleep)
+
+    result = runner.invoke(
+        app,
+        ["agent", "next", "--wait-seconds", "0.25", "--retries", "5", "--manager"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "ACTION  task" in result.output
+    assert "backend-001-late-work" in result.output
+    assert attempts["tasks"] == 3
+    assert sleeps == [0.25, 0.25]
+    assert "ACTION  idle" not in result.output
+    assert "none:" not in result.output
 
 
 def test_agent_next_wait_retries_uses_config_defaults(runner, isolated_project, monkeypatch):
@@ -572,6 +825,7 @@ def test_agent_next_wait_retries_uses_config_defaults(runner, isolated_project, 
     assert result.exit_code == 0, result.output
     assert "ACTION  idle" in result.output
     assert sleeps == [0.1, 0.1, 0.1]
+    assert "none:" not in result.output
 
 
 def test_log_shows_recorded_events(runner, isolated_project):
@@ -584,7 +838,7 @@ def test_log_shows_recorded_events(runner, isolated_project):
             "agent",
             "new-task",
             "--thread",
-            "AA",
+            "backend",
             "--title",
             "Record event",
             "--acceptance",
@@ -603,7 +857,7 @@ def test_log_shows_recorded_events(runner, isolated_project):
     result = runner.invoke(app, ["log"])
 
     assert result.exit_code == 0, result.output
-    assert "thread.created thread:AA" in result.output
+    assert "thread.created thread:backend" in result.output
     assert f"task.created task:{task_id}" in result.output
     assert f"task.transitioned task:{task_id}" in result.output
 
@@ -620,7 +874,10 @@ def test_agent_start_returns_loop_prompt(runner, isolated_project):
     assert "loom agent next" in result.output
     assert "done <task-id>" in result.output
     assert "pause <task-id>" in result.output
-    assert "WORKSPACE" in result.output
+    assert "ESSENTIAL COMMANDS" in result.output
+    assert "COMMAND REFERENCE" not in result.output
+    assert "WORKSPACE" not in result.output
+    assert "loom agent checkpoint" not in result.output
     assert "Global mode is active (-g)." not in result.output
 
 
@@ -660,7 +917,7 @@ def test_global_flag_uses_home_directory(runner, isolated_project, monkeypatch):
 def test_spawn_whoami_checkpoint_resume_and_inbox_flow(runner, isolated_project):
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    spawn_result = runner.invoke(app, ["agent", "spawn", "--threads", "AA,AB"])
+    spawn_result = runner.invoke(app, ["agent", "spawn", "--threads", "backend,frontend"])
     assert spawn_result.exit_code == 0, spawn_result.output
     assert "SPAWNED agent" in spawn_result.output
     assert "Executor environment file" in spawn_result.output
@@ -728,20 +985,19 @@ def test_spawn_uses_configured_executor_command(runner, isolated_project):
         encoding="utf-8",
     )
 
-    result = runner.invoke(app, ["agent", "spawn", "--threads", "AA"])
+    result = runner.invoke(app, ["agent", "spawn", "--threads", "backend"])
 
     assert result.exit_code == 0, result.output
     agent_id = result.output.splitlines()[0].split()[-1]
+    env_path = isolated_project / ".loom" / "agents" / agent_id / f"{agent_id}.env"
+    inline_command = (
+        f"LOOM_AGENT_ID={agent_id} LOOM_DIR={isolated_project / '.loom'} "
+        f"LOOM_THREADS=backend opencode run --loom-agent {agent_id}"
+    )
     assert "Configured executor command" in result.output
     assert f"opencode run --loom-agent {agent_id}" in result.output
-    assert (
-        f"source {isolated_project / '.loom' / 'agents' / agent_id / f'{agent_id}.env'} && opencode run --loom-agent {agent_id}"
-        in result.output
-    )
-    assert (
-        f"LOOM_AGENT_ID={agent_id} LOOM_DIR={isolated_project / '.loom'} LOOM_THREADS=AA opencode run --loom-agent {agent_id}"
-        in result.output
-    )
+    assert f"source {env_path} && opencode run --loom-agent {agent_id}" in result.output
+    assert inline_command in result.output
 
 
 def test_agent_commands_require_agent_id_without_manager_flag(runner, isolated_project):
@@ -759,7 +1015,7 @@ def test_agent_commands_allow_manager_override(runner, isolated_project):
     result = runner.invoke(app, ["agent", "new-thread", "--name", "backend", "--manager"])
 
     assert result.exit_code == 0, result.output
-    assert "CREATED thread AA" in result.output
+    assert "CREATED thread backend" in result.output
 
 
 def test_agent_next_shows_ready_tasks_for_manager_without_claiming(runner, isolated_project):
@@ -771,7 +1027,7 @@ def test_agent_next_shows_ready_tasks_for_manager_without_claiming(runner, isola
             "agent",
             "new-task",
             "--thread",
-            "AA",
+            "backend",
             "--title",
             "Manager claimed task",
             "--acceptance",
@@ -786,10 +1042,10 @@ def test_agent_next_shows_ready_tasks_for_manager_without_claiming(runner, isola
     assert "ACTION  task" in out
     assert "ACTOR   manager" in out
     assert "READY TASKS" in out
-    assert "loom agent spawn [--threads <AA,AB>]" in out
+    assert "loom agent spawn [--threads <backend,frontend>]" in out
     assert task_id in out
 
-    task_content = (isolated_project / ".loom" / "threads" / "AA" / f"{task_id}.md").read_text(encoding="utf-8")
+    task_content = (isolated_project / ".loom" / "threads" / "backend" / "001.md").read_text(encoding="utf-8")
     assert "status: scheduled" in task_content
 
 

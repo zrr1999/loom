@@ -48,6 +48,7 @@
 ## Contributor conventions
 
 - Update docs when behavior changes: at minimum check `README.md`, `docs/reference/cli.md`, and `docs/reference/data-model.md`
+- Keep `docs/` and `docs/reference/` for stable product/user documentation; put design notes, proposals, and other evolving planning material under `design/`
 - Update `tests/e2e/test_cli.py` when command output or flow changes
 - Prefer preserving existing plain-text CLI output shape unless the task explicitly changes it
 - Use `just format`, `just check`, and `just test` before wrapping up code changes

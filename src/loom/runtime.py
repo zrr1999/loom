@@ -14,7 +14,7 @@ def set_root(root: Path | None) -> None:
 
 
 def is_global_mode_active() -> bool:
-    return _ROOT_OVERRIDE == global_root()
+    return global_root() == _ROOT_OVERRIDE
 
 
 def resolve_root(root: Path | None = None) -> Path:

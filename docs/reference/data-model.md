@@ -10,21 +10,27 @@
 
 - raw requirement text
 - `status`: `pending | planned | merged`
-- `planned_to`: generated task ID string
+- `planned_to`: generated task reference string (`<thread-name>/<task-id>`)
 
-## `.loom/threads/<ID>/_thread.md`
+## `.loom/threads/<thread-name>/_thread.md`
 
+- `id`: short internal thread id (`thaa`, `thab`, ...)
+- `name`: stable human-facing thread directory name
 - thread strategy: `sequential | parallel`
 - cross-thread priority
 
-## `.loom/threads/<ID>/<task>.md`
+## `.loom/threads/<thread-name>/<seq>.md`
 
+- filename is only the per-thread sequence (`001.md`, `002.md`, ...)
+- `id`: global task id composed as `<thread-id>-<seq>` (for example `thaa-001`)
 - `status`: `draft | scheduled | claimed | reviewing | paused | done`
 - `depends_on`: cross-thread task dependencies
 - `created_from`: source inbox IDs
 - `claim`: agent id + claim timestamp while claimed
 - `acceptance`: required before entering `scheduled`
 - `decision`: required while `paused`
+- `reviewing`: rejected for tasks whose body/output still advertises TODOs, proposal-only output, or known follow-up improvements
+- task markdown keeps `## 背景` / `## 实现方向` sections, but leaves them empty unless real context is provided
 
 ## `.loom/agents/`
 

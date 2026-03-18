@@ -11,12 +11,14 @@ from typing import TYPE_CHECKING
 import typer
 
 from .config import load_settings
-from .models import AgentStatus, MessageType, Task, TaskStatus
+from .migration import ensure_name_based_threads
+from .models import AgentStatus, MessageType, Task
 from .repository import agent_pending_dir, load_message, load_task, require_loom, task_file_path, workspace_root
 from .runtime import global_root, is_global_mode_active, set_root
 from .scheduler import get_next_tasks, get_pending_inbox_items, get_status_summary
 from .services import (
     claim_task,
+    complete_task,
     create_message,
     create_task,
     create_thread,
@@ -26,7 +28,6 @@ from .services import (
     resume_agent,
     spawn_agent,
     touch_agent,
-    transition_task,
     update_checkpoint,
 )
 from .state import InvalidTransitionError
@@ -55,7 +56,9 @@ def _emit_error(message: str, *, code: str = "error") -> None:
 
 def _resolve_loom() -> Path:
     try:
-        return require_loom()
+        loom = require_loom()
+        ensure_name_based_threads(loom)
+        return loom
     except FileNotFoundError as exc:
         _emit_error(str(exc), code="loom_not_found")
         raise  # unreachable; satisfies type checker
@@ -140,7 +143,7 @@ def new_thread(
     priority: int = typer.Option(50, help="Thread priority."),
     manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
 ) -> None:
-    """Create a new thread with auto-assigned letter ID."""
+    """Create a new thread with an auto-assigned short internal id."""
     loom = _resolve_loom()
     _touch_if_agent(loom, _resolve_actor(manager=manager))
 
@@ -151,8 +154,8 @@ def new_thread(
         raise  # unreachable
 
     lines = [
-        f"CREATED thread {thread.id}",
-        f"  name     : {thread.name}",
+        f"CREATED thread {thread.name}",
+        f"  id       : {thread.id}",
         f"  priority : {thread.priority}",
         f"  path     : {path.parent}",
     ]
@@ -163,7 +166,7 @@ def new_thread(
 
 @app.command("new-task")
 def new_task(
-    thread: str = typer.Option(..., "--thread", help="Thread ID (e.g. AA)."),
+    thread: str = typer.Option(..., "--thread", help="Canonical thread name (e.g. backend)."),
     title: str = typer.Option("", help="Task title."),
     priority: int = typer.Option(50, help="Task priority."),
     acceptance: str = typer.Option("", help="Acceptance criteria."),
@@ -278,7 +281,6 @@ def next_task(
             "  3. Run: loom agent new-task --thread <id> --title '<title>' --acceptance '<criteria>' --manager",
             "  4. Repeat `loom agent next --manager` after all requirements above are arranged.",
             "",
-            "none: false",
         ]
         typer.echo("\n".join(lines))
         return
@@ -303,8 +305,6 @@ def next_task(
                 lines.append(f"  paused    : {paused_count} (human must decide)")
             if inbox_pending:
                 lines.append(f"  inbox     : {inbox_pending} pending items")
-        lines.append("")
-        lines.append("none: true")
         typer.echo("\n".join(lines))
         return
 
@@ -321,11 +321,10 @@ def next_task(
             "READY TASKS",
             *task_lines,
             "Manager next steps:",
-            "  1. Start or wake a worker agent if needed: loom agent spawn [--threads <AA,AB>]",
+            "  1. Start or wake a worker agent if needed: loom agent spawn [--threads <backend,frontend>]",
             "  2. Tell the worker to run `loom agent next` in its own executor environment.",
             "  3. Keep using `loom agent status` to monitor ready / paused / reviewing work.",
             "",
-            "none: false",
         ]
         typer.echo("\n".join(lines))
         return
@@ -348,15 +347,13 @@ def next_task(
         "",
         "If blocked and need a decision:",
         "  loom agent pause <task-id> --question '<question>'",
-        "",
-        "none: false",
     ]
     typer.echo("\n".join(lines))
 
 
 @app.command("start")
 def start() -> None:
-    """Print the manager bootstrap guide (identity, loop, command reference)."""
+    """Print the manager bootstrap guide."""
     _require_manager_context("start")
 
     loom = _resolve_loom()
@@ -388,8 +385,7 @@ def start() -> None:
         "",
         "IDENTITY",
         "  role           : manager",
-        f"  LOOM_DIR       : {loom_dir_env or str(loom)}",
-        f"  loom dir       : {loom}",
+        f"  loom dir       : {loom_dir_env or str(loom)}",
         "",
         *state_summary,
         "",
@@ -407,7 +403,7 @@ def start() -> None:
         "",
         "      If output starts with ACTION  task:",
         "        Execute every claimed task that was returned.",
-        "        While working, record checkpoints and finish with done.",
+        "        Finish each completed task with done.",
         "        If blocked on a human decision, pause the task.",
         "        After handling all returned tasks, run loom agent next --manager again.",
         "",
@@ -415,87 +411,26 @@ def start() -> None:
         "        No executable work is ready right now.",
         "        Inspect the waiting-on section, then wait or exit.",
         "",
-        "    STEP 2 — during task execution",
-        "      Progress: loom agent checkpoint --phase <phase> '<summary>' --manager",
-        "      Blocked : loom agent pause <task-id> --question '<q>' --manager",
-        "      Finished: loom agent done <task-id> --output <path> --manager",
+        "ESSENTIAL COMMANDS",
         "",
-        "COMMAND REFERENCE",
-        "",
-        "  loom agent next [--thread <id>] [--wait-seconds <n>] [--retries <n>] [--manager]",
-        "    Returns the next action. Side-effect: claimed tasks are immediately",
-        "    set to status=claimed.",
+        "  loom agent next --manager",
+        "    Fetch planning work or the next ready task batch.",
         f"    Planning batch : {settings.agent.inbox_plan_batch} inbox items",
         f"    Task batch     : {settings.agent.task_batch} tasks",
         f"    Idle wait      : {settings.agent.next_wait_seconds}s between retries",
         f"    Idle retries   : {settings.agent.next_retries}",
         "",
-        "  loom agent done <task-id> [--output <path-or-url>]",
-        "    Mark task as reviewing (ready for human acceptance).",
-        "    task-id is REQUIRED — never infer from context.",
+        "  loom agent done <task-id> --output <path-or-url>",
+        "    Mark a finished task as reviewing, or pause it if incomplete markers remain.",
         "",
-        "  loom agent pause <task-id> --question '<question>' [--options '<json>']",
-        "    Pause task and record decision request. Releases claimed lock.",
-        "    task-id is REQUIRED.",
-        '    --options JSON: \'[{"id":"A","label":"...","note":"..."}]\'',
-        "    Leave --options empty for free-text decision.",
+        "  loom agent pause <task-id> --question '<question>'",
+        "    Release the claim and ask the human for a decision.",
         "",
-        "  loom agent checkpoint --phase <phase> '<summary>'",
-        "    Update checkpoint_summary and ## Checkpoint section in _agent.md.",
-        "    Phases: planning | implementing | reviewing | blocked | idle",
-        "",
-        "  loom agent resume",
-        "    Print ## Checkpoint body from _agent.md for crash recovery.",
-        "",
-        "  loom agent new-thread --name <name> [--priority <n>] --manager",
-        "    Create a new thread. Auto-assigns ID (AA, AB, …).",
-        "",
-        "  loom agent new-task --thread <id> --title '<title>' --manager",
-        "                      [--priority <n>] [--acceptance '<text>']",
-        "                      [--depends-on '<id1,id2>'] [--after <task-id>]",
-        "    Create a task in draft (no acceptance) or scheduled (with acceptance).",
-        "    --depends-on: comma-separated task IDs to block on.",
-        "    All referenced task IDs are validated at write time.",
-        "",
-        "  loom agent inbox",
-        "    Executor-only. List pending messages for the current executor.",
-        "",
-        "  loom agent inbox-read <msg-id>",
-        "    Executor-only. Show message content without moving it.",
-        "",
-        "  loom agent reply <msg-id> '<body>'",
-        "    Executor-only. Reply to a pending message and move it to replied/.",
-        "",
-        "  loom agent send <to> '<body>' [--type <type>] [--ref <id>]",
-        "    Send a message. Types: task_assignment | question | answer |",
-        "    info | decision_result | review_request | task_proposal",
-        "    to: agent-id | manager | human",
-        "",
-        "  loom agent ask <to> '<question>' [--ref <task-id>]",
-        "    Shorthand for send --type question.",
-        "",
-        "  loom agent propose <to> '<proposal>' [--thread <id>] [--ref <id>]",
-        "    Shorthand for send --type task_proposal.",
-        "",
-        "  loom agent whoami [--manager]",
-        "    Print current actor identity.",
+        "  loom agent spawn [--threads <backend,frontend>]",
+        "    Start or wake an executor assignment.",
         "",
         "  loom agent status",
-        "    Describe current project state.",
-        "",
-        "  loom agent spawn [--threads <AA,AB>]",
-        "    Register a new executor. Writes <id>.env with LOOM_AGENT_ID,",
-        "    LOOM_DIR, LOOM_THREADS.",
-        "",
-        "SCHEDULING RULES",
-        "  - Tasks are ready when: status=scheduled AND all depends_on are done.",
-        "  - Execution order is purely depends_on-based (no thread strategy).",
-        "  - Priority: thread.priority desc -> task.priority desc -> seq asc.",
-        "  - claimed lock is released only by: done | pause | loom release.",
-        "  - No automatic timeout on claimed tasks.",
-        "",
-        "WORKSPACE",
-        f"  Effective loom dir: {loom}",
+        "    Review ready, paused, and reviewing work across the project.",
     ]
 
     if is_global_mode_active():
@@ -515,28 +450,24 @@ def done(
     output: str = typer.Option("", "--output", help="Output path or link."),
     manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
 ) -> None:
-    """Mark a task as reviewing (agent done)."""
+    """Mark a task as reviewing when it is ready for human review."""
     loom = _resolve_loom()
     _touch_if_agent(loom, _resolve_actor(manager=manager))
 
     try:
-        _, task = transition_task(
-            loom,
-            task_id,
-            TaskStatus.REVIEWING,
-            output=output or None,
-        )
+        _, task, blockers = complete_task(loom, task_id, output=output or None)
     except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
         _emit_error(str(exc))
         raise  # unreachable
 
-    lines = [
-        f"DONE task {task.id}",
-        f"  status : {task.status.value}",
-    ]
+    lines = [f"DONE task {task.id}", f"  status : {task.status.value}"]
     if output:
         lines.append(f"  output : {output}")
-    lines.append("  Waiting for human review. Run: loom review")
+    if blockers:
+        lines.append(f"  blocked: {', '.join(blockers)}")
+        lines.append("  Waiting for human decision. Run: loom")
+    else:
+        lines.append("  Waiting for human review. Run: loom review")
     typer.echo("\n".join(lines))
 
 
@@ -660,8 +591,9 @@ def spawn(
     payload = spawn_agent(loom, threads=[item.strip() for item in threads.split(",") if item.strip()])
     env_path = payload.get("env", "")
     agent_id = str(payload["id"])
-    thread_list = payload.get("threads", [])
-    thread_text = ", ".join(thread_list) if isinstance(thread_list, list) and thread_list else "(unassigned)"
+    raw_threads = payload.get("threads", [])
+    thread_list = [str(item) for item in raw_threads] if isinstance(raw_threads, list) else []
+    thread_text = ", ".join(thread_list) if thread_list else "(unassigned)"
     lines = [
         f"SPAWNED agent {agent_id}",
         f"  env file : {env_path}",
@@ -676,11 +608,7 @@ def spawn(
         "  Required variables are usually:",
         f"    LOOM_AGENT_ID={agent_id}",
         f"    LOOM_DIR={loom}",
-        (
-            f"    LOOM_THREADS={','.join(thread_list)}"
-            if isinstance(thread_list, list) and thread_list
-            else "    LOOM_THREADS=<optional>"
-        ),
+        (f"    LOOM_THREADS={','.join(thread_list)}" if thread_list else "    LOOM_THREADS=<optional>"),
         "",
     ]
 
@@ -690,11 +618,11 @@ def spawn(
             executor_command,
             agent_id=agent_id,
             loom_dir=loom,
-            threads=thread_list if isinstance(thread_list, list) else [],
+            threads=thread_list,
             env_path=str(env_path),
         )
         env_prefix = f"LOOM_AGENT_ID={agent_id} LOOM_DIR={loom}"
-        if isinstance(thread_list, list) and thread_list:
+        if thread_list:
             env_prefix += f" LOOM_THREADS={','.join(thread_list)}"
         lines += [
             "Configured executor command",

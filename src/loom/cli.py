@@ -16,6 +16,7 @@ from .config import ensure_settings
 from .frontmatter import write_model
 from .history import read_events
 from .ids import next_inbox_seq
+from .migration import ensure_name_based_threads
 from .models import Decision, InboxItem, TaskStatus
 from .prompting import select, text
 from .repository import load_inbox_item, load_task, require_loom, root_config_path
@@ -46,7 +47,9 @@ app.add_typer(inbox_app, name="inbox")
 
 def _resolve_loom() -> Path:
     try:
-        return require_loom()
+        loom = require_loom()
+        ensure_name_based_threads(loom)
+        return loom
     except FileNotFoundError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
@@ -327,10 +330,18 @@ def _run_queue(loom: Path) -> None:
         return
 
     summary: dict[str, int] = {"decided": 0, "accepted": 0, "rejected": 0, "skipped": 0}
-    for item in queue:
+    visited: set[tuple[str, str]] = set()
+
+    while True:
+        queue = [item for item in get_interaction_queue(loom) if (item["kind"], item["id"]) not in visited]
+        if not queue:
+            break
+
+        item = queue[0]
         _render_item_detail(loom, item)
         result = _handle_paused_item(loom, item) if item["kind"] == "paused" else _handle_reviewing_item(loom, item)
         summary[result] = summary.get(result, 0) + 1
+        visited.add((item["kind"], item["id"]))
 
     typer.echo("Queue summary:")
     for key in ["decided", "accepted", "rejected", "skipped"]:
