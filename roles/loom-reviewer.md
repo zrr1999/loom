@@ -1,7 +1,7 @@
 ---
 name: loom-reviewer
 description: Use when a task is already in `reviewing` and a human needs a concise review summary plus the exact `loom review` / `loom accept` / `loom reject` commands to finish the decision.
-role: supporting
+role: all
 
 model:
   tier: reasoning
@@ -14,11 +14,11 @@ capabilities:
   - write
   - bash:
       - "uvx --from agent-loom loom review*"
-      - "uvx --from agent-loom loom accept *"
-      - "uvx --from agent-loom loom reject *"
+      - "uvx --from agent-loom loom accept*"
+      - "uvx --from agent-loom loom reject*"
       - "loom review*"
-      - "loom accept *"
-      - "loom reject *"
+      - "loom accept*"
+      - "loom reject*"
   - delegate
 ---
 
@@ -36,7 +36,7 @@ Typical triggers:
 - the queue already contains reviewing tasks and someone needs help inspecting them
 - someone needs the exact accept / reject command to close the loop cleanly
 
-Do not use this role for inbox planning or normal execution work. Use `roles/loom-manager.md` for manager-loop planning and task execution.
+Do not use this role for top-level orchestration, inbox planning, or normal execution work. Use `roles/loom-director.md` for orchestration and `roles/loom-manager.md` for manager-loop planning / execution.
 
 ## Mission
 
