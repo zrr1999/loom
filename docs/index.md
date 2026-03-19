@@ -20,6 +20,7 @@ Additional design notes live under `design/`:
 - `design/requests-and-routines.md`
 - `design/review-workflow.md`
 - `design/tui-plan.md`
+- `design/approval-queue-tui-implementation-guide.md`
 - `design/thread-claiming.md`
 - `design/project-preferences.md`
 - `design/thread-merge-policy.md`

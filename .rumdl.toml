@@ -1,0 +1,31 @@
+# rumdl configuration file
+# Used by: uvx rumdl check / fmt / check --fix, `just md-check`, `just md-fmt`,
+# `just md-check-fix`, and the prek pre-commit hook.
+
+[global]
+# MD013 (line length) is disabled: this repo intentionally uses long lines in docs and .loom files.
+# MD041 (first line must be H1) is disabled: .loom task/inbox files start with YAML front-matter.
+# MD033 (inline HTML) is disabled: CLI arg placeholders like <task-id> are valid in doc prose.
+# MD036 (emphasis instead of heading) is disabled: design notes use bold text as section labels.
+# MD076 (blank line between list items) is disabled: blank lines are used intentionally for grouping.
+disable = ["MD013", "MD033", "MD036", "MD041", "MD076"]
+
+# Paths scanned when no explicit path is given.
+# Covers project docs, design notes, role files, and the human-authored parts of `.loom/`.
+include = [
+    "README.md",
+    "AGENTS.md",
+    "docs/**/*.md",
+    "design/**/*.md",
+    "roles/**/*.md",
+    ".loom/**/*.md",
+]
+
+exclude = [
+    ".git",
+    ".venv",
+    ".pytest_cache",
+    ".loom/agents/**/*.md",
+]
+
+respect-gitignore = false

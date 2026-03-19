@@ -31,6 +31,7 @@
 - `decision`: required while `paused`
 - `reviewing`: rejected for tasks whose body/output still advertises TODOs, proposal-only output, or known follow-up improvements
 - task markdown keeps `## 背景` / `## 实现方向` sections, but leaves them empty unless real context is provided
+- human approval surfaces (`loom`, `loom review`, and phase-1 `loom tui`) only read and mutate these same task files; they do not add separate runtime state
 
 ## `.loom/agents/`
 

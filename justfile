@@ -5,18 +5,33 @@ default:
 # Install dependencies in development mode
 install:
     uv sync --all-groups
-    uvx prek install
+    uvx prek install --hook-type pre-commit
+    uvx prek install --hook-type commit-msg
 
 # Format all code
 format:
     just --fmt --unstable
     uvx ruff format .
     uvx ruff check . --fix
+    just md-fmt
 
 # Run static checks
 check:
     uvx ruff check .
     uvx ty check src/ tests/
+    just md-check
+
+# Format markdown files (auto-fix)
+md-fmt:
+    uvx rumdl fmt --config .rumdl.toml .
+
+# Check markdown files (no changes; exits 1 if issues found)
+md-check:
+    uvx rumdl check --config .rumdl.toml .
+
+# Check markdown files and auto-fix what rumdl can fix
+md-check-fix:
+    uvx rumdl check --fix --config .rumdl.toml .
 
 # Run tests
 test:

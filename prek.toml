@@ -36,3 +36,22 @@ rev = "v1.33.1"
 hooks = [
   { id = "typos", args = ["--force-exclude"] },
 ]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "commit-message-format"
+name = "commit message format"
+entry = "uv run python -m loom.commit_message"
+language = "system"
+stages = ["commit-msg"]
+always_run = true
+
+[[repos.hooks]]
+id = "rumdl"
+name = "rumdl markdown lint/fix"
+entry = "uvx rumdl check --fix --config .rumdl.toml ."
+language = "system"
+pass_filenames = false
+always_run = true
