@@ -4,15 +4,26 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import typer
 
+from .agent_command_catalog import (
+    manager_done_command,
+    manager_new_task_command,
+    manager_new_thread_command,
+    manager_next_command,
+    manager_pause_command,
+    manager_propose_command,
+    manager_send_command,
+    manager_spawn_command,
+)
 from .config import load_settings
 from .migration import ensure_name_based_threads
-from .models import AgentStatus, MessageType, Task
+from .models import AgentRole, AgentStatus, MessageType, Task
 from .repository import agent_pending_dir, load_message, load_task, require_loom, task_file_path, workspace_root
 from .runtime import global_root, is_global_mode_active, set_root
 from .scheduler import get_next_tasks, get_pending_inbox_items, get_status_summary
@@ -36,6 +47,12 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 app = typer.Typer(invoke_without_command=True)
+_SINGLETON_ACTORS = {
+    AgentRole.MANAGER.value,
+    AgentRole.DIRECTOR.value,
+    AgentRole.REVIEWER.value,
+}
+_ROLE_HELP = "Run as worker, manager, director, or reviewer. Defaults to worker."
 
 
 @app.callback(invoke_without_command=True)
@@ -64,28 +81,46 @@ def _resolve_loom() -> Path:
         raise  # unreachable; satisfies type checker
 
 
-def _resolve_actor(*, manager: bool) -> str:
-    if manager:
-        return "manager"
+def _resolve_actor(*, role: AgentRole) -> str:
+    if role != AgentRole.WORKER:
+        return role.value
 
-    agent_id = os.environ.get("LOOM_AGENT_ID", "").strip()
-    if not agent_id:
+    worker_id = os.environ.get("LOOM_WORKER_ID", "").strip()
+    legacy_agent_id = os.environ.get("LOOM_AGENT_ID", "").strip()
+    if not worker_id:
+        migration_note = ""
+        if legacy_agent_id:
+            migration_note = " LOOM_AGENT_ID is no longer used; rename it to LOOM_WORKER_ID."
         _emit_error(
-            "LOOM_AGENT_ID is required for this command. Use --manager to act as manager.",
-            code="missing_agent_id",
+            (
+                "LOOM_WORKER_ID is required for worker commands. "
+                "Use --role manager / --role director / --role reviewer, or set LOOM_WORKER_ID."
+                f"{migration_note}"
+            ),
+            code="missing_worker_id",
         )
         raise  # unreachable
-    return agent_id
+    return worker_id
 
 
 def _require_manager_context(command_name: str) -> None:
-    agent_id = os.environ.get("LOOM_AGENT_ID", "").strip()
-    if agent_id:
+    worker_id = os.environ.get("LOOM_WORKER_ID", "").strip()
+    if worker_id:
         _emit_error(
-            f"loom agent {command_name} is manager-only. LOOM_AGENT_ID={agent_id!r} is set, "
-            "so this process is running as an executor. Start a clean manager process without "
-            "LOOM_AGENT_ID in the environment and run the command there.",
-            code="executor_not_allowed",
+            f"loom agent {command_name} is manager-only. LOOM_WORKER_ID={worker_id!r} is set, "
+            "so this process is running as a worker. Start a clean manager process without "
+            "LOOM_WORKER_ID in the environment and run the command there.",
+            code="worker_not_allowed",
+        )
+    legacy_agent_id = os.environ.get("LOOM_AGENT_ID", "").strip()
+    if legacy_agent_id:
+        _emit_error(
+            (
+                f"loom agent {command_name} no longer reads LOOM_AGENT_ID={legacy_agent_id!r}. "
+                "Rename it to LOOM_WORKER_ID when launching a worker, or run this manager-only "
+                "command from a clean manager process."
+            ),
+            code="legacy_worker_env",
         )
 
 
@@ -95,6 +130,69 @@ def _format_executor_command(template: str, *, agent_id: str, loom_dir: Path, th
         .replace("{loom_dir}", str(loom_dir))
         .replace("{threads}", ",".join(threads))
         .replace("{env_file}", env_path)
+    )
+
+
+def _has_configured_executor_command(settings: object) -> bool:
+    return bool(getattr(getattr(settings, "agent", None), "executor_command", "").strip())
+
+
+def _manager_mailbox_steps(settings: object) -> list[str]:
+    lines = ["Manager next steps:"]
+    if _has_configured_executor_command(settings):
+        lines.append(f"  1. Start or wake a worker agent if needed: {manager_spawn_command()}")
+    else:
+        lines.append(
+            "  1. Ask the director or host system to start or wake a worker runtime with LOOM_WORKER_ID + LOOM_DIR."
+        )
+    lines.extend(
+        [
+            (f"  2. Prefer mailbox-first delegation: {manager_propose_command()}"),
+            (f"  3. Follow up with {manager_send_command()} when needed."),
+            "  4. Tell the worker to run `loom agent next` in its own executor environment.",
+            "  5. Keep using `loom agent status` to monitor ready / paused / reviewing work.",
+            "",
+        ]
+    )
+    return lines
+
+
+def _manager_launch_guidance(settings: object) -> list[str]:
+    if _has_configured_executor_command(settings):
+        return [
+            f"  {manager_spawn_command()}",
+            "    Create or wake a worker assignment and print the configured launch command.",
+            "",
+        ]
+    return [
+        "  Ask the director or host system to create or wake a worker runtime.",
+        "    Pass LOOM_WORKER_ID and LOOM_DIR from your own launcher or wrapper process.",
+        "    Configure [agent].executor_command later if you want `loom spawn` to print that command for you.",
+        "",
+    ]
+
+
+def _format_wait_seconds(seconds: float) -> str:
+    text = f"{seconds:.2f}"
+    return text.rstrip("0").rstrip(".")
+
+
+def _interactive_wait_feedback_enabled() -> bool:
+    stdout_isatty = getattr(sys.stdout, "isatty", None)
+    stderr_isatty = getattr(sys.stderr, "isatty", None)
+    return bool(callable(stdout_isatty) and stdout_isatty() and callable(stderr_isatty) and stderr_isatty())
+
+
+def _emit_wait_feedback(*, attempt: int, retries: int, wait_seconds: float) -> None:
+    remaining = retries - attempt
+    typer.echo(
+        (
+            f"WAITING  attempt {attempt + 1}/{retries + 1}"
+            f"  retries:{retries}"
+            f"  wait_seconds:{_format_wait_seconds(wait_seconds)}"
+            f"  remaining:{remaining}"
+        ),
+        err=True,
     )
 
 
@@ -132,7 +230,7 @@ def _format_minutes_ago(timestamp: str | None) -> str:
 
 
 def _touch_if_agent(loom: Path, actor: str) -> None:
-    if actor == "manager":
+    if actor in _SINGLETON_ACTORS:
         return
     touch_agent(loom, actor, status=AgentStatus.ACTIVE)
 
@@ -141,11 +239,11 @@ def _touch_if_agent(loom: Path, actor: str) -> None:
 def new_thread(
     name: str = typer.Option("", help="Thread name."),
     priority: int = typer.Option(50, help="Thread priority."),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
-    """Create a new thread with an auto-assigned short internal id."""
+    """Create a new thread using its canonical readable name."""
     loom = _resolve_loom()
-    _touch_if_agent(loom, _resolve_actor(manager=manager))
+    _touch_if_agent(loom, _resolve_actor(role=role))
 
     try:
         thread, path, duplicates = create_thread(loom, name=name, priority=priority)
@@ -155,7 +253,6 @@ def new_thread(
 
     lines = [
         f"CREATED thread {thread.name}",
-        f"  id       : {thread.id}",
         f"  priority : {thread.priority}",
         f"  path     : {path.parent}",
     ]
@@ -175,11 +272,11 @@ def new_task(
     created_from: str = typer.Option("", help="Comma-separated source inbox RQ IDs."),
     background: str = typer.Option("", help="Task background section content."),
     implementation_direction: str = typer.Option("", help="Implementation direction section content."),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
     """Create a new task file in the given thread."""
     loom = _resolve_loom()
-    _touch_if_agent(loom, _resolve_actor(manager=manager))
+    _touch_if_agent(loom, _resolve_actor(role=role))
 
     # Merge --after into depends_on
     merged_deps = depends_on
@@ -189,7 +286,7 @@ def new_task(
     try:
         task, path = create_task(
             loom,
-            thread_id=thread,
+            thread_name=thread,
             title=title,
             priority=priority,
             acceptance=acceptance,
@@ -227,11 +324,11 @@ def next_task(
         min=0,
         help="Retry count when no plan/task action is ready.",
     ),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
     """Get the next agent action."""
     loom = _resolve_loom()
-    actor = _resolve_actor(manager=manager)
+    actor = _resolve_actor(role=role)
     _touch_if_agent(loom, actor)
     settings = load_settings(workspace_root(loom))
     effective_wait_seconds = settings.agent.next_wait_seconds if wait_seconds is None else wait_seconds
@@ -258,6 +355,12 @@ def next_task(
             break
 
         if attempt < effective_retries and effective_wait_seconds > 0:
+            if _interactive_wait_feedback_enabled():
+                _emit_wait_feedback(
+                    attempt=attempt,
+                    retries=effective_retries,
+                    wait_seconds=effective_wait_seconds,
+                )
             time.sleep(effective_wait_seconds)
 
     if pending_inbox:
@@ -277,9 +380,9 @@ def next_task(
             "",
             "Manager next steps:",
             "  1. Create or choose a thread for each requirement.",
-            "  2. Run: loom agent new-thread --name <name> [--priority <n>] --manager",
-            "  3. Run: loom agent new-task --thread <id> --title '<title>' --acceptance '<criteria>' --manager",
-            "  4. Repeat `loom agent next --manager` after all requirements above are arranged.",
+            f"  2. Run: {manager_new_thread_command()}",
+            f"  3. Run: {manager_new_task_command()}",
+            f"  4. Repeat `{manager_next_command()}` after all requirements above are arranged.",
             "",
         ]
         typer.echo("\n".join(lines))
@@ -305,10 +408,27 @@ def next_task(
                 lines.append(f"  paused    : {paused_count} (human must decide)")
             if inbox_pending:
                 lines.append(f"  inbox     : {inbox_pending} pending items")
+        if actor in _SINGLETON_ACTORS:
+            typer.echo("\n".join(lines))
+            return
+
+        lines.extend(
+            [
+                "",
+                "Worker next steps:",
+                "  1. Check `loom agent inbox` for pending manager handoffs.",
+                "  2. If you want more work, proactively ask to claim a thread or task.",
+                "     Example: `loom agent ask manager 'Can I take thread <thread> or task <task-id>?'`",
+                (
+                    "  3. If you already know the work, propose the handoff yourself with "
+                    "`loom agent propose manager '<thread/task handoff>' --ref <thread-or-task-id>`."
+                ),
+            ]
+        )
         typer.echo("\n".join(lines))
         return
 
-    if actor == "manager":
+    if actor in _SINGLETON_ACTORS:
         task_lines = []
         for task in tasks:
             task_lines.extend(_format_task_block(loom, task))
@@ -316,15 +436,23 @@ def next_task(
         lines = [
             "ACTION  task",
             f"COUNT   {len(tasks)}",
-            "ACTOR   manager",
+            f"ACTOR   {actor}",
             "",
             "READY TASKS",
             *task_lines,
-            "Manager next steps:",
-            "  1. Start or wake a worker agent if needed: loom agent spawn [--threads <backend,frontend>]",
-            "  2. Tell the worker to run `loom agent next` in its own executor environment.",
-            "  3. Keep using `loom agent status` to monitor ready / paused / reviewing work.",
-            "",
+            *(
+                _manager_mailbox_steps(settings)
+                if actor == AgentRole.MANAGER.value
+                else [
+                    f"{actor.title()} next steps:",
+                    "  1. Coordinate with the manager or worker role before mutating task state.",
+                    (
+                        "  2. Re-run with `--role manager` for manager-loop actions, or configure "
+                        "LOOM_WORKER_ID to claim as a worker."
+                    ),
+                    "",
+                ]
+            ),
         ]
         typer.echo("\n".join(lines))
         return
@@ -393,19 +521,19 @@ def start() -> None:
         "  Repeat this loop immediately:",
         "",
         "    STEP 1 — fetch the next action",
-        "      Run: loom agent next --manager",
+        f"      Run: {manager_next_command()}",
         "",
         "      If output starts with ACTION  plan:",
         "        Arrange the listed human requirements into threads/tasks with:",
-        "          loom agent new-thread --name <name> --manager",
-        "          loom agent new-task --thread <id> --title '<title>' --acceptance '<criteria>' --manager",
-        "        Then run loom agent next --manager again.",
+        f"          {manager_new_thread_command()}",
+        f"          {manager_new_task_command()}",
+        f"        Then run {manager_next_command()} again.",
         "",
         "      If output starts with ACTION  task:",
         "        Execute every claimed task that was returned.",
-        "        Finish each completed task with done.",
-        "        If blocked on a human decision, pause the task.",
-        "        After handling all returned tasks, run loom agent next --manager again.",
+        f"        Finish each completed task with `{manager_done_command()}`.",
+        f"        If blocked on a human decision, use `{manager_pause_command()}`.",
+        f"        After handling all returned tasks, run {manager_next_command()} again.",
         "",
         "      If output starts with ACTION  idle:",
         "        No executable work is ready right now.",
@@ -413,21 +541,24 @@ def start() -> None:
         "",
         "ESSENTIAL COMMANDS",
         "",
-        "  loom agent next --manager",
+        f"  {manager_next_command()}",
         "    Fetch planning work or the next ready task batch.",
         f"    Planning batch : {settings.agent.inbox_plan_batch} inbox items",
         f"    Task batch     : {settings.agent.task_batch} tasks",
         f"    Idle wait      : {settings.agent.next_wait_seconds}s between retries",
         f"    Idle retries   : {settings.agent.next_retries}",
         "",
-        "  loom agent done <task-id> --output <path-or-url>",
+        f"  {manager_done_command()}",
         "    Mark a finished task as reviewing, or pause it if incomplete markers remain.",
         "",
-        "  loom agent pause <task-id> --question '<question>'",
+        f"  {manager_pause_command()}",
         "    Release the claim and ask the human for a decision.",
         "",
-        "  loom agent spawn [--threads <backend,frontend>]",
-        "    Start or wake an executor assignment.",
+        *_manager_launch_guidance(settings),
+        "  Mailbox-first delegation once a worker exists",
+        f"    {manager_propose_command()}",
+        f"    {manager_send_command()}",
+        "    Workers inspect with `loom agent inbox` / `loom agent inbox-read` and answer with `loom agent reply`.",
         "",
         "  loom agent status",
         "    Review ready, paused, and reviewing work across the project.",
@@ -448,11 +579,11 @@ def start() -> None:
 def done(
     task_id: str = typer.Argument(..., help="Task ID to mark done."),
     output: str = typer.Option("", "--output", help="Output path or link."),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
     """Mark a task as reviewing when it is ready for human review."""
     loom = _resolve_loom()
-    _touch_if_agent(loom, _resolve_actor(manager=manager))
+    _touch_if_agent(loom, _resolve_actor(role=role))
 
     try:
         _, task, blockers = complete_task(loom, task_id, output=output or None)
@@ -476,11 +607,11 @@ def pause(
     task_id: str = typer.Argument(..., help="Task ID to pause."),
     question: str = typer.Option("", "--question", help="Decision question."),
     options: str = typer.Option("", "--options", help="JSON array of {id, label, note} options."),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
     """Pause a task with a decision question."""
     loom = _resolve_loom()
-    _touch_if_agent(loom, _resolve_actor(manager=manager))
+    _touch_if_agent(loom, _resolve_actor(role=role))
 
     if not question:
         _emit_error("--question is required to pause a task", code="missing_question")
@@ -566,6 +697,9 @@ def agent_status() -> None:
             line = f"  {agent_id:<12} {status_val}  last_seen:{age_text}"
             if summary_val:
                 line += f"  — {summary_val}"
+            pending_messages = int(agent.get("pending_messages", 0) or 0)
+            replied_messages = int(agent.get("replied_messages", 0) or 0)
+            line += f"  mailbox:{pending_messages} pending / {replied_messages} replied"
             if is_offline:
                 line += "  WARNING: appears offline"
             lines.append(line)
@@ -580,11 +714,10 @@ def agent_status() -> None:
     typer.echo("\n".join(lines))
 
 
-@app.command("spawn")
-def spawn(
-    threads: str = typer.Option("", "--threads", help="Comma-separated thread assignment."),
+def spawn_worker_runtime(
+    threads: str = "",
 ) -> None:
-    """Register a new executor agent."""
+    """Register a new worker agent from the top-level `loom spawn` entrypoint."""
     _require_manager_context("spawn")
     loom = _resolve_loom()
     settings = load_settings(workspace_root(loom))
@@ -599,14 +732,14 @@ def spawn(
         f"  env file : {env_path}",
         f"  threads  : {thread_text}",
         "",
-        "Executor environment file",
+        "Worker environment file",
         f"  {env_path}",
         "",
         "Default launch pattern",
-        "  Prefer passing environment variables from the outside when starting the executor.",
+        "  Prefer passing environment variables from the outside when starting the worker.",
         "  Read the env file and inject those values into the child-process launch.",
         "  Required variables are usually:",
-        f"    LOOM_AGENT_ID={agent_id}",
+        f"    LOOM_WORKER_ID={agent_id}",
         f"    LOOM_DIR={loom}",
         (f"    LOOM_THREADS={','.join(thread_list)}" if thread_list else "    LOOM_THREADS=<optional>"),
         "",
@@ -621,20 +754,20 @@ def spawn(
             threads=thread_list,
             env_path=str(env_path),
         )
-        env_prefix = f"LOOM_AGENT_ID={agent_id} LOOM_DIR={loom}"
+        env_prefix = f"LOOM_WORKER_ID={agent_id} LOOM_DIR={loom}"
         if thread_list:
             env_prefix += f" LOOM_THREADS={','.join(thread_list)}"
         lines += [
-            "Configured executor command",
+            "Configured worker command",
             "  [agent].executor_command is set in loom.toml.",
-            "  You can launch the executor with either style:",
+            "  You can launch the worker with either style:",
             f"    source {env_path} && {rendered}",
             f"    {env_prefix} {rendered}",
             "",
         ]
     else:
         lines += [
-            "No executor command is configured in loom.toml.",
+            "No worker command is configured in loom.toml.",
             "  If you want spawn to print a ready-to-run command, set:",
             "    [agent]",
             '    executor_command = "your launcher command"',
@@ -644,32 +777,44 @@ def spawn(
 
     lines += [
         "If your subagent runtime cannot set environment variables at all:",
-        "  do not use loom agent spawn for that runtime.",
+        "  do not use loom spawn for that runtime.",
         "  Either launch the agent from a wrapper process that can inject env vars,",
         "  or use a runtime that supports per-process environment configuration.",
     ]
     typer.echo("\n".join(lines))
 
 
+@app.command("spawn", hidden=True)
+def spawn(
+    threads: str = typer.Option("", "--threads", help="Comma-separated thread assignment."),
+) -> None:
+    """Legacy entrypoint kept only to print migration guidance."""
+    suggestion = f"loom spawn --threads {threads}" if threads else manager_spawn_command()
+    _emit_error(
+        f"`loom agent spawn` moved to `{suggestion}`. Run `{suggestion}` instead.",
+        code="moved_command",
+    )
+
+
 @app.command("whoami")
-def whoami(manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID.")) -> None:
+def whoami(role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP)) -> None:
     """Show the current actor identity."""
-    actor = _resolve_actor(manager=manager)
-    role = "manager" if actor == "manager" else "executor"
-    typer.echo(f"IDENTITY\n  id   : {actor}\n  role : {role}")
+    actor = _resolve_actor(role=role)
+    resolved_role = role.value if actor in _SINGLETON_ACTORS else AgentRole.WORKER.value
+    typer.echo(f"IDENTITY\n  id   : {actor}\n  role : {resolved_role}")
 
 
 @app.command("checkpoint")
 def checkpoint(
     summary: str = typer.Argument(..., help="Checkpoint summary."),
     phase: str = typer.Option("implementing", "--phase", help="Current phase."),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
     """Update the current agent checkpoint."""
     loom = _resolve_loom()
-    actor = _resolve_actor(manager=manager)
-    if actor == "manager":
-        _emit_error("manager checkpoint updates are not implemented via this command.", code="not_supported")
+    actor = _resolve_actor(role=role)
+    if actor in _SINGLETON_ACTORS:
+        _emit_error(f"{actor} checkpoint updates are not implemented via this command.", code="not_supported")
     record = update_checkpoint(loom, actor, phase=phase, summary=summary)
     typer.echo(
         f"CHECKPOINT recorded\n  agent : {record.id}\n  phase : {phase}\n  summary : {record.checkpoint_summary}"
@@ -677,23 +822,23 @@ def checkpoint(
 
 
 @app.command("resume")
-def resume(manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID.")) -> None:
+def resume(role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP)) -> None:
     """Show the current agent checkpoint body."""
     loom = _resolve_loom()
-    actor = _resolve_actor(manager=manager)
-    if actor == "manager":
-        _emit_error("manager resume is not implemented via this command.", code="not_supported")
+    actor = _resolve_actor(role=role)
+    if actor in _SINGLETON_ACTORS:
+        _emit_error(f"{actor} resume is not implemented via this command.", code="not_supported")
     record = resume_agent(loom, actor)
     typer.echo(f"CHECKPOINT body for {record.id}\n\n{record.body}")
 
 
 @app.command("inbox")
-def inbox(manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID.")) -> None:
+def inbox(role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP)) -> None:
     """List pending messages for the current agent."""
     loom = _resolve_loom()
-    actor = _resolve_actor(manager=manager)
-    if actor == "manager":
-        _emit_error("manager inbox is not implemented via this command.", code="not_supported")
+    actor = _resolve_actor(role=role)
+    if actor in _SINGLETON_ACTORS:
+        _emit_error(f"{actor} inbox is not implemented via this command.", code="not_supported")
     messages = list_pending_messages(loom, actor)
 
     if not messages:
@@ -711,13 +856,13 @@ def inbox(manager: bool = typer.Option(False, "--manager", help="Run as manager 
 @app.command("inbox-read")
 def inbox_read(
     msg_id: str = typer.Argument(..., help="Message ID to read (e.g. MSG-001)."),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
     """Show message content without moving it."""
     loom = _resolve_loom()
-    actor = _resolve_actor(manager=manager)
-    if actor == "manager":
-        _emit_error("manager inbox-read is not implemented via this command.", code="not_supported")
+    actor = _resolve_actor(role=role)
+    if actor in _SINGLETON_ACTORS:
+        _emit_error(f"{actor} inbox-read is not implemented via this command.", code="not_supported")
     pending_dir = agent_pending_dir(loom, actor)
     try:
         _, message = load_message(pending_dir, msg_id)
@@ -744,11 +889,11 @@ def send(
     body: str = typer.Argument(..., help="Message body."),
     type_: str = typer.Option("info", "--type", help="Message type."),
     ref: str = typer.Option("", "--ref", help="Optional related entity id."),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
     """Send a message to another agent."""
     loom = _resolve_loom()
-    actor = _resolve_actor(manager=manager)
+    actor = _resolve_actor(role=role)
     message = create_message(
         loom,
         sender=actor,
@@ -773,11 +918,11 @@ def ask(
     to: str = typer.Argument(..., help="Recipient agent id (or 'manager' / 'human')."),
     question: str = typer.Argument(..., help="The question to ask."),
     ref: str = typer.Option("", "--ref", help="Optional related task/entity id."),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
     """Shorthand for send --type question."""
     loom = _resolve_loom()
-    actor = _resolve_actor(manager=manager)
+    actor = _resolve_actor(role=role)
     message = create_message(
         loom,
         sender=actor,
@@ -801,13 +946,13 @@ def ask(
 def propose(
     to: str = typer.Argument(..., help="Recipient agent id (or 'manager' / 'human')."),
     proposal: str = typer.Argument(..., help="The task proposal body."),
-    thread: str = typer.Option("", "--thread", help="Optional related thread id."),
+    thread: str = typer.Option("", "--thread", help="Optional related thread name."),
     ref: str = typer.Option("", "--ref", help="Optional related entity id."),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
     """Shorthand for send --type task_proposal."""
     loom = _resolve_loom()
-    actor = _resolve_actor(manager=manager)
+    actor = _resolve_actor(role=role)
     ref_value = ref or thread or None
     message = create_message(
         loom,
@@ -832,13 +977,13 @@ def propose(
 def reply(
     msg_id: str = typer.Argument(..., help="Pending message id."),
     body: str = typer.Argument(..., help="Reply body."),
-    manager: bool = typer.Option(False, "--manager", help="Run as manager without LOOM_AGENT_ID."),
+    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
 ) -> None:
     """Reply to a pending message and move it to replied."""
     loom = _resolve_loom()
-    actor = _resolve_actor(manager=manager)
-    if actor == "manager":
-        _emit_error("manager reply is not implemented via this command.", code="not_supported")
+    actor = _resolve_actor(role=role)
+    if actor in _SINGLETON_ACTORS:
+        _emit_error(f"{actor} reply is not implemented via this command.", code="not_supported")
     payload = reply_to_message(loom, actor, msg_id, body)
     typer.echo(f"REPLIED to {msg_id}\n  reply id : {payload.get('reply_id', '')}")
 

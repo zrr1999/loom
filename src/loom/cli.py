@@ -12,17 +12,18 @@ import typer
 from loguru import logger
 
 from .agent import app as agent_app
+from .agent import spawn_worker_runtime
+from .agent import start as agent_start
 from .config import ensure_settings
-from .frontmatter import write_model
 from .history import read_events
-from .ids import next_inbox_seq
 from .migration import ensure_name_based_threads
-from .models import Decision, InboxItem, TaskStatus
+from .models import Decision, TaskStatus
 from .prompting import select, text
 from .repository import load_inbox_item, load_task, require_loom, root_config_path
 from .runtime import global_root, set_root
 from .scheduler import get_interaction_queue, get_pending_inbox_items, get_status_summary, load_all_tasks
 from .services import (
+    create_inbox_item,
     decide_task,
     ensure_agent_layout,
     format_review_summary,
@@ -81,13 +82,12 @@ def inbox_add(
 ) -> None:
     """Add a new requirement to the inbox."""
     loom = _resolve_loom()
-
-    seq = next_inbox_seq(loom / "inbox")
-    rq_id = f"RQ-{seq:03d}"
-    item = InboxItem(id=rq_id, body=description)
-    path = loom / "inbox" / f"{rq_id}.md"
-    write_model(path, item)
-    typer.echo(f"Created {rq_id}: {path}")
+    try:
+        item, path = create_inbox_item(loom, description)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Created {item.id}: {path}")
 
 
 @app.command()
@@ -113,6 +113,20 @@ def status() -> None:
         typer.echo("Queue:")
         for item in queue:
             typer.echo(f"  {item['kind']}: {item['id']} - {item['title']}")
+
+
+@app.command()
+def manage() -> None:
+    """Open the manager bootstrap guide from the top-level CLI."""
+    agent_start()
+
+
+@app.command()
+def spawn(
+    threads: str = typer.Option("", "--threads", help="Comma-separated thread assignment."),
+) -> None:
+    """Register a new worker agent from the top-level CLI."""
+    spawn_worker_runtime(threads=threads)
 
 
 @app.command()
@@ -381,6 +395,7 @@ def inbox_main(ctx: typer.Context) -> None:
 def main(
     ctx: typer.Context,
     global_mode: bool = typer.Option(False, "-g", help="Use the home-level loom directory."),
+    plain: bool = typer.Option(False, "--plain", help="Use the plain prompt-based approval loop instead of the TUI."),
 ) -> None:
     """Enter the default interactive queue when no subcommand is provided."""
     set_root(global_root() if global_mode else None)
@@ -388,22 +403,36 @@ def main(
         return
 
     loom = _resolve_loom()
-    _run_queue(loom)
+    if plain:
+        _run_queue(loom)
+        return
+
+    try:
+        from .tui import run_tui
+
+        run_tui(loom)
+    except ImportError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        typer.echo("Hint: install the TUI extra with `uv sync --extra tui`, or run `loom --plain`.", err=True)
+        raise typer.Exit(1) from exc
 
 
 @app.command()
 def tui() -> None:
     """Open the Textual approval-queue TUI (requires the 'tui' optional dependency).
 
-    Browse and act on paused / reviewing queue items interactively.
-    Add new requirements first with `loom inbox add "..."`, then run agents
-    to produce work for review before launching the TUI.
+    Browse and act on paused / reviewing queue items interactively, and add
+    new requirements into `.loom/inbox/` from inside the TUI.
 
     Key bindings inside the TUI:
       a  accept the selected reviewing task
       r  reject the selected reviewing task (prompts for reason)
       d  decide on the selected paused task (prompts for choice)
+      n  add a new inbox requirement (multi-line)
+      l  release the selected claimed queue item (prompts for reason)
       R  refresh the queue from disk
+      w  toggle watch mode (polls .loom/ every 1s)
+      ?  show the in-app shortcut/help overlay
       q  quit
     """
     loom = _resolve_loom()
