@@ -11,6 +11,7 @@
 - `loom reject <id> "reason"`
 - `loom decide <id> <option>`
 - `loom release <id> "reason"`
+- `loom tui`
 
 Running `loom` with no subcommand now processes the current paused / reviewing approval queue.
 
@@ -19,10 +20,27 @@ Difference between `loom` and `loom review`:
 - `loom`: interactive approval loop for `paused` and `reviewing`
 - `loom review`: non-interactive list of reviewing items only
 - `loom inbox`: interactive planning loop for pending inbox requirements
+- `loom tui`: full-screen Textual TUI for the same approval queue
 
 - `paused`: use compact keyed actions like `d`, `s`, `o`, or `?`
 - `reviewing`: use compact keyed actions like `a`, `r`, `s`, `o`, or `?`
 - `inbox`: use compact keyed actions like `p`, `s`, `o`, or `?`
+
+### `loom tui`
+
+`loom tui` opens an optional full-screen Textual TUI that covers the same approval queue as plain `loom`.
+
+- Requires the `tui` optional dependency: `uv sync --extra tui`
+- Phase 1 scope: browse `paused` / `reviewing` queue items, then reuse the existing accept / reject / decide / release operations
+- Aligns with `design/tui-plan.md`: this is an optional second presentation layer over the same filesystem-backed workflow
+- Keyboard shortcuts inside the TUI:
+  - `a` — accept the selected reviewing task → done
+  - `r` — reject the selected reviewing task → scheduled (prompts for reason)
+  - `d` — decide on the selected paused task → scheduled (prompts for choice)
+  - `l` — release the selected claimed queue item → scheduled (prompts for reason)
+  - `R` — refresh the queue from disk
+  - `q` — quit
+- `.loom/` files remain the source of truth; the TUI reuses the same scheduler/service layer as plain CLI commands
 
 `loom init` ensures both `.loom/` and root `loom.toml` exist. It is idempotent. Pass `-g` to use the home-level loom workspace.
 
@@ -73,6 +91,13 @@ Current behavior note: mutating `loom agent` commands infer the acting agent fro
 `loom agent start` returns a concise manager bootstrap prompt describing the expected loop around `loom agent next`, `done`, and `pause`.
 
 That prompt includes a current-state summary, the practical command set for managers, and explicitly states that `loom agent done` and `loom agent pause` always require a specific task id.
+
+## Repo hook policy
+
+- run `uvx prek install --hook-type pre-commit --hook-type commit-msg` after syncing dependencies
+- the repo's `commit-msg` hook expects `<emoji> <type>(<scope>)?: <subject>`
+- example: `✨ feat: add more functionality`
+- auto-generated `Merge ...`, `Revert ...`, `fixup! ...`, and `squash! ...` messages are allowed
 
 Global workspace guidance (`-g`) is only shown in `loom agent start` when global mode is currently active.
 

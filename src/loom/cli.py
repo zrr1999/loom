@@ -391,5 +391,30 @@ def main(
     _run_queue(loom)
 
 
+@app.command()
+def tui() -> None:
+    """Open the Textual approval-queue TUI (requires the 'tui' optional dependency).
+
+    Browse and act on paused / reviewing queue items interactively.
+    Add new requirements first with `loom inbox add "..."`, then run agents
+    to produce work for review before launching the TUI.
+
+    Key bindings inside the TUI:
+      a  accept the selected reviewing task
+      r  reject the selected reviewing task (prompts for reason)
+      d  decide on the selected paused task (prompts for choice)
+      R  refresh the queue from disk
+      q  quit
+    """
+    loom = _resolve_loom()
+    try:
+        from .tui import run_tui
+
+        run_tui(loom)
+    except ImportError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+
 def find_task(loom: Path, task_id: str) -> tuple[Path, Any]:
     return load_task(loom, task_id)
