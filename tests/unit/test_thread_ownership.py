@@ -1,0 +1,193 @@
+"""Tests for thread-level ownership model."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from loom.models import TaskStatus, Thread
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def loom(tmp_path: Path) -> Path:
+    """Bootstraps a minimal loom workspace for testing."""
+    from loom.services import create_thread, ensure_agent_layout
+
+    loom_dir = tmp_path / ".loom"
+    loom_dir.mkdir()
+    (loom_dir / "threads").mkdir()
+    (loom_dir / "inbox").mkdir()
+    ensure_agent_layout(loom_dir)
+    create_thread(loom_dir, name="backend", priority=80)
+    return loom_dir
+
+
+# ---------------------------------------------------------------------------
+# Thread ownership
+# ---------------------------------------------------------------------------
+
+
+def test_claim_thread_sets_owner(loom: Path) -> None:
+    from loom.services import claim_thread
+
+    _, thread = claim_thread(loom, "backend", agent_id="worker-1")
+    assert thread.owner == "worker-1"
+    assert thread.owned_at is not None
+
+
+def test_claim_thread_idempotent_for_same_agent(loom: Path) -> None:
+    from loom.services import claim_thread
+
+    claim_thread(loom, "backend", agent_id="worker-1")
+    _, thread = claim_thread(loom, "backend", agent_id="worker-1")
+    assert thread.owner == "worker-1"
+
+
+def test_claim_thread_rejects_different_agent(loom: Path) -> None:
+    from loom.services import claim_thread
+
+    claim_thread(loom, "backend", agent_id="worker-1")
+    with pytest.raises(ValueError, match="already owned"):
+        claim_thread(loom, "backend", agent_id="worker-2")
+
+
+def test_release_thread_clears_owner(loom: Path) -> None:
+    from loom.services import claim_thread, release_thread
+
+    claim_thread(loom, "backend", agent_id="worker-1")
+    _, thread = release_thread(loom, "backend", note="done working")
+    assert thread.owner is None
+    assert thread.owned_at is None
+
+
+def test_release_unclaimed_thread_raises(loom: Path) -> None:
+    from loom.services import release_thread
+
+    with pytest.raises(ValueError, match="no active owner"):
+        release_thread(loom, "backend", note="oops")
+
+
+def test_claim_nonexistent_thread_raises(loom: Path) -> None:
+    from loom.services import claim_thread
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        claim_thread(loom, "nonexistent", agent_id="worker-1")
+
+
+# ---------------------------------------------------------------------------
+# Task transitions without CLAIMED
+# ---------------------------------------------------------------------------
+
+
+def test_scheduled_to_reviewing_direct(loom: Path) -> None:
+    """Tasks go SCHEDULED → REVIEWING directly (no CLAIMED step)."""
+    from loom.services import create_task, transition_task
+
+    task, _ = create_task(
+        loom,
+        thread_name="backend",
+        title="Impl token refresh",
+        acceptance="- [ ] POST /auth/refresh works",
+    )
+    assert task.status == TaskStatus.SCHEDULED
+
+    _, updated = transition_task(loom, task.id, TaskStatus.REVIEWING)
+    assert updated.status == TaskStatus.REVIEWING
+
+
+def test_scheduled_to_paused_direct(loom: Path) -> None:
+    """Tasks go SCHEDULED → PAUSED directly."""
+    from loom.models import Decision, DecisionOption
+    from loom.services import create_task, transition_task
+
+    task, _ = create_task(
+        loom,
+        thread_name="backend",
+        title="Choose framework",
+        acceptance="- [ ] framework chosen",
+    )
+    decision = Decision(
+        question="Which framework?",
+        options=[DecisionOption(id="A", label="React"), DecisionOption(id="B", label="Vue")],
+    )
+    _, updated = transition_task(loom, task.id, TaskStatus.PAUSED, decision=decision)
+    assert updated.status == TaskStatus.PAUSED
+
+
+def test_scheduled_to_claimed_rejected(loom: Path) -> None:
+    """SCHEDULED → CLAIMED is no longer a valid transition."""
+    from loom.services import create_task, transition_task
+    from loom.state import InvalidTransitionError
+
+    task, _ = create_task(
+        loom,
+        thread_name="backend",
+        title="blocked task",
+        acceptance="- [ ] ready",
+    )
+    with pytest.raises(InvalidTransitionError):
+        transition_task(loom, task.id, TaskStatus.CLAIMED)
+
+
+# ---------------------------------------------------------------------------
+# Scheduler filtering
+# ---------------------------------------------------------------------------
+
+
+def test_get_ready_tasks_excludes_other_owner(loom: Path) -> None:
+    """Tasks in a thread owned by another agent are excluded."""
+    from loom.scheduler import get_ready_tasks
+    from loom.services import claim_thread, create_task
+
+    create_task(
+        loom,
+        thread_name="backend",
+        title="task1",
+        acceptance="- [ ] ok",
+    )
+    claim_thread(loom, "backend", agent_id="worker-1")
+
+    # worker-2 should not see tasks in worker-1's thread
+    ready = get_ready_tasks(loom, for_agent="worker-2")
+    assert len(ready) == 0
+
+    # worker-1 should see its own tasks
+    ready = get_ready_tasks(loom, for_agent="worker-1")
+    assert len(ready) == 1
+
+
+def test_get_ready_tasks_includes_unowned(loom: Path) -> None:
+    """Tasks in unowned threads are available to any agent."""
+    from loom.scheduler import get_ready_tasks
+    from loom.services import create_task
+
+    create_task(
+        loom,
+        thread_name="backend",
+        title="task1",
+        acceptance="- [ ] ok",
+    )
+    ready = get_ready_tasks(loom, for_agent="worker-99")
+    assert len(ready) == 1
+
+
+# ---------------------------------------------------------------------------
+# Thread model fields
+# ---------------------------------------------------------------------------
+
+
+def test_thread_owner_fields_in_model() -> None:
+    """Thread model has owner and owned_at fields."""
+    t = Thread(name="test", priority=50)
+    assert t.owner is None
+    assert t.owned_at is None
+
+    t2 = t.model_copy(update={"owner": "w1", "owned_at": "2026-01-01T00:00:00+00:00"})
+    assert t2.owner == "w1"
+    assert t2.owned_at == "2026-01-01T00:00:00+00:00"
