@@ -18,8 +18,10 @@ try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical
+    from textual.events import Key
     from textual.screen import ModalScreen
-    from textual.widgets import Button, Footer, Header, Input, Label, ListItem, ListView, Static
+    from textual.timer import Timer
+    from textual.widgets import Button, Footer, Header, Input, Label, ListItem, ListView, Static, TextArea
 
     _TEXTUAL_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -69,11 +71,11 @@ def _detail_text(loom: Path, item: dict[str, Any]) -> str:
     for line in format_review_summary(task)[1:]:
         lines.append(line.lstrip())
 
-    claim_agent, claimed_at = _claim_summary(task)
-    if claim_agent:
-        lines.append(f"Claim : {claim_agent}")
-    if claimed_at:
-        lines.append(f"Claimed at : {claimed_at}")
+    owner_agent, owned_at = _thread_owner(loom, task)
+    if owner_agent:
+        lines.append(f"Thread owner : {owner_agent}")
+    if owned_at:
+        lines.append(f"Owned since  : {owned_at}")
 
     if task.decision:
         decision = task.decision
@@ -116,8 +118,21 @@ def _decision_options(loom: Path, task_id: str) -> list[str]:
     return []
 
 
-def _claim_summary(task: Any) -> tuple[str | None, str | None]:
-    """Return `(agent, claimed_at)` for a task claim payload."""
+def _queue_signature(items: list[dict[str, Any]]) -> tuple[tuple[str, str], ...]:
+    """Return a stable queue signature for reload/watch comparisons."""
+    return tuple((item["kind"], item["id"]) for item in items)
+
+
+def _thread_owner(loom: Any, task: Any) -> tuple[str | None, str | None]:
+    """Return `(owner, owned_at)` for the thread that owns *task*."""
+    from .scheduler import load_all_threads
+
+    threads = load_all_threads(loom)
+    thread = threads.get(task.thread)
+    if thread and thread.owner:
+        return thread.owner, thread.owned_at
+
+    # Backward-compat: fall back to legacy task-level claim.
     from .models import Claim
 
     claim = task.claim
@@ -270,6 +285,133 @@ if _TEXTUAL_AVAILABLE:
             if value:
                 self.dismiss(value)
 
+    class _TextAreaModal(ModalScreen[str | None]):
+        """Generic multi-line text modal. Returns entered text or None."""
+
+        DEFAULT_CSS = """
+        _TextAreaModal {
+            align: center middle;
+        }
+        _TextAreaModal > Vertical {
+            width: 80;
+            height: 24;
+            border: thick $accent;
+            background: $surface;
+            padding: 1 2;
+        }
+        _TextAreaModal Label {
+            margin-bottom: 1;
+        }
+        _TextAreaModal TextArea {
+            height: 1fr;
+            margin-bottom: 1;
+        }
+        _TextAreaModal .buttons {
+            layout: horizontal;
+            align: right middle;
+            height: auto;
+        }
+        _TextAreaModal Button {
+            margin-left: 1;
+        }
+        """
+
+        def __init__(self, prompt: str, *, placeholder: str = "") -> None:
+            super().__init__()
+            self._prompt = prompt
+            self._placeholder = placeholder
+
+        def compose(self) -> ComposeResult:
+            with Vertical():
+                yield Label(self._prompt)
+                yield TextArea(self._placeholder, id="text-area")
+                yield Label("Press Ctrl+Enter to save, or Escape to cancel.")
+                with Horizontal(classes="buttons"):
+                    yield Button("Save", id="ok", variant="primary")
+                    yield Button("Cancel", id="cancel")
+
+        def on_mount(self) -> None:
+            self.query_one("#text-area", TextArea).focus()
+
+        def _submit(self) -> None:
+            value = self.query_one("#text-area", TextArea).text.strip()
+            if value:
+                self.dismiss(value)
+                return
+            self.dismiss(None)
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            if event.button.id == "ok":
+                self._submit()
+                return
+            self.dismiss(None)
+
+        def on_key(self, event: Key) -> None:
+            if event.key == "escape":
+                self.dismiss(None)
+                event.stop()
+                return
+            if event.key == "ctrl+enter":
+                self._submit()
+                event.stop()
+
+    class _HelpModal(ModalScreen[None]):
+        """Compact in-app help inspired by terminal tool shortcut overlays."""
+
+        DEFAULT_CSS = """
+        _HelpModal {
+            align: center middle;
+        }
+        _HelpModal > Vertical {
+            width: 84;
+            height: auto;
+            max-height: 24;
+            border: thick $accent;
+            background: $surface;
+            padding: 1 2;
+        }
+        _HelpModal Static {
+            margin-bottom: 1;
+        }
+        """
+
+        HELP_TEXT = "\n".join(
+            [
+                "Loom approval queue shortcuts",
+                "",
+                "Inspired by compact terminal tools like Copilot / Claude Code / Codex:",
+                "- keep the list and detail panes visible together",
+                "- keep shortcuts visible in the footer + status line",
+                "- use a lightweight help overlay instead of a hidden mode switch",
+                "",
+                "Actions",
+                "  a  accept reviewing task",
+                "  r  reject reviewing task",
+                "  d  decide paused task",
+                "  n  create inbox requirement",
+                "  l  release thread ownership",
+                "  R  reload from .loom/",
+                "  w  toggle watch polling (.loom/ every 1s)",
+                "  q  quit",
+                "",
+                "Limits",
+                "  - .loom/ remains the only source of truth",
+                "  - watch mode polls the filesystem; it does not keep a second cache",
+                "  - plain CLI / review commands stay unchanged outside the TUI",
+                "",
+                "Press Escape, Enter, or q to close this help.",
+            ]
+        )
+
+        def compose(self) -> ComposeResult:
+            with Vertical():
+                yield Static(self.HELP_TEXT)
+
+        def on_key(self, event: Key) -> None:
+            if event.key in {"escape", "enter", "q"}:
+                self.dismiss(None)
+                event.stop()
+
     # ---------------------------------------------------------------------------
     # Main application
     # ---------------------------------------------------------------------------
@@ -312,8 +454,11 @@ if _TEXTUAL_AVAILABLE:
             Binding("a", "accept", "Accept", show=True),
             Binding("r", "reject", "Reject", show=True),
             Binding("d", "decide", "Decide", show=True),
+            Binding("n", "new_requirement", "New Req", show=True),
             Binding("l", "release", "Release", show=True),
             Binding("R", "refresh", "Refresh", show=True),
+            Binding("w", "toggle_watch", "Watch", show=True),
+            Binding("?", "show_help", "Help", show=False),
             Binding("q", "quit", "Quit", show=True),
         ]
 
@@ -321,6 +466,8 @@ if _TEXTUAL_AVAILABLE:
             super().__init__()
             self._loom = loom
             self._queue: list[dict[str, Any]] = []
+            self._queue_signature: tuple[tuple[str, str], ...] = ()
+            self._watch_timer: Timer | None = None
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -333,30 +480,54 @@ if _TEXTUAL_AVAILABLE:
         def on_mount(self) -> None:
             self._reload_queue()
             lv = self.query_one("#queue-list", ListView)
-            lv.border_title = "Queue"
-            self.query_one("#detail-panel", Static).border_title = "Detail"
+            self._set_status(self._idle_status())
 
         # ------------------------------------------------------------------
         # Queue loading
         # ------------------------------------------------------------------
 
-        def _reload_queue(self) -> None:
+        def _reload_queue(self) -> bool:
             from .scheduler import get_interaction_queue
 
-            self._queue = get_interaction_queue(self._loom)
+            current_item = self._current_item()
+            current_id = current_item["id"] if current_item else None
+            items = get_interaction_queue(self._loom)
+            changed = _queue_signature(items) != self._queue_signature
+            self._queue = items
+            self._queue_signature = _queue_signature(items)
             lv = self.query_one("#queue-list", ListView)
             lv.clear()
             for item in self._queue:
                 lv.append(ListItem(Label(_queue_label(item))))
             if self._queue:
-                lv.index = 0
-                self._show_detail(0)
+                selected_index = next((idx for idx, item in enumerate(self._queue) if item["id"] == current_id), 0)
+                lv.index = selected_index
+                self._show_detail(selected_index)
             else:
                 self._set_detail("No paused or reviewing tasks.")
-            self._set_status(
+            self._update_panel_titles()
+            return changed
+
+        def _idle_status(self) -> str:
+            watch_state = "on" if self._watch_timer is not None else "off"
+            return (
                 f"{len(self._queue)} item(s) in queue · [a] accept · [r] reject · "
-                "[d] decide · [l] release · [R] refresh · [q] quit"
+                "[d] decide · [n] new requirement · [l] release · [R] refresh · "
+                f"[w] watch {watch_state} · [?] help · [q] quit"
             )
+
+        def _update_panel_titles(self) -> None:
+            lv = self.query_one("#queue-list", ListView)
+            queue_count = len(self._queue)
+            queue_suffix = "item" if queue_count == 1 else "items"
+            lv.border_title = f"Queue · {queue_count} {queue_suffix}"
+
+            detail = self.query_one("#detail-panel", Static)
+            current = self._current_item()
+            if current is None:
+                detail.border_title = "Detail · no selection"
+                return
+            detail.border_title = f"Detail · {current['id']}"
 
         def _current_item(self) -> dict[str, Any] | None:
             lv = self.query_one("#queue-list", ListView)
@@ -371,6 +542,7 @@ if _TEXTUAL_AVAILABLE:
             else:
                 text = "Select an item from the queue."
             self._set_detail(text)
+            self._update_panel_titles()
 
         def _set_detail(self, text: str) -> None:
             self.query_one("#detail-panel", Static).update(text)
@@ -394,7 +566,51 @@ if _TEXTUAL_AVAILABLE:
 
         def action_refresh(self) -> None:
             self._reload_queue()
-            self._set_status("Refreshed.")
+            self._set_status("Reloaded queue from .loom/. " + self._idle_status())
+
+        def _watch_reload_tick(self) -> None:
+            if self._reload_queue():
+                self._set_status("Detected .loom/ changes and reloaded queue. " + self._idle_status())
+
+        def action_toggle_watch(self) -> None:
+            if self._watch_timer is None:
+                self._reload_queue()
+                self._watch_timer = self.set_interval(1.0, self._watch_reload_tick)
+                self._set_status("Watch enabled (polls .loom/ every 1s). " + self._idle_status())
+                return
+
+            self._watch_timer.stop()
+            self._watch_timer = None
+            self._set_status("Watch disabled. " + self._idle_status())
+
+        def action_show_help(self) -> None:
+            self.push_screen(_HelpModal())
+
+        def action_new_requirement(self) -> None:
+            def _on_body(body: str | None) -> None:
+                if not body:
+                    self._set_status("New requirement cancelled.")
+                    return
+                self._do_create_inbox_item(body)
+
+            self.push_screen(
+                _TextAreaModal(
+                    "New requirement",
+                    placeholder="Describe the requirement here. Multiple lines are supported.",
+                ),
+                _on_body,
+            )
+
+        def _do_create_inbox_item(self, body: str) -> None:
+            from .services import create_inbox_item
+
+            try:
+                item, path = create_inbox_item(self._loom, body)
+            except ValueError as exc:
+                self._set_status(f"Error: {exc}")
+                return
+            self._reload_queue()
+            self._set_status(f"Created {item.id} → {path}. Run manager planning next.")
 
         def action_accept(self) -> None:
             item = self._current_item()
@@ -407,12 +623,11 @@ if _TEXTUAL_AVAILABLE:
             self._do_accept(item)
 
         def _do_accept(self, item: dict[str, Any]) -> None:
-            from .models import TaskStatus
-            from .services import transition_task
+            from .services import accept_task
             from .state import InvalidTransitionError
 
             try:
-                transition_task(self._loom, item["id"], TaskStatus.DONE)
+                accept_task(self._loom, item["id"])
             except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
                 self._set_status(f"Error: {exc}")
                 return
@@ -462,9 +677,9 @@ if _TEXTUAL_AVAILABLE:
                 self._set_status(f"Task file not found: {item['id']}")
                 return
 
-            claim_agent, _claimed_at = _claim_summary(task)
-            if not claim_agent:
-                self._set_status(f"{item['id']} has no active claim to release.")
+            owner_agent, _owned_at = _thread_owner(self._loom, task)
+            if not owner_agent:
+                self._set_status(f"{item['id']} — thread has no active owner to release.")
                 return
 
             def _on_note(note: str | None) -> None:
@@ -485,7 +700,7 @@ if _TEXTUAL_AVAILABLE:
                 self._set_status(f"Error: {exc}")
                 return
             self._reload_queue()
-            self._set_status(f"Released {item['id']} → scheduled.")
+            self._set_status(f"Released thread for {item['id']}.")
 
         def action_decide(self) -> None:
             item = self._current_item()

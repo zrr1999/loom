@@ -12,23 +12,26 @@ import typer
 from loguru import logger
 
 from .agent import app as agent_app
+from .agent import spawn_worker_runtime
+from .agent import start as agent_start
 from .config import ensure_settings
-from .frontmatter import write_model
 from .history import read_events
-from .ids import next_inbox_seq
-from .migration import ensure_name_based_threads
-from .models import Decision, InboxItem, TaskStatus
+from .migration import ensure_name_based_threads, ensure_worker_agent_subtree
+from .models import AgentRole, Decision, TaskStatus
 from .prompting import select, text
 from .repository import load_inbox_item, load_task, require_loom, root_config_path
 from .runtime import global_root, set_root
 from .scheduler import get_interaction_queue, get_pending_inbox_items, get_status_summary, load_all_tasks
 from .services import (
+    accept_task,
+    create_inbox_item,
     decide_task,
     ensure_agent_layout,
     format_review_summary,
     plan_inbox_item,
     reject_task,
     release_claim,
+    release_thread,
     transition_task,
 )
 from .state import InvalidTransitionError
@@ -48,11 +51,30 @@ app.add_typer(inbox_app, name="inbox")
 def _resolve_loom() -> Path:
     try:
         loom = require_loom()
+        ensure_worker_agent_subtree(loom)
         ensure_name_based_threads(loom)
         return loom
     except FileNotFoundError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
+
+
+def _require_non_worker_review_context() -> None:
+    worker_id = os.environ.get("LOOM_WORKER_ID", "").strip()
+    if not worker_id:
+        return
+    typer.echo(
+        (
+            "ERROR [worker_not_allowed]: loom review is reviewer/human-only. "
+            f"LOOM_WORKER_ID={worker_id!r} is set, so this process is running as a worker. "
+            "Finish runtime work with `loom agent done <task-id>` or "
+            "`loom agent pause <task-id> --question '...'`, then switch to a clean reviewer "
+            "or human process without `LOOM_WORKER_ID` and use `loom agent start --role reviewer`, "
+            "`loom review`, and `loom accept <task-id>` / `loom reject <task-id> '<reason>'` as needed."
+        ),
+        err=True,
+    )
+    raise typer.Exit(1)
 
 
 @app.command()
@@ -81,13 +103,12 @@ def inbox_add(
 ) -> None:
     """Add a new requirement to the inbox."""
     loom = _resolve_loom()
-
-    seq = next_inbox_seq(loom / "inbox")
-    rq_id = f"RQ-{seq:03d}"
-    item = InboxItem(id=rq_id, body=description)
-    path = loom / "inbox" / f"{rq_id}.md"
-    write_model(path, item)
-    typer.echo(f"Created {rq_id}: {path}")
+    try:
+        item, path = create_inbox_item(loom, description)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Created {item.id}: {path}")
 
 
 @app.command()
@@ -114,10 +135,38 @@ def status() -> None:
         for item in queue:
             typer.echo(f"  {item['kind']}: {item['id']} - {item['title']}")
 
+    capabilities = cast("list[dict[str, Any]]", summary.get("capabilities", []))
+    if capabilities:
+        typer.echo("Capabilities:")
+        for capability in capabilities:
+            line = f"  {capability['thread']}: {capability['phase']}"
+            latest = capability.get("latest_completed")
+            if isinstance(latest, dict):
+                line += f" (latest {latest['id']} [{latest['kind']} {latest['status']}])"
+            typer.echo(line)
+            follow_up = capability.get("implementation_follow_up")
+            if isinstance(follow_up, dict):
+                typer.echo(f"    implementation follow-up: {follow_up['id']} [{follow_up['status']}]")
+
+
+@app.command()
+def manage() -> None:
+    """Open the manager bootstrap guide from the top-level CLI."""
+    agent_start(role=AgentRole.MANAGER)
+
+
+@app.command()
+def spawn(
+    threads: str = typer.Option("", "--threads", help="Comma-separated thread assignment."),
+) -> None:
+    """Register a new worker agent from the top-level CLI."""
+    spawn_worker_runtime(threads=threads)
+
 
 @app.command()
 def review() -> None:
     """List reviewing tasks without entering the interactive approval loop."""
+    _require_non_worker_review_context()
     loom = _resolve_loom()
 
     tasks = [task for task in load_all_tasks(loom) if task.status == TaskStatus.REVIEWING]
@@ -154,7 +203,7 @@ def accept(task_id: str = typer.Argument(..., help="Task ID to accept.")) -> Non
     """Accept a reviewing task -> done."""
     loom = _resolve_loom()
     try:
-        transition_task(loom, task_id, TaskStatus.DONE)
+        accept_task(loom, task_id)
     except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
@@ -193,17 +242,24 @@ def decide(
 
 @app.command()
 def release(
-    task_id: str = typer.Argument(..., help="Claimed task ID to release."),
-    note: str = typer.Argument(..., help="Reason for releasing the claim."),
+    target: str = typer.Argument(..., help="Thread name or task ID to release ownership of."),
+    note: str = typer.Argument(..., help="Reason for releasing."),
 ) -> None:
-    """Release a claimed task back to scheduled."""
+    """Release thread ownership (or a legacy task claim) back to the pool."""
     loom = _resolve_loom()
     try:
-        release_claim(loom, task_id, note=note)
+        from .scheduler import load_all_threads
+
+        threads = load_all_threads(loom)
+        if target in threads:
+            release_thread(loom, target, note=note)
+            typer.echo(f"Released thread {target}.")
+            return
+        release_claim(loom, target, note=note)
+        typer.echo(f"Released {target}.")
     except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
-    typer.echo(f"Released {task_id} -> scheduled.")
 
 
 def _render_item_detail(loom: Path, item: dict[str, Any]) -> None:
@@ -313,7 +369,7 @@ def _handle_reviewing_item(loom: Path, item: dict[str, Any]) -> str:
             _render_item_detail(loom, item)
             continue
         if action == "accept":
-            transition_task(loom, item["id"], TaskStatus.DONE)
+            accept_task(loom, item["id"])
             typer.echo(f"Accepted {item['id']} -> done.")
             return "accepted"
         if action == "reject":
@@ -381,6 +437,7 @@ def inbox_main(ctx: typer.Context) -> None:
 def main(
     ctx: typer.Context,
     global_mode: bool = typer.Option(False, "-g", help="Use the home-level loom directory."),
+    plain: bool = typer.Option(False, "--plain", help="Use the plain prompt-based approval loop instead of the TUI."),
 ) -> None:
     """Enter the default interactive queue when no subcommand is provided."""
     set_root(global_root() if global_mode else None)
@@ -388,22 +445,36 @@ def main(
         return
 
     loom = _resolve_loom()
-    _run_queue(loom)
+    if plain:
+        _run_queue(loom)
+        return
+
+    try:
+        from .tui import run_tui
+
+        run_tui(loom)
+    except ImportError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        typer.echo("Hint: install the TUI extra with `uv sync --extra tui`, or run `loom --plain`.", err=True)
+        raise typer.Exit(1) from exc
 
 
 @app.command()
 def tui() -> None:
     """Open the Textual approval-queue TUI (requires the 'tui' optional dependency).
 
-    Browse and act on paused / reviewing queue items interactively.
-    Add new requirements first with `loom inbox add "..."`, then run agents
-    to produce work for review before launching the TUI.
+    Browse and act on paused / reviewing queue items interactively, and add
+    new requirements into `.loom/inbox/` from inside the TUI.
 
     Key bindings inside the TUI:
       a  accept the selected reviewing task
       r  reject the selected reviewing task (prompts for reason)
       d  decide on the selected paused task (prompts for choice)
+      n  add a new inbox requirement (multi-line)
+      l  release the selected claimed queue item (prompts for reason)
       R  refresh the queue from disk
+      w  toggle watch mode (polls .loom/ every 1s)
+      ?  show the in-app shortcut/help overlay
       q  quit
     """
     loom = _resolve_loom()
