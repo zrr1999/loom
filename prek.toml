@@ -43,7 +43,7 @@ repo = "local"
 [[repos.hooks]]
 id = "commit-message-format"
 name = "commit message format"
-entry = "uv run python -m loom.commit_message"
+entry = "uv run python -m tools.hooks.commit_message_validator"
 language = "system"
 stages = ["commit-msg"]
 always_run = true

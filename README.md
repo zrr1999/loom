@@ -174,5 +174,4 @@ Managers should prefer mailbox-first delegation once a worker exists: use `loom 
 
 `loom manage` is the preferred manager entrypoint, while `loom agent start` remains the lower-level runtime source of truth for the manager loop behavior. The role file is the stable role definition that points contributors to that loop and command contract.
 
-
 `loom spawn` replaces the old `loom agent spawn` entrypoint. Running the legacy command now prints a migration hint that points to `loom spawn`.

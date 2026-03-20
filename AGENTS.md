@@ -15,6 +15,12 @@
 
 ## Roles
 
+### Director / orchestrator
+
+- Bootstrap orchestration in this repo with `just start`
+- Any suitable agent or human may perform director duties from that prompt
+- Stay above the runtime loop; decide whether manager, worker, reviewer, or a human should act next
+
 ### Human
 
 - Add requirements with `uv run loom inbox add "..."`
@@ -52,6 +58,20 @@
 - Update `tests/e2e/test_cli.py` when command output or flow changes
 - Prefer preserving existing plain-text CLI output shape unless the task explicitly changes it
 - Use `just format`, `just check`, and `just test` before wrapping up code changes
+
+### Incremental commit expectations
+
+Commit meaningful completed changes promptly during implementation work instead of accumulating a single large diff at the end. Each commit should be a coherent, self-contained unit of progress that follows the repo's `<emoji> <type>(<scope>)?: <subject>` format.
+
+Practical guidance:
+
+- Commit after completing a logical step: a new function, a passing test, a docs update, a config change
+- Keep each commit focused on one type of change — avoid mixing unrelated feature work, refactors, and doc updates in the same commit
+- A good rhythm is to commit whenever you would naturally describe progress to a colleague: "added the validator", "fixed the edge case", "updated the CLI docs"
+- Do not wait until the entire task is finished to make your first commit; reviewers and future readers benefit from incremental history
+- If you realize a commit is growing too large, split it: stage related hunks with `git add -p` and commit them separately
+
+This expectation complements the commit-msg hook — the hook enforces format, this convention encourages timely, well-scoped commits throughout a task.
 
 ## Current caveats
 
