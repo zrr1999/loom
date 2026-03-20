@@ -11,9 +11,9 @@ from .history import append_event
 from .ids import (
     canonical_thread_name,
     next_agent_id,
+    next_inbox_seq,
     next_message_seq,
     next_task_seq,
-    next_thread_id,
     task_filename,
     task_id,
 )
@@ -21,7 +21,6 @@ from .models import (
     AgentRecord,
     AgentRole,
     AgentStatus,
-    Claim,
     Decision,
     DecisionOption,
     InboxItem,
@@ -29,7 +28,9 @@ from .models import (
     ManagerRecord,
     Message,
     MessageType,
+    ReviewEntry,
     Task,
+    TaskKind,
     TaskStatus,
     Thread,
     find_review_blockers,
@@ -45,6 +46,7 @@ from .repository import (
     load_message,
     load_task,
     manager_path,
+    worker_agents_dir,
     workspace_root,
 )
 from .scheduler import load_all_tasks, load_all_threads
@@ -74,7 +76,7 @@ def create_thread(
     name: str = "",
     priority: int = 50,
 ) -> tuple[Thread, Path, list[str]]:
-    """Create a thread with a human-facing name and a short internal id."""
+    """Create a thread keyed only by its canonical human-readable name."""
     threads_dir = loom / "threads"
     resolved_name = canonical_thread_name(name)
     existing = load_all_threads(loom)
@@ -86,7 +88,6 @@ def create_thread(
     thread_dir.mkdir(parents=True, exist_ok=False)
 
     thread = Thread(
-        id=next_thread_id(thread.id for thread in existing.values()),
         name=resolved_name,
         priority=priority,
         body=thread_body(),
@@ -98,7 +99,7 @@ def create_thread(
         "thread.created",
         "thread",
         thread.name,
-        {"id": thread.id, "priority": thread.priority},
+        {"priority": thread.priority},
     )
     return thread, path, duplicate_ids
 
@@ -106,10 +107,26 @@ def create_thread(
 def ensure_agent_layout(loom: Path) -> None:
     agents_root = agents_dir(loom)
     agents_root.mkdir(parents=True, exist_ok=True)
+    worker_agents_dir(loom).mkdir(parents=True, exist_ok=True)
     manager_file = manager_path(loom)
     if not manager_file.exists():
         manager = ManagerRecord(last_seen=datetime.now(UTC).isoformat(timespec="seconds"), checkpoint_summary="ready")
         write_model(manager_file, manager)
+
+
+def create_inbox_item(loom: Path, description: str) -> tuple[InboxItem, Path]:
+    """Create a new pending inbox item."""
+    body = description.strip()
+    if not body:
+        raise ValueError("description must not be empty")
+
+    seq = next_inbox_seq(loom / "inbox")
+    rq_id = f"RQ-{seq:03d}"
+    item = InboxItem(id=rq_id, body=body)
+    path = loom / "inbox" / f"{rq_id}.md"
+    write_model(path, item)
+    append_event(loom, "inbox.created", "inbox", item.id, {"status": item.status.value})
+    return item, path
 
 
 def spawn_agent(loom: Path, *, threads: list[str] | None = None) -> dict[str, object]:
@@ -125,7 +142,7 @@ def spawn_agent(loom: Path, *, threads: list[str] | None = None) -> dict[str, ob
     now = datetime.now(UTC).isoformat(timespec="seconds")
     record = AgentRecord(
         id=agent_id,
-        role=AgentRole.EXECUTOR,
+        role=AgentRole.WORKER,
         registered=now,
         last_seen=now,
         status=AgentStatus.IDLE,
@@ -137,7 +154,7 @@ def spawn_agent(loom: Path, *, threads: list[str] | None = None) -> dict[str, ob
 
     env_path = agent_root / f"{agent_id}.env"
     env_lines = [
-        f"LOOM_AGENT_ID={agent_id}",
+        f"LOOM_WORKER_ID={agent_id}",
         f"LOOM_DIR={loom}",
     ]
     if threads:
@@ -261,14 +278,23 @@ def reply_to_message(loom: Path, agent_id: str, msg_id: str, body: str) -> dict[
 
 
 def release_claim(loom: Path, task_id: str, *, note: str) -> tuple[Path, Task]:
-    return transition_task(loom, task_id, TaskStatus.SCHEDULED, rejection_note=note)
+    """Backward-compat shim — releases thread ownership for the task's thread."""
+    path, task = load_task(loom, task_id)
+    threads = load_all_threads(loom)
+    thread = threads.get(task.thread)
+    if thread and thread.owner:
+        release_thread(loom, task.thread, note=note)
+    if task.status == TaskStatus.CLAIMED:
+        return transition_task(loom, task_id, TaskStatus.SCHEDULED, rejection_note=note)
+    return path, task
 
 
 def create_task(
     loom: Path,
     *,
-    thread_id: str,
+    thread_name: str,
     title: str,
+    kind: TaskKind = TaskKind.IMPLEMENTATION,
     priority: int = 50,
     acceptance: str = "",
     depends_on: str | list[str] | None = None,
@@ -277,15 +303,14 @@ def create_task(
     implementation_direction: str = "",
 ) -> tuple[Task, Path]:
     threads = load_all_threads(loom)
-    canonical_thread = canonical_thread_name(thread_id)
+    canonical_thread = canonical_thread_name(thread_name)
     if canonical_thread not in threads:
         raise FileNotFoundError(f"thread '{canonical_thread}' does not exist")
 
     thread_dir = loom / "threads" / canonical_thread
-    thread = threads[canonical_thread]
     seq = next_task_seq(thread_dir)
     normalized_title = title.strip() or f"task-{seq}"
-    internal_task_id = task_id(thread.id, seq)
+    readable_task_id = task_id(canonical_thread, seq)
 
     normalized_acceptance = acceptance.strip()
     status = TaskStatus.SCHEDULED if normalized_acceptance else TaskStatus.DRAFT
@@ -300,10 +325,11 @@ def create_task(
             raise ValueError(f"depends_on references unknown task(s): {', '.join(missing)}")
 
     task = Task(
-        id=internal_task_id,
+        id=readable_task_id,
         thread=canonical_thread,
         seq=seq,
         title=normalized_title,
+        kind=kind,
         status=status,
         priority=priority,
         depends_on=parsed_depends_on,
@@ -331,6 +357,7 @@ def transition_task(
     output: str | None = None,
     rejection_note: str | None = None,
     decision: Decision | None = None,
+    review_entry: ReviewEntry | None = None,
 ) -> tuple[Path, Task]:
     path, task = load_task(loom, task_id)
     validate_task_transition(task.status, target_status)
@@ -345,6 +372,8 @@ def transition_task(
         updates["rejection_note"] = rejection_note
     if decision is not None:
         updates["decision"] = decision
+    if review_entry is not None:
+        updates["review_history"] = [*task.review_history, review_entry]
 
     updated = Task.model_validate(task.model_dump(mode="python") | updates)
     write_model(path, updated)
@@ -387,19 +416,54 @@ def complete_task(loom: Path, task_id: str, *, output: str | None = None) -> tup
     return path, updated, blockers
 
 
-def claim_task(loom: Path, task_id: str, *, agent_id: str) -> tuple[Path, Task]:
-    path, task = load_task(loom, task_id)
-    validate_task_transition(task.status, TaskStatus.CLAIMED)
+def claim_thread(loom: Path, thread_name: str, *, agent_id: str) -> tuple[Path, Thread]:
+    """Claim a thread for an agent.  One active owner per thread maximum."""
+    threads = load_all_threads(loom)
+    canonical = canonical_thread_name(thread_name)
+    if canonical not in threads:
+        raise FileNotFoundError(f"thread '{canonical}' does not exist")
 
-    claim = Claim(agent=agent_id, claimed_at=datetime.now(UTC).isoformat(timespec="seconds"))
-    updated = task.model_copy(update={"status": TaskStatus.CLAIMED, "claim": claim})
+    thread = threads[canonical]
+    if thread.owner and thread.owner != agent_id:
+        raise ValueError(f"thread '{canonical}' is already owned by '{thread.owner}'")
+
+    path = loom / "threads" / canonical / "_thread.md"
+    if thread.owner == agent_id:
+        return path, thread
+
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    updated = thread.model_copy(update={"owner": agent_id, "owned_at": now})
     write_model(path, updated)
     append_event(
         loom,
-        "task.claimed",
-        "task",
-        task.id,
-        {"agent": agent_id, "claimed_at": claim.claimed_at},
+        "thread.claimed",
+        "thread",
+        canonical,
+        {"agent": agent_id, "owned_at": now},
+    )
+    return path, updated
+
+
+def release_thread(loom: Path, thread_name: str, *, note: str = "") -> tuple[Path, Thread]:
+    """Release thread ownership back to the pool."""
+    threads = load_all_threads(loom)
+    canonical = canonical_thread_name(thread_name)
+    if canonical not in threads:
+        raise FileNotFoundError(f"thread '{canonical}' does not exist")
+
+    thread = threads[canonical]
+    if not thread.owner:
+        raise ValueError(f"thread '{canonical}' has no active owner")
+
+    updated = thread.model_copy(update={"owner": None, "owned_at": None})
+    path = loom / "threads" / canonical / "_thread.md"
+    write_model(path, updated)
+    append_event(
+        loom,
+        "thread.released",
+        "thread",
+        canonical,
+        {"previous_owner": thread.owner, "note": note},
     )
     return path, updated
 
@@ -450,7 +514,7 @@ def plan_inbox_item(loom: Path, rq_id: str) -> dict[str, object]:
     validate_inbox_transition(item.status, InboxStatus.PLANNED)
 
     settings = load_settings(workspace_root(loom))
-    created_thread_id: str | None = None
+    created_thread_name: str | None = None
     threads = load_all_threads(loom)
     if not threads:
         thread, _, _duplicates = create_thread(
@@ -459,14 +523,14 @@ def plan_inbox_item(loom: Path, rq_id: str) -> dict[str, object]:
             priority=settings.threads.default_priority,
         )
         threads = {thread.name: thread}
-        created_thread_id = thread.name
+        created_thread_name = thread.name
 
     target_thread = max(threads.values(), key=lambda thread: (thread.priority, thread.name))
     title = derive_task_title(item)
     acceptance = "- [ ] 覆盖需求描述中的核心行为\n- [ ] 产出可供人工验收的结果"
     task, path = create_task(
         loom,
-        thread_id=target_thread.name,
+        thread_name=target_thread.name,
         title=title,
         priority=target_thread.priority,
         acceptance=acceptance,
@@ -475,7 +539,7 @@ def plan_inbox_item(loom: Path, rq_id: str) -> dict[str, object]:
         implementation_direction=f"围绕 {item.id} 先拆出第一条可执行任务, 后续再继续细化。",
     )
 
-    planned_link = f"{task.thread}/{task.id}"
+    planned_link = task.id
     planned_to = [*item.planned_to, planned_link]
     updated_item = item.model_copy(update={"status": InboxStatus.PLANNED, "planned_to": planned_to})
     write_model(inbox_path, updated_item)
@@ -484,14 +548,14 @@ def plan_inbox_item(loom: Path, rq_id: str) -> dict[str, object]:
         "inbox.planned",
         "inbox",
         item.id,
-        {"planned_to": planned_to, "created_thread": created_thread_id},
+        {"planned_to": planned_to, "created_thread": created_thread_name},
     )
 
     return {
         "rq_id": item.id,
         "status": updated_item.status.value,
         "planned_to": planned_link,
-        "created_thread": created_thread_id,
+        "created_thread": created_thread_name,
         "tasks": [{"id": task.id, "file": str(path)}],
     }
 
@@ -503,21 +567,60 @@ def derive_task_title(item: InboxItem) -> str:
 
 
 def reject_task(loom: Path, task_id: str, note: str) -> tuple[Path, Task]:
-    return transition_task(loom, task_id, TaskStatus.SCHEDULED, rejection_note=note)
+    entry = ReviewEntry(
+        kind="reject",
+        actor="human",
+        created=datetime.now(UTC).isoformat(timespec="seconds"),
+        note=note,
+        source="cli",
+    )
+    return transition_task(loom, task_id, TaskStatus.SCHEDULED, rejection_note=note, review_entry=entry)
+
+
+def accept_task(loom: Path, task_id: str, *, note: str = "") -> tuple[Path, Task]:
+    entry = ReviewEntry(
+        kind="accept",
+        actor="human",
+        created=datetime.now(UTC).isoformat(timespec="seconds"),
+        note=note,
+        source="cli",
+    )
+    return transition_task(loom, task_id, TaskStatus.DONE, review_entry=entry)
 
 
 def format_review_summary(task: Task) -> list[str]:
+    """Format a task for review display, emphasizing outcomes first.
+
+    Order: title/status → acceptance criteria → output/results →
+    review history → metadata (kind, depends_on, created_from).
+    """
     lines = [f"{task.id}: {task.title}"]
     lines.append(f"  status: {task.status.value}")
-    if task.output:
-        lines.append(f"  output: {task.output}")
-    if task.depends_on:
-        lines.append(f"  depends_on: {', '.join(task.depends_on)}")
-    if task.rejection_note:
-        lines.append(f"  rejection_note: {task.rejection_note}")
-    if task.created_from:
-        lines.append(f"  created_from: {', '.join(task.created_from)}")
+
+    # -- Outcome-first: acceptance criteria --
     if task.acceptance:
         lines.append("  acceptance:")
         lines.extend(f"    {line}" for line in task.acceptance.splitlines())
+
+    # -- Output / results --
+    if task.output:
+        lines.append(f"  output: {task.output}")
+
+    # -- Review history (append-only) --
+    if task.review_history:
+        lines.append("  review_history:")
+        for entry in task.review_history:
+            ts = entry.created[:16] if entry.created else "unknown"
+            note_suffix = f"  {entry.note}" if entry.note else ""
+            lines.append(f"    {ts} {entry.kind}{note_suffix}")
+    elif task.rejection_note:
+        # Backward compat: show legacy single rejection_note if no history
+        lines.append(f"  rejection_note: {task.rejection_note}")
+
+    # -- Secondary metadata --
+    lines.append(f"  kind: {task.kind.value}")
+    if task.depends_on:
+        lines.append(f"  depends_on: {', '.join(task.depends_on)}")
+    if task.created_from:
+        lines.append(f"  created_from: {', '.join(task.created_from)}")
     return lines

@@ -24,6 +24,11 @@ class TaskStatus(StrEnum):
     DONE = "done"
 
 
+class TaskKind(StrEnum):
+    IMPLEMENTATION = "implementation"
+    DESIGN = "design"
+
+
 class InboxStatus(StrEnum):
     PENDING = "pending"
     PLANNED = "planned"
@@ -31,8 +36,10 @@ class InboxStatus(StrEnum):
 
 
 class AgentRole(StrEnum):
+    DIRECTOR = "director"
     MANAGER = "manager"
-    EXECUTOR = "executor"
+    REVIEWER = "reviewer"
+    WORKER = "worker"
 
 
 class AgentStatus(StrEnum):
@@ -56,7 +63,8 @@ class MessageType(StrEnum):
 
 TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.DRAFT: {TaskStatus.SCHEDULED},
-    TaskStatus.SCHEDULED: {TaskStatus.CLAIMED},
+    TaskStatus.SCHEDULED: {TaskStatus.REVIEWING, TaskStatus.PAUSED},
+    # CLAIMED is kept for backward-compat reads of pre-migration task files.
     TaskStatus.CLAIMED: {TaskStatus.REVIEWING, TaskStatus.PAUSED, TaskStatus.SCHEDULED},
     TaskStatus.REVIEWING: {TaskStatus.DONE, TaskStatus.SCHEDULED},
     TaskStatus.PAUSED: {TaskStatus.SCHEDULED},
@@ -99,7 +107,19 @@ class Decision(BaseModel):
     decided: str | None = None
 
 
+class ReviewEntry(BaseModel):
+    """A single append-only record of a review event (accept or reject)."""
+
+    kind: str  # "accept" or "reject"
+    actor: str = "human"
+    created: str = ""
+    note: str = ""
+    source: str = "cli"
+
+
 class Claim(BaseModel):
+    """Legacy task-level claim — kept for backward-compat reads only."""
+
     agent: str | None = None
     claimed_at: str | None = None
 
@@ -110,10 +130,11 @@ class Claim(BaseModel):
 
 
 class Thread(BaseModel):
-    id: str
     name: str
     priority: int = 50
     created: date = Field(default_factory=date.today)
+    owner: str | None = None
+    owned_at: str | None = None
     body: str = ""
 
 
@@ -127,15 +148,17 @@ class Task(BaseModel):
     thread: str
     seq: int
     title: str
+    kind: TaskKind = TaskKind.IMPLEMENTATION
     status: TaskStatus = TaskStatus.DRAFT
     priority: int = 50
     depends_on: list[str] = Field(default_factory=list)
     created_from: list[str] = Field(default_factory=list)
     created: date = Field(default_factory=date.today)
     output: str | None = None
-    claim: Claim | dict[str, Any] | None = None
+    claim: Claim | dict[str, Any] | None = None  # deprecated: kept for backward-compat reads
     decision: Decision | dict[str, Any] | None = None
     rejection_note: str | None = None
+    review_history: list[ReviewEntry] = Field(default_factory=list)
     acceptance: str | None = None
     body: str = ""
 
@@ -207,13 +230,20 @@ class InboxItem(BaseModel):
 
 class AgentRecord(BaseModel):
     id: str
-    role: AgentRole = AgentRole.EXECUTOR
+    role: AgentRole = AgentRole.WORKER
     registered: str | None = None
     last_seen: str | None = None
     status: AgentStatus = AgentStatus.IDLE
     threads: list[str] = Field(default_factory=list)
     checkpoint_summary: str = ""
     body: str = "## Checkpoint\n\n未记录。\n\n## Notes\n\n"
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _upgrade_executor_role(cls, value: Any) -> Any:
+        if value == "executor":
+            return AgentRole.WORKER
+        return value
 
 
 class ManagerRecord(BaseModel):
