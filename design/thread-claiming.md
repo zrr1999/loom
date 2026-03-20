@@ -35,12 +35,16 @@ Current Loom claims work at the task level. RQ-011 asks to move ownership up one
     daily/
 ```
 
-## Model changes
+## Model changes (implemented)
 
-- move `claim` from `Task` to `Thread`
-- remove task status `claimed`
-- remove task field `output` as the primary output surface
-- extend thread metadata to describe current owner and shared outputs
+- `Thread` gains `owner: str | None` and `owned_at: str | None`
+- `Task.claim` deprecated (kept for backward-compat reads)
+- `TASK_TRANSITIONS[SCHEDULED]` now allows `{REVIEWING, PAUSED}` — skips CLAIMED
+- `TaskStatus.CLAIMED` enum value kept for backward-compat reads of old files
+- `claim_task()` replaced by `claim_thread()` / `release_thread()`
+- Agent `next` command claims the thread, not individual tasks
+- Workers see "ASSIGNED TASKS"; managers see "READY TASKS" (no claiming)
+- `release_claim()` is a backward-compat shim that delegates to `release_thread()`
 
 ## Risks
 

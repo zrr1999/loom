@@ -14,19 +14,19 @@
 
 ## `.loom/threads/<thread-name>/_thread.md`
 
-- `id`: short internal thread id (`thaa`, `thab`, ...)
 - `name`: stable human-facing thread directory name
-- thread strategy: `sequential | parallel`
+- `owner`: agent currently owning this thread (at most one)
+- `owned_at`: ISO timestamp when ownership was claimed
 - cross-thread priority
 
 ## `.loom/threads/<thread-name>/<seq>.md`
 
 - filename is only the per-thread sequence (`001.md`, `002.md`, ...)
 - `id`: global task id composed as `<thread-id>-<seq>` (for example `thaa-001`)
-- `status`: `draft | scheduled | claimed | reviewing | paused | done`
+- `status`: `draft | scheduled | reviewing | paused | done` (CLAIMED kept for backward-compat)
 - `depends_on`: cross-thread task dependencies
 - `created_from`: source inbox IDs
-- `claim`: agent id + claim timestamp while claimed
+- `claim`: *(deprecated)* legacy task-level claim, kept for old files
 - `acceptance`: required before entering `scheduled`
 - `decision`: required while `paused`
 - `reviewing`: rejected for tasks whose body/output still advertises TODOs, proposal-only output, or known follow-up improvements
