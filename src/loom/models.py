@@ -32,7 +32,10 @@ class InboxStatus(StrEnum):
 
 class AgentRole(StrEnum):
     MANAGER = "manager"
-    EXECUTOR = "executor"
+    WORKER = "worker"
+    DIRECTOR = "director"
+    REVIEWER = "reviewer"
+    EXECUTOR = "executor"  # legacy alias
 
 
 class AgentStatus(StrEnum):
@@ -56,7 +59,8 @@ class MessageType(StrEnum):
 
 TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.DRAFT: {TaskStatus.SCHEDULED},
-    TaskStatus.SCHEDULED: {TaskStatus.CLAIMED},
+    TaskStatus.SCHEDULED: {TaskStatus.REVIEWING, TaskStatus.PAUSED},
+    # CLAIMED kept for backward-compat reads of pre-migration task files.
     TaskStatus.CLAIMED: {TaskStatus.REVIEWING, TaskStatus.PAUSED, TaskStatus.SCHEDULED},
     TaskStatus.REVIEWING: {TaskStatus.DONE, TaskStatus.SCHEDULED},
     TaskStatus.PAUSED: {TaskStatus.SCHEDULED},
@@ -100,6 +104,8 @@ class Decision(BaseModel):
 
 
 class Claim(BaseModel):
+    """Legacy task-level claim — kept for backward-compat reads only."""
+
     agent: str | None = None
     claimed_at: str | None = None
 
@@ -114,6 +120,8 @@ class Thread(BaseModel):
     name: str
     priority: int = 50
     created: date = Field(default_factory=date.today)
+    owner: str | None = None
+    owned_at: str | None = None
     body: str = ""
 
 
@@ -133,7 +141,7 @@ class Task(BaseModel):
     created_from: list[str] = Field(default_factory=list)
     created: date = Field(default_factory=date.today)
     output: str | None = None
-    claim: Claim | dict[str, Any] | None = None
+    claim: Claim | dict[str, Any] | None = None  # deprecated: backward-compat only
     decision: Decision | dict[str, Any] | None = None
     rejection_note: str | None = None
     acceptance: str | None = None
