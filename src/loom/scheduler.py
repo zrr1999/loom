@@ -66,9 +66,7 @@ def is_ready(task: Task, all_tasks: list[Task], threads: dict[str, Thread]) -> b
     return all(dep_id in done_ids for dep_id in task.depends_on)
 
 
-def get_ready_tasks(
-    loom_dir: Path, thread_filter: str | None = None, *, for_agent: str | None = None
-) -> list[Task]:
+def get_ready_tasks(loom_dir: Path, thread_filter: str | None = None, *, for_agent: str | None = None) -> list[Task]:
     """Return all ready tasks in dispatch order.
 
     When *for_agent* is given, tasks in threads owned by a **different** agent
@@ -81,11 +79,7 @@ def get_ready_tasks(
         ready = [task for task in ready if task.thread == thread_filter]
 
     if for_agent:
-        ready = [
-            task
-            for task in ready
-            if not threads[task.thread].owner or threads[task.thread].owner == for_agent
-        ]
+        ready = [task for task in ready if not threads[task.thread].owner or threads[task.thread].owner == for_agent]
 
     ready.sort(key=lambda task: sort_key(task, threads))
     return ready
@@ -281,9 +275,7 @@ def get_status_summary(loom_dir: Path) -> dict[str, Any]:
         inbox_by_status[item.status.value] = inbox_by_status.get(item.status.value, 0) + 1
 
     owned_threads = {
-        name: {"owner": thread.owner, "owned_at": thread.owned_at}
-        for name, thread in threads.items()
-        if thread.owner
+        name: {"owner": thread.owner, "owned_at": thread.owned_at} for name, thread in threads.items() if thread.owner
     }
 
     return {

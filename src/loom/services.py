@@ -278,13 +278,16 @@ def reply_to_message(loom: Path, agent_id: str, msg_id: str, body: str) -> dict[
 
 
 def release_claim(loom: Path, task_id: str, *, note: str) -> tuple[Path, Task]:
-    """Backward-compat shim — releases thread ownership for the task's thread."""
+    """Release thread ownership and revert the task toward SCHEDULED.
+
+    Works for both legacy CLAIMED tasks and current REVIEWING tasks.
+    """
     path, task = load_task(loom, task_id)
     threads = load_all_threads(loom)
     thread = threads.get(task.thread)
     if thread and thread.owner:
         release_thread(loom, task.thread, note=note)
-    if task.status == TaskStatus.CLAIMED:
+    if task.status in {TaskStatus.CLAIMED, TaskStatus.REVIEWING}:
         return transition_task(loom, task_id, TaskStatus.SCHEDULED, rejection_note=note)
     return path, task
 

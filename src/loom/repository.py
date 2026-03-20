@@ -5,9 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from .config import config_path, load_settings
-from .frontmatter import read_model
+from .frontmatter import read_model, read_raw
 from .ids import split_task_id, task_filename
-from .models import AgentRecord, InboxItem, ManagerRecord, Message, Task, Thread
+from .models import AgentRecord, InboxItem, ManagerRecord, Message, Task
 from .runtime import resolve_root
 
 
@@ -43,20 +43,10 @@ def find_task_path(loom: Path, task_id: str) -> Path:
 
     parsed = split_task_id(task_id)
     if parsed is not None:
-        thread_internal_id, seq = parsed
-        for thread_dir in sorted(threads_dir.iterdir()):
-            if not thread_dir.is_dir():
-                continue
-            meta_file = thread_dir / "_thread.md"
-            if not meta_file.exists():
-                continue
-            thread = read_model(meta_file, Thread)
-            if thread.id != thread_internal_id:
-                continue
-            path = thread_dir / task_filename(seq)
-            if path.exists():
-                return path
-            break
+        thread_name, seq = parsed
+        path = threads_dir / thread_name / task_filename(seq)
+        if path.exists():
+            return path
 
     for thread_dir in sorted(threads_dir.iterdir()):
         if not thread_dir.is_dir():
@@ -65,6 +55,9 @@ def find_task_path(loom: Path, task_id: str) -> Path:
             if path.name == "_thread.md":
                 continue
             if path.stem == task_id or path.stem.startswith(f"{task_id}-"):
+                return path
+            metadata, _body = read_raw(path)
+            if metadata.get("id") == task_id:
                 return path
 
     raise FileNotFoundError(f"task '{task_id}' not found")
@@ -95,12 +88,24 @@ def agents_dir(loom: Path) -> Path:
     return loom / "agents"
 
 
+def worker_agents_dir(loom: Path) -> Path:
+    return agents_dir(loom) / "workers"
+
+
 def manager_path(loom: Path) -> Path:
     return agents_dir(loom) / "_manager.md"
 
 
-def agent_dir(loom: Path, agent_id: str) -> Path:
+def legacy_agent_dir(loom: Path, agent_id: str) -> Path:
     return agents_dir(loom) / agent_id
+
+
+def agent_dir(loom: Path, agent_id: str) -> Path:
+    preferred = worker_agents_dir(loom) / agent_id
+    legacy = legacy_agent_dir(loom, agent_id)
+    if (preferred / "_agent.md").exists() or not legacy.exists():
+        return preferred
+    return legacy
 
 
 def agent_record_path(loom: Path, agent_id: str) -> Path:

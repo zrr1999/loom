@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -26,47 +25,12 @@ def canonical_thread_name(name: str) -> str:
     raise ValueError(msg)
 
 
-THREAD_ID_PREFIX = "th"
-THREAD_ID_PATTERN = re.compile(r"^th[a-z]{2,}$")
-TASK_ID_PATTERN = re.compile(r"^(?P<thread_id>th[a-z]{2,})-(?P<seq>\d{3})$")
+TASK_ID_PATTERN = re.compile(r"^(?P<thread_name>[^/]+)-(?P<seq>\d{3})$")
 
 
-def _alpha_suffix(index: int, *, min_length: int = 1) -> str:
-    """Encode a zero-based integer as an a-z suffix with a minimum length."""
-    if index < 0:
-        msg = "index must be >= 0"
-        raise ValueError(msg)
-
-    alphabet = "abcdefghijklmnopqrstuvwxyz"
-    chars: list[str] = []
-    value = index
-    while True:
-        chars.append(alphabet[value % 26])
-        value //= 26
-        if value == 0:
-            break
-    return "".join(reversed(chars)).rjust(min_length, "a")
-
-
-def is_short_thread_id(value: str) -> bool:
-    """Return True when a thread id matches the short incremental scheme."""
-    return bool(THREAD_ID_PATTERN.fullmatch(value))
-
-
-def next_thread_id(existing_ids: Iterable[str]) -> str:
-    """Return the next short thread id (`thaa`, `thab`, ...)."""
-    used = {value for value in existing_ids if is_short_thread_id(value)}
-    index = 0
-    while True:
-        candidate = f"{THREAD_ID_PREFIX}{_alpha_suffix(index, min_length=2)}"
-        if candidate not in used:
-            return candidate
-        index += 1
-
-
-def task_id(thread_id: str, seq: int) -> str:
-    """Build a globally unique task id from a short thread id and per-thread sequence."""
-    return f"{thread_id}-{seq:03d}"
+def task_id(thread_name: str, seq: int) -> str:
+    """Build a globally unique task id from the canonical thread name and sequence."""
+    return f"{canonical_thread_name(thread_name)}-{seq:03d}"
 
 
 def task_filename(seq: int) -> str:
@@ -75,11 +39,15 @@ def task_filename(seq: int) -> str:
 
 
 def split_task_id(value: str) -> tuple[str, int] | None:
-    """Parse a task id in the short `<thread-id>-NNN` format."""
+    """Parse a task id in the `<thread-name>-NNN` format."""
     match = TASK_ID_PATTERN.fullmatch(value)
     if match is None:
         return None
-    return match.group("thread_id"), int(match.group("seq"))
+    try:
+        thread_name = canonical_thread_name(match.group("thread_name"))
+    except ValueError:
+        return None
+    return thread_name, int(match.group("seq"))
 
 
 def next_task_seq(thread_dir: Path) -> int:
@@ -123,7 +91,15 @@ def next_message_seq(message_dir: Path) -> int:
 
 def next_agent_id(agents_dir: Path) -> str:
     """Return the next 4-char agent id."""
-    existing = {entry.name for entry in agents_dir.iterdir() if entry.is_dir()} if agents_dir.exists() else set()
+    existing: set[str] = set()
+    if agents_dir.exists():
+        workers_dir = agents_dir / "workers"
+        if workers_dir.exists():
+            existing.update(entry.name for entry in workers_dir.iterdir() if entry.is_dir())
+        for entry in agents_dir.iterdir():
+            if not entry.is_dir() or entry.name == "workers":
+                continue
+            existing.add(entry.name)
     alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
     for a in alphabet:
         for b in alphabet:

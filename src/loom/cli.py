@@ -32,7 +32,6 @@ from .services import (
     reject_task,
     release_claim,
     release_thread,
-    transition_task,
 )
 from .state import InvalidTransitionError
 
