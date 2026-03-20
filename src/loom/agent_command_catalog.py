@@ -62,13 +62,22 @@ def render_manager_command_contract(prefix: str = DEFAULT_COMMAND_PREFIX) -> str
 
 
 def render_manager_command_access(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
-    shared = [
-        "agent next [--role <manager|director|reviewer>]",
+    worker_safe = [
+        "agent next",
+        "agent done <id> --output path",
+        "agent pause <id> --question ... --options ...",
+        'agent checkpoint "..."',
+        "agent resume",
+        "agent inbox",
+        "agent inbox-read <msg-id>",
+        "agent whoami",
+        'agent ask <to> "..."',
+        'agent propose <to> "..."',
+        'agent reply <msg-id> "..."',
+    ]
+    singleton_only = [
         "agent new-thread [--role <manager|director|reviewer>]",
         "agent new-task --thread backend [--role <manager|director|reviewer>]",
-        "agent done <id> --output path [--role <manager|director|reviewer>]",
-        "agent pause <id> --question ... --options ... [--role <manager|director|reviewer>]",
-        'agent propose <to> "..." [--role <manager|director|reviewer>]',
         'agent send <to> "..." [--role <manager|director|reviewer>]',
     ]
     manager_only = [
@@ -77,13 +86,15 @@ def render_manager_command_access(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
     ]
 
     lines = [
-        (
-            "- Shared `loom agent` commands: workers use default role semantics with "
-            "`LOOM_WORKER_ID`; singleton roles may opt in with `--role manager`, "
-            "`--role director`, or `--role reviewer`."
-        ),
-        *[f"  - `{_command(prefix, suffix)}`" for suffix in shared],
+        ("- Worker-safe `loom agent` commands default to the worker role and require `LOOM_WORKER_ID`."),
+        *[f"  - `{_command(prefix, suffix)}`" for suffix in worker_safe],
+        ("- Singleton-only `loom agent` commands require `--role manager`, `--role director`, or `--role reviewer`."),
+        *[f"  - `{_command(prefix, suffix)}`" for suffix in singleton_only],
+        f"- Read-only status remains available without a worker id: `{_command(prefix, 'agent status')}`",
+        "- Director/orchestrator bootstrap in this repo: `just start`.",
+        "- Director and human share the full top-level `loom` command surface.",
         "- Manager entrypoints outside `loom agent`: require a clean manager process without `LOOM_WORKER_ID`.",
         *[f"  - `{_command(prefix, suffix)}`" for suffix in manager_only],
+        f"- Reviewer entrypoint outside `loom agent`: `{_command(prefix, 'review')}`",
     ]
     return "\n".join(lines)

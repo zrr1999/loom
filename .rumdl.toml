@@ -9,23 +9,20 @@
 # MD036 (emphasis instead of heading) is disabled: design notes use bold text as section labels.
 # MD076 (blank line between list items) is disabled: blank lines are used intentionally for grouping.
 disable = ["MD013", "MD033", "MD036", "MD041", "MD076"]
-
 # Paths scanned when no explicit path is given.
 # Covers project docs, design notes, role files, and the human-authored parts of `.loom/`.
 include = [
-    "README.md",
-    "AGENTS.md",
-    "docs/**/*.md",
-    "design/**/*.md",
-    "roles/**/*.md",
-    ".loom/**/*.md",
+  "README.md",
+  "AGENTS.md",
+  "docs/**/*.md",
+  "design/**/*.md",
+  "roles/**/*.md",
+  ".loom/**/*.md",
 ]
-
 exclude = [
-    ".git",
-    ".venv",
-    ".pytest_cache",
-    ".loom/agents/**/*.md",
+  ".git",
+  ".venv",
+  ".pytest_cache",
+  ".loom/agents/**/*.md",
 ]
-
 respect-gitignore = false

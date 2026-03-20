@@ -60,3 +60,12 @@ Possible command shape:
 ### Recommendation
 
 Proceed with an optional Textual-based `loom tui` that initially covers the existing human approval loop only. Keep the plain CLI as the primary stable interface.
+
+### UX polish notes
+
+When polishing the TUI, prefer portable patterns that map cleanly onto Loom's review queue instead of copying a coding agent UI wholesale:
+
+- keep queue + detail visible together, similar to split-pane terminal tools
+- keep shortcuts discoverable in the footer/status line, rather than relying on memory
+- provide a lightweight help overlay for `?`, so the interface stays learnable without adding a new mode
+- keep feedback transient and state-backed: reload/watch should always re-read `.loom/` instead of introducing an in-memory source of truth

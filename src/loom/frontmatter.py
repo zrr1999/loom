@@ -73,7 +73,7 @@ def write_raw(path: Path, metadata: dict[str, Any], body: str) -> None:
         sort_keys=False,
         default_flow_style=False,
     ).strip()
-    frontmatter_text = f"{FRONTMATTER_DELIMITER}\n{yaml_text}\n{FRONTMATTER_DELIMITER}\n\n{body.strip()}"
+    frontmatter_text = f"{FRONTMATTER_DELIMITER}\n{yaml_text}\n{FRONTMATTER_DELIMITER}\n\n{body.rstrip()}"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(frontmatter_text + "\n", encoding="utf-8")
 

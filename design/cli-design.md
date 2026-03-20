@@ -183,16 +183,32 @@ $ loom
   choice ›
 ```
 
-### Manager bootstrap flow
+### Role bootstrap flow
 
-`loom agent start` should stay manager-oriented and intentionally brief:
+The chosen bootstrap surface is now split by role:
 
-1. identify the active loom workspace
-2. summarize current pending/ready/review counts
-3. show the `next -> done/pause -> next` loop
-4. list only the essential manager commands
+- director/orchestrator: repo-local `just start`
+- manager: `loom manage`
+- reviewer: `loom review` plus top-level `loom accept` / `loom reject`
+- lower-level role briefs: `loom agent start --role <manager|director|reviewer|worker>`
 
-It should not attempt to act as full inline documentation for every `loom agent` subcommand.
+This intentionally rejects three tempting additions for now:
+
+- no top-level `loom start`
+- no `loom manage start`
+- no `loom review start`
+
+Why:
+
+1. `loom manage` already reads naturally as a bootstrap entrypoint for the manager loop.
+2. `loom review` already names the reviewer queue surface, while `accept` / `reject` stay short and scriptable as adjacent top-level actions.
+3. Director work in this repo is orchestration glue around local prompts and existing commands, so `just start` is a better fit than expanding the product CLI with a repo-specific alias.
+
+Compatibility / migration path:
+
+1. keep `loom agent start --role ...` as the shared lower-level bootstrap contract for all roles
+2. document `just start`, `loom manage`, and `loom review` as the preferred human-facing entrypoints
+3. if a future release still needs `loom start` or `... start` aliases, add them as thin wrappers over the same help text rather than moving runtime authority away from the existing commands
 
 ## Output style contracts
 
@@ -278,24 +294,32 @@ When `loom agent next --json` eventually lands, its payload should mirror the te
 
 The idle payload should carry a structured waiting summary rather than a boolean `none` flag.
 
-## `loom manager` subgroup decision
+## Role command boundary decision
 
-RQ-008 also explored a dedicated `loom manager` group.
+RQ-059 asked whether role bootstrap should become:
+
+- `loom start` for director
+- `loom manage start` for manager
+- `loom review start` for reviewer
+
 For this repo, the recommended decision is:
 
-- keep manager actions under `loom agent` for now
-- do not introduce a parallel `loom manager` command group yet
+- keep `just start` as the explicit repo-local director bootstrap
+- keep `loom manage` as the canonical manager bootstrap entrypoint
+- keep `loom review` as the reviewing-list surface, with `loom accept` / `loom reject` staying adjacent top-level review actions
+- keep `loom agent start --role ...` as the lower-level cross-role bootstrap surface
 
 Why:
 
-- current workflows, docs, and tests already center `loom agent --manager`
-- splitting manager commands into a third surface would create migration churn before the human `loom` surface is fully settled
-- the current problem is role clarity, not top-level namespace count
+- current workflows, docs, and tests already center `loom manage`, `loom review`, and role-aware `loom agent start --role ...`
+- adding `... start` subcommands would duplicate meaning without changing runtime behavior
+- the current problem is role clarity, not a lack of command nouns
+- director guidance in this repo is intentionally local to the repo bootstrap prompt, so `just start` is clearer than turning a repo convention into a global product command
 
 Possible future path:
 
-- add `loom manager ...` later as an alias or curated manager entry point
-- keep `loom agent ...` as the underlying canonical implementation during migration
+- add `loom start` or `loom manage start` / `loom review start` later as aliases if the ecosystem clearly benefits
+- keep the existing help text and runtime behavior as the implementation underneath those aliases
 
 ## Migration notes
 

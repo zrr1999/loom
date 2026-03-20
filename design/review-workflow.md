@@ -168,7 +168,7 @@ Recommended signatures:
 
 ```bash
 loom accept <task-id> --continue "Next step direction"
-loom continue <thread-id> "Next step direction"
+loom continue <thread-name> "Next step direction"
 ```
 
 Semantics:
