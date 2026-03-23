@@ -84,3 +84,45 @@ Agents are stored under `.loom/agents/`. `loom init` ensures the manager record 
 - Role generation/discovery config lives in `roles.toml`
 
 `loom agent start` remains the runtime source of truth for the manager loop behavior. The role file is the stable role definition that points contributors to that loop and command contract.
+
+### Manager command contract
+
+<!-- BEGIN: manager-command-contract -->
+- Bootstrap the manager loop: `uvx --from git+https://github.com/zrr1999/loom loom manage`
+- Fetch the next action: `uvx --from git+https://github.com/zrr1999/loom loom agent next --role manager`
+- Create a planning thread: `uvx --from git+https://github.com/zrr1999/loom loom agent new-thread --name <name> [--priority <n>] --role manager`
+- Create a planned task: `uvx --from git+https://github.com/zrr1999/loom loom agent new-task --thread <id> --title '<title>' --acceptance '<criteria>' --role manager`
+- Finish completed manager-owned work: `uvx --from git+https://github.com/zrr1999/loom loom agent done <task-id> --output <path-or-url> --role manager`
+- Pause for a human decision: `uvx --from git+https://github.com/zrr1999/loom loom agent pause <task-id> --question '<question>' --role manager`
+- Spawn or wake a worker when configured: `uvx --from git+https://github.com/zrr1999/loom loom spawn [--threads <backend,frontend>]`
+- Delegate the initial handoff: `uvx --from git+https://github.com/zrr1999/loom loom agent propose <agent-id> '<task handoff>' --ref <task-id> --role manager`
+- Send follow-up context: `uvx --from git+https://github.com/zrr1999/loom loom agent send <agent-id> '<extra context>' --ref <task-id> --role manager`
+<!-- END: manager-command-contract -->
+
+### Manager-facing access split
+
+<!-- BEGIN: manager-command-access -->
+- Worker-safe `loom agent` commands default to the worker role and require `LOOM_WORKER_ID`.
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent next`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent done <id> --output path`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent pause <id> --question ... --options ...`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent checkpoint "..."`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent resume`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent inbox`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent inbox-read <msg-id>`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent whoami`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent ask <to> "..."`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent propose <to> "..."`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent reply <msg-id> "..."`
+- Singleton-only `loom agent` commands require `--role manager`, `--role director`, or `--role reviewer`.
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent new-thread [--role <manager|director|reviewer>]`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent new-task --thread backend [--role <manager|director|reviewer>]`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent send <to> "..." [--role <manager|director|reviewer>]`
+- Read-only status remains available without a worker id: `uvx --from git+https://github.com/zrr1999/loom loom agent status`
+- Director/orchestrator bootstrap in this repo: `just start`.
+- Director and human share the full top-level `loom` command surface.
+- Manager entrypoints outside `loom agent`: require a clean manager process without `LOOM_WORKER_ID`.
+  - `uvx --from git+https://github.com/zrr1999/loom loom manage`
+  - `uvx --from git+https://github.com/zrr1999/loom loom spawn [--threads <backend,frontend>]`
+- Reviewer entrypoint outside `loom agent`: `uvx --from git+https://github.com/zrr1999/loom loom review`
+<!-- END: manager-command-access -->
