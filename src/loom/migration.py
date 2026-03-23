@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from .frontmatter import read_raw, write_model
 from .ids import canonical_thread_name, task_filename, task_id
-from .models import Claim, TaskStatus
+from .models import Claim, RequestResolution, RequestStatus, TaskStatus
 from .repository import (
     agents_dir,
     load_agent,
@@ -19,6 +19,34 @@ from .scheduler import load_all_inbox_items, load_all_tasks, load_all_threads
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def _ensure_inbox_alias(loom: Path, requests_root: Path) -> None:
+    inbox_root = loom / "inbox"
+    if inbox_root.exists() or inbox_root.is_symlink():
+        return
+    try:
+        inbox_root.symlink_to(requests_root.name, target_is_directory=True)
+    except OSError:
+        inbox_root.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_request_storage(loom: Path) -> None:
+    """Prefer `.loom/requests/` while preserving `.loom/inbox/` compatibility."""
+    requests_root = loom / "requests"
+    inbox_root = loom / "inbox"
+
+    if requests_root.exists():
+        _ensure_inbox_alias(loom, requests_root)
+        return
+
+    if inbox_root.exists() and not inbox_root.is_symlink():
+        inbox_root.rename(requests_root)
+        _ensure_inbox_alias(loom, requests_root)
+        return
+
+    requests_root.mkdir(parents=True, exist_ok=True)
+    _ensure_inbox_alias(loom, requests_root)
 
 
 def ensure_name_based_threads(loom: Path) -> None:
@@ -88,14 +116,24 @@ def ensure_name_based_threads(loom: Path) -> None:
     for item in load_all_inbox_items(loom):
         updated_refs: list[str] = []
         changed = False
-        for ref in item.planned_to:
+        for ref in item.planned_to or []:
             task_ref = ref.split("/", 1)[1] if "/" in ref else ref
             updated_ref = task_links.get(task_ref, ref)
             updated_refs.append(updated_ref)
             changed = changed or updated_ref != ref
         if changed:
             path, original = load_inbox_item(loom, item.id)
-            updated_item = original.model_copy(update={"planned_to": updated_refs})
+            updated_item = original.model_copy(
+                update={
+                    "planned_to": updated_refs,
+                    "resolved_to": updated_refs if original.resolved_to else original.resolved_to,
+                    "status": (
+                        RequestStatus.DONE
+                        if original.status == RequestStatus.DONE and original.resolved_as == RequestResolution.TASK
+                        else original.status
+                    ),
+                }
+            )
             write_model(path, updated_item)
 
     agent_dirs: list[Path] = []

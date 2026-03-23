@@ -4,6 +4,10 @@ name = "loom"
 [agent]
 inbox_plan_batch = 10
 task_batch = 1
+next_wait_seconds = 60.0
+next_retries = 5
+executor_command = ""
+offline_after_minutes = 30
 
 [threads]
 default_priority = 50

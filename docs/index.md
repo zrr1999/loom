@@ -4,7 +4,7 @@
 
 ## Core ideas
 
-- `inbox/` stores raw requirements from humans
+- `requests/` stores raw requirements from humans (`inbox/` remains a compatibility alias)
 - `threads/` stores executable task streams for agents
 - frontmatter drives scheduling, review, pause, and decision state
 

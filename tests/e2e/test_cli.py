@@ -848,13 +848,14 @@ def test_inbox_command_without_subcommand_runs_interactive_planning(runner, isol
     assert result.exit_code == 0, result.output
     assert "Inbox item action [P / s / o / ?]" in result.output
     assert "[inbox] RQ-001:" in result.output
-    assert "Planned RQ-001 ->" in result.output
+    assert "Resolved RQ-001 ->" in result.output
     assert "Inbox planning summary:" in result.output
     assert "planned: 1" in result.output
 
     inbox_content = (isolated_project / ".loom" / "inbox" / "RQ-001.md").read_text(encoding="utf-8")
-    assert "status: planned" in inbox_content
-    assert "planned_to:" in inbox_content
+    assert "status: done" in inbox_content
+    assert "resolved_as: task" in inbox_content
+    assert "resolved_to:" in inbox_content
 
 
 def test_inbox_command_without_subcommand_shows_empty_message(runner, isolated_project):
@@ -864,6 +865,100 @@ def test_inbox_command_without_subcommand_shows_empty_message(runner, isolated_p
 
     assert result.exit_code == 0, result.output
     assert "No pending inbox items." in result.output
+
+
+def test_request_add_and_list_preserve_inbox_compatibility(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    add_result = runner.invoke(app, ["request", "add", "Add OAuth login"])
+    assert add_result.exit_code == 0, add_result.output
+    assert ".loom/requests/RQ-001.md" in add_result.output
+    assert (isolated_project / ".loom" / "requests" / "RQ-001.md").exists()
+    assert (isolated_project / ".loom" / "inbox" / "RQ-001.md").exists()
+
+    pending_result = runner.invoke(app, ["request", "ls", "--pending"])
+    assert pending_result.exit_code == 0, pending_result.output
+    assert "RQ-001  pending" in pending_result.output
+
+    alias_result = runner.invoke(app, ["inbox", "ls", "--pending"])
+    assert alias_result.exit_code == 0, alias_result.output
+    assert "RQ-001  pending" in alias_result.output
+
+
+def test_request_list_shows_resolution_visibility(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    request_dir = isolated_project / ".loom" / "requests"
+    (request_dir / "RQ-001.md").write_text(
+        (
+            "---\n"
+            "id: RQ-001\n"
+            "created: '2026-03-18'\n"
+            "status: done\n"
+            "resolved_as: task\n"
+            "resolved_to:\n"
+            "  - backend-001\n"
+            "---\n\n"
+            "Add OAuth login\n"
+        ),
+        encoding="utf-8",
+    )
+    (request_dir / "RQ-002.md").write_text(
+        (
+            "---\n"
+            "id: RQ-002\n"
+            "created: '2026-03-18'\n"
+            "status: done\n"
+            "resolved_as: routine\n"
+            "resolved_to:\n"
+            "  - scan-github-issues\n"
+            "---\n\n"
+            "Scan GitHub issues\n"
+        ),
+        encoding="utf-8",
+    )
+    (request_dir / "RQ-003.md").write_text(
+        (
+            "---\n"
+            "id: RQ-003\n"
+            "created: '2026-03-18'\n"
+            "status: done\n"
+            "resolved_as: merged\n"
+            "resolved_to:\n"
+            "  - backend-001\n"
+            "resolution_note: Covered by the active auth task.\n"
+            "---\n\n"
+            "Also add auth logging\n"
+        ),
+        encoding="utf-8",
+    )
+    (request_dir / "RQ-004.md").write_text(
+        (
+            "---\n"
+            "id: RQ-004\n"
+            "created: '2026-03-18'\n"
+            "status: done\n"
+            "resolved_as: rejected\n"
+            "resolved_to: []\n"
+            "resolution_note: Out of scope for this repo.\n"
+            "---\n\n"
+            "Replace Python with Rust\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["request", "ls"])
+
+    assert result.exit_code == 0, result.output
+    assert "RQ-001  done" in result.output
+    assert "resolved_as   : task" in result.output
+    assert "resolved_to   : backend-001" in result.output
+    assert "resolved_as   : routine" in result.output
+    assert "resolved_to   : scan-github-issues" in result.output
+    assert "resolved_as   : merged" in result.output
+    assert "Covered by the active auth task." in result.output
+    assert "resolved_as   : rejected" in result.output
+    assert "Out of scope for this repo." in result.output
 
 
 def test_scheduler_respects_dependencies_and_thread_priority(runner, isolated_project):

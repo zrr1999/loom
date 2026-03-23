@@ -16,15 +16,20 @@ from .agent import spawn_worker_runtime
 from .agent import start as agent_start
 from .config import ensure_settings
 from .history import read_events
-from .migration import ensure_name_based_threads, ensure_thread_ownership_metadata, ensure_worker_agent_subtree
-from .models import AgentRole, Decision, TaskStatus
+from .migration import (
+    ensure_name_based_threads,
+    ensure_request_storage,
+    ensure_thread_ownership_metadata,
+    ensure_worker_agent_subtree,
+)
+from .models import AgentRole, Decision, RequestItem, RequestStatus, TaskStatus
 from .prompting import select, text
-from .repository import load_inbox_item, load_task, require_loom, root_config_path
+from .repository import load_inbox_item, load_task, requests_dir, require_loom, root_config_path
 from .runtime import global_root, set_root
 from .scheduler import get_interaction_queue, get_pending_inbox_items, get_status_summary, load_all_tasks
 from .services import (
     accept_task,
-    create_inbox_item,
+    create_request_item,
     decide_task,
     ensure_agent_layout,
     format_review_summary,
@@ -43,6 +48,8 @@ app = typer.Typer(
     help="A CLI tool where humans weave requirements and agents execute tasks.",
 )
 app.add_typer(agent_app, name="agent", help="Agent commands (machine-friendly).")
+request_app = typer.Typer(help="Request commands.")
+app.add_typer(request_app, name="request")
 inbox_app = typer.Typer(help="Inbox commands.")
 app.add_typer(inbox_app, name="inbox")
 
@@ -50,6 +57,7 @@ app.add_typer(inbox_app, name="inbox")
 def _resolve_loom() -> Path:
     try:
         loom = require_loom()
+        ensure_request_storage(loom)
         ensure_worker_agent_subtree(loom)
         ensure_name_based_threads(loom)
         ensure_thread_ownership_metadata(loom)
@@ -87,8 +95,8 @@ def init(
     root = global_root() if global_mode else Path.cwd()
     loom = root / ".loom"
     loom.mkdir(exist_ok=True)
-    (loom / "inbox").mkdir(exist_ok=True)
     (loom / "threads").mkdir(exist_ok=True)
+    ensure_request_storage(loom)
     ensure_agent_layout(loom)
 
     project_name = project or root.name
@@ -97,18 +105,85 @@ def init(
     typer.echo(f"{action} {root_config_path(loom).name} and ensured .loom/ structure for '{project_name}'.")
 
 
-@inbox_app.command("add")
-def inbox_add(
-    description: str = typer.Argument(..., help="Requirement description."),
-) -> None:
-    """Add a new requirement to the inbox."""
+def _add_request(description: str) -> None:
     loom = _resolve_loom()
     try:
-        item, path = create_inbox_item(loom, description)
+        item, path = create_request_item(loom, description)
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
     typer.echo(f"Created {item.id}: {path}")
+
+
+@request_app.command("add")
+def request_add(
+    description: str = typer.Argument(..., help="Requirement description."),
+) -> None:
+    """Add a new request."""
+    _add_request(description)
+
+
+@inbox_app.command("add")
+def inbox_add(
+    description: str = typer.Argument(..., help="Requirement description."),
+) -> None:
+    """Compatibility alias for `loom request add`."""
+    _add_request(description)
+
+
+def _format_request_line(item: RequestItem) -> list[str]:
+    first_line = item.body.splitlines()[0] if item.body else item.id
+    lines = [f"{item.id}  {item.status.value}  {first_line}"]
+    if item.status == RequestStatus.DONE and item.resolved_as is not None:
+        targets = ", ".join(item.resolved_to) if item.resolved_to else "-"
+        lines.append(f"  resolved_as   : {item.resolved_as.value}")
+        lines.append(f"  resolved_to   : {targets}")
+        if item.resolution_note:
+            lines.append(f"  note          : {item.resolution_note}")
+    return lines
+
+
+def _list_requests(*, pending_only: bool) -> None:
+    loom = _resolve_loom()
+    request_root = requests_dir(loom)
+    items = get_pending_inbox_items(loom) if pending_only else None
+    if pending_only:
+        if not items:
+            typer.echo("No pending requests.")
+            return
+        for item in items:
+            typer.echo(f"{item['id']}  {item['status']}  {item['title']}")
+            typer.echo(f"  file          : {item['file']}")
+        return
+
+    request_items = []
+    for path in sorted(request_root.glob("RQ-*.md")):
+        request_items.append(load_inbox_item(loom, path.stem)[1])
+    if not request_items:
+        typer.echo("No requests.")
+        return
+    for item in request_items:
+        for line in _format_request_line(item):
+            typer.echo(line)
+        typer.echo(f"  file          : {request_root / f'{item.id}.md'}")
+
+
+@request_app.command("ls")
+@request_app.command("list")
+def request_list(
+    pending: bool = typer.Option(False, "--pending", help="Show only pending requests."),
+) -> None:
+    """List requests and their resolution state."""
+    _list_requests(pending_only=pending)
+
+
+@inbox_app.command("ls")
+@inbox_app.command("list")
+def inbox_list(
+    pending: bool = typer.Option(False, "--pending", help="Show only pending requests."),
+) -> None:
+    """Compatibility alias for `loom request ls`."""
+    _list_requests(pending_only=pending)
 
 
 @app.command()
@@ -311,7 +386,7 @@ def _handle_inbox_item(loom: Path, item: dict[str, Any]) -> str:
             except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
                 typer.echo(f"Error: {exc}", err=True)
                 return "errors"
-            typer.echo(f"Planned {item['id']} -> {planned['planned_to']}.")
+            typer.echo(f"Resolved {item['id']} -> {', '.join(cast('list[str]', planned['resolved_to']))}.")
             return "planned"
 
 
@@ -382,7 +457,7 @@ def _handle_reviewing_item(loom: Path, item: dict[str, Any]) -> str:
 def _run_queue(loom: Path) -> None:
     queue = get_interaction_queue(loom)
     if not queue:
-        typer.echo('No pending approvals. Add a requirement with `loom inbox add "..."`.')
+        typer.echo('No pending approvals. Add a request with `loom request add "..."` (or `loom inbox add "..."`).')
         return
 
     summary: dict[str, int] = {"decided": 0, "accepted": 0, "rejected": 0, "skipped": 0}

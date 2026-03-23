@@ -7,7 +7,7 @@ from pathlib import Path
 from .config import config_path, load_settings
 from .frontmatter import read_model, read_raw
 from .ids import split_task_id, task_filename
-from .models import AgentRecord, InboxItem, ManagerRecord, Message, Task
+from .models import AgentRecord, ManagerRecord, Message, RequestItem, Task
 from .runtime import resolve_root
 
 
@@ -72,16 +72,34 @@ def task_file_path(loom: Path, task: Task) -> Path:
     return loom / "threads" / task.thread / task_filename(task.seq)
 
 
-def find_inbox_path(loom: Path, rq_id: str) -> Path:
-    path = loom / "inbox" / f"{rq_id}.md"
+def requests_dir(loom: Path) -> Path:
+    requests_path = loom / "requests"
+    if requests_path.exists():
+        return requests_path
+    return loom / "inbox"
+
+
+def find_request_path(loom: Path, rq_id: str) -> Path:
+    path = requests_dir(loom) / f"{rq_id}.md"
     if not path.exists():
-        raise FileNotFoundError(f"inbox item '{rq_id}' not found")
+        legacy_path = loom / "inbox" / f"{rq_id}.md"
+        if legacy_path.exists():
+            return legacy_path
+        raise FileNotFoundError(f"request '{rq_id}' not found")
     return path
 
 
-def load_inbox_item(loom: Path, rq_id: str) -> tuple[Path, InboxItem]:
-    path = find_inbox_path(loom, rq_id)
-    return path, read_model(path, InboxItem)
+def load_request_item(loom: Path, rq_id: str) -> tuple[Path, RequestItem]:
+    path = find_request_path(loom, rq_id)
+    return path, read_model(path, RequestItem)
+
+
+def find_inbox_path(loom: Path, rq_id: str) -> Path:
+    return find_request_path(loom, rq_id)
+
+
+def load_inbox_item(loom: Path, rq_id: str) -> tuple[Path, RequestItem]:
+    return load_request_item(loom, rq_id)
 
 
 def agents_dir(loom: Path) -> Path:

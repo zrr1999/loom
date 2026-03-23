@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .models import (
-    INBOX_TRANSITIONS,
+    REQUEST_TRANSITIONS,
     TASK_TRANSITIONS,
-    InboxStatus,
+    RequestStatus,
     TaskStatus,
 )
 
@@ -29,11 +29,16 @@ def validate_task_transition(current: TaskStatus, target: TaskStatus) -> None:
         raise InvalidTransitionError("task", current.value, target.value)
 
 
-def validate_inbox_transition(current: InboxStatus, target: InboxStatus) -> None:
+def validate_request_transition(current: RequestStatus, target: RequestStatus) -> None:
     """Raise if the transition is not allowed."""
-    allowed = INBOX_TRANSITIONS.get(current, set())
+    allowed = REQUEST_TRANSITIONS.get(current, set())
     if target not in allowed:
-        raise InvalidTransitionError("inbox", current.value, target.value)
+        raise InvalidTransitionError("request", current.value, target.value)
+
+
+def validate_inbox_transition(current: RequestStatus, target: RequestStatus) -> None:
+    """Backward-compatible alias for request transition validation."""
+    validate_request_transition(current, target)
 
 
 def validate_task_scheduled(acceptance: str | None) -> None:

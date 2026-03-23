@@ -17,17 +17,19 @@ from .ids import (
     task_filename,
     task_id,
 )
+from .lease import is_thread_stale, refresh_thread_lease, utc_now
 from .models import (
     AgentRecord,
     AgentRole,
     AgentStatus,
     Decision,
     DecisionOption,
-    InboxItem,
-    InboxStatus,
     ManagerRecord,
     Message,
     MessageType,
+    RequestItem,
+    RequestResolution,
+    RequestStatus,
     ReviewEntry,
     Task,
     TaskKind,
@@ -42,17 +44,18 @@ from .repository import (
     agent_replied_dir,
     agents_dir,
     load_agent,
-    load_inbox_item,
     load_message,
+    load_request_item,
     load_task,
     manager_path,
+    requests_dir,
     worker_agents_dir,
     workspace_root,
 )
 from .scheduler import load_all_tasks, load_all_threads
 from .state import (
     validate_decision_payload,
-    validate_inbox_transition,
+    validate_request_transition,
     validate_task_scheduled,
     validate_task_transition,
 )
@@ -114,19 +117,25 @@ def ensure_agent_layout(loom: Path) -> None:
         write_model(manager_file, manager)
 
 
-def create_inbox_item(loom: Path, description: str) -> tuple[InboxItem, Path]:
-    """Create a new pending inbox item."""
+def create_request_item(loom: Path, description: str) -> tuple[RequestItem, Path]:
+    """Create a new pending request item."""
     body = description.strip()
     if not body:
         raise ValueError("description must not be empty")
 
-    seq = next_inbox_seq(loom / "inbox")
+    request_root = requests_dir(loom)
+    seq = next_inbox_seq(request_root)
     rq_id = f"RQ-{seq:03d}"
-    item = InboxItem(id=rq_id, body=body)
-    path = loom / "inbox" / f"{rq_id}.md"
+    item = RequestItem(id=rq_id, body=body)
+    path = request_root / f"{rq_id}.md"
     write_model(path, item)
-    append_event(loom, "inbox.created", "inbox", item.id, {"status": item.status.value})
+    append_event(loom, "request.created", "request", item.id, {"status": item.status.value})
     return item, path
+
+
+def create_inbox_item(loom: Path, description: str) -> tuple[RequestItem, Path]:
+    """Compatibility alias for request creation."""
+    return create_request_item(loom, description)
 
 
 def spawn_agent(loom: Path, *, threads: list[str] | None = None) -> dict[str, object]:
@@ -200,18 +209,34 @@ def touch_agent(
 
 def update_checkpoint(loom: Path, agent_id: str, *, phase: str, summary: str) -> AgentRecord:
     path, agent = load_agent(loom, agent_id)
-    updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    now = utc_now()
+    updated_at = now.isoformat(timespec="seconds")
     updated_body = f"## Checkpoint\n\n**phase** {phase}\n**updated** {updated_at}\n\n{summary}\n\n## Notes\n\n"
     updated = agent.model_copy(
         update={
-            "last_seen": datetime.now(UTC).isoformat(timespec="seconds"),
+            "last_seen": updated_at,
             "status": AgentStatus.ACTIVE,
             "checkpoint_summary": summary[:120],
             "body": updated_body,
         }
     )
     write_model(path, updated)
-    append_event(loom, "agent.checkpointed", "agent", agent_id, {"phase": phase})
+
+    refreshed_threads: list[str] = []
+    for thread_name, thread in load_all_threads(loom).items():
+        if thread.owner != agent_id:
+            continue
+        refreshed = refresh_thread_lease(thread, loom, now=now)
+        write_model(loom / "threads" / thread_name / "_thread.md", refreshed)
+        refreshed_threads.append(thread_name)
+
+    append_event(
+        loom,
+        "agent.checkpointed",
+        "agent",
+        agent_id,
+        {"phase": phase, "refreshed_threads": refreshed_threads},
+    )
     return updated
 
 
@@ -427,22 +452,39 @@ def claim_thread(loom: Path, thread_name: str, *, agent_id: str) -> tuple[Path, 
         raise FileNotFoundError(f"thread '{canonical}' does not exist")
 
     thread = threads[canonical]
-    if thread.owner and thread.owner != agent_id:
+    if thread.owner and thread.owner != agent_id and not is_thread_stale(thread):
         raise ValueError(f"thread '{canonical}' is already owned by '{thread.owner}'")
 
     path = loom / "threads" / canonical / "_thread.md"
+    now = utc_now()
     if thread.owner == agent_id:
-        return path, thread
+        refreshed = refresh_thread_lease(thread, loom, now=now)
+        if refreshed.model_dump(mode="python") != thread.model_dump(mode="python"):
+            write_model(path, refreshed)
+            append_event(
+                loom,
+                "thread.lease_refreshed",
+                "thread",
+                canonical,
+                {"agent": agent_id, "lease_expires_at": refreshed.owner_lease_expires_at},
+            )
+        return path, refreshed
 
-    now = datetime.now(UTC).isoformat(timespec="seconds")
-    updated = thread.model_copy(update={"owner": agent_id, "owned_at": now})
+    claimed_at = now.isoformat(timespec="seconds")
+    updated = refresh_thread_lease(thread.model_copy(update={"owner": agent_id, "owned_at": claimed_at}), loom, now=now)
     write_model(path, updated)
+    event_name = "thread.reclaimed" if thread.owner and is_thread_stale(thread, now=now) else "thread.claimed"
     append_event(
         loom,
-        "thread.claimed",
+        event_name,
         "thread",
         canonical,
-        {"agent": agent_id, "owned_at": now},
+        {
+            "agent": agent_id,
+            "owned_at": claimed_at,
+            "previous_owner": thread.owner,
+            "lease_expires_at": updated.owner_lease_expires_at,
+        },
     )
     return path, updated
 
@@ -458,7 +500,14 @@ def release_thread(loom: Path, thread_name: str, *, note: str = "") -> tuple[Pat
     if not thread.owner:
         raise ValueError(f"thread '{canonical}' has no active owner")
 
-    updated = thread.model_copy(update={"owner": None, "owned_at": None})
+    updated = thread.model_copy(
+        update={
+            "owner": None,
+            "owned_at": None,
+            "owner_heartbeat_at": None,
+            "owner_lease_expires_at": None,
+        }
+    )
     path = loom / "threads" / canonical / "_thread.md"
     write_model(path, updated)
     append_event(
@@ -512,58 +561,85 @@ def decide_task(loom: Path, task_id: str, option: str) -> tuple[Path, Task]:
     return path, updated
 
 
-def plan_inbox_item(loom: Path, rq_id: str) -> dict[str, object]:
-    inbox_path, item = load_inbox_item(loom, rq_id)
-    validate_inbox_transition(item.status, InboxStatus.PLANNED)
+def plan_request_item(loom: Path, rq_id: str) -> dict[str, object]:
+    request_path, item = load_request_item(loom, rq_id)
+    validate_request_transition(item.status, RequestStatus.PROCESSING)
+
+    processing_item = item.model_copy(update={"status": RequestStatus.PROCESSING})
+    write_model(request_path, processing_item)
+    append_event(loom, "request.processing", "request", item.id, {"status": processing_item.status.value})
 
     settings = load_settings(workspace_root(loom))
     created_thread_name: str | None = None
-    threads = load_all_threads(loom)
-    if not threads:
-        thread, _, _duplicates = create_thread(
+    try:
+        threads = load_all_threads(loom)
+        if not threads:
+            thread, _, _duplicates = create_thread(
+                loom,
+                name="general",
+                priority=settings.threads.default_priority,
+            )
+            threads = {thread.name: thread}
+            created_thread_name = thread.name
+
+        target_thread = max(threads.values(), key=lambda thread: (thread.priority, thread.name))
+        title = derive_task_title(item)
+        acceptance = "- [ ] 覆盖需求描述中的核心行为\n- [ ] 产出可供人工验收的结果"
+        task, path = create_task(
             loom,
-            name="general",
-            priority=settings.threads.default_priority,
+            thread_name=target_thread.name,
+            title=title,
+            priority=target_thread.priority,
+            acceptance=acceptance,
+            created_from=[item.id],
+            background=item.body,
+            implementation_direction=f"围绕 {item.id} 先拆出第一条可执行任务, 后续再继续细化。",
         )
-        threads = {thread.name: thread}
-        created_thread_name = thread.name
+    except Exception:
+        rollback_item = item.model_copy(update={"status": RequestStatus.PENDING})
+        write_model(request_path, rollback_item)
+        append_event(loom, "request.reverted", "request", item.id, {"status": rollback_item.status.value})
+        raise
 
-    target_thread = max(threads.values(), key=lambda thread: (thread.priority, thread.name))
-    title = derive_task_title(item)
-    acceptance = "- [ ] 覆盖需求描述中的核心行为\n- [ ] 产出可供人工验收的结果"
-    task, path = create_task(
-        loom,
-        thread_name=target_thread.name,
-        title=title,
-        priority=target_thread.priority,
-        acceptance=acceptance,
-        created_from=[item.id],
-        background=item.body,
-        implementation_direction=f"围绕 {item.id} 先拆出第一条可执行任务, 后续再继续细化。",
+    resolved_to = [task.id]
+    updated_item = item.model_copy(
+        update={
+            "status": RequestStatus.DONE,
+            "resolved_as": RequestResolution.TASK,
+            "resolved_to": resolved_to,
+            "resolution_note": None,
+            "planned_to": None,
+        }
     )
-
-    planned_link = task.id
-    planned_to = [*item.planned_to, planned_link]
-    updated_item = item.model_copy(update={"status": InboxStatus.PLANNED, "planned_to": planned_to})
-    write_model(inbox_path, updated_item)
+    write_model(request_path, updated_item)
     append_event(
         loom,
-        "inbox.planned",
-        "inbox",
+        "request.resolved",
+        "request",
         item.id,
-        {"planned_to": planned_to, "created_thread": created_thread_name},
+        {
+            "resolved_as": updated_item.resolved_as.value if updated_item.resolved_as else None,
+            "resolved_to": resolved_to,
+            "created_thread": created_thread_name,
+        },
     )
 
     return {
         "rq_id": item.id,
         "status": updated_item.status.value,
-        "planned_to": planned_link,
+        "resolved_as": updated_item.resolved_as.value if updated_item.resolved_as else None,
+        "resolved_to": resolved_to,
         "created_thread": created_thread_name,
         "tasks": [{"id": task.id, "file": str(path)}],
     }
 
 
-def derive_task_title(item: InboxItem) -> str:
+def plan_inbox_item(loom: Path, rq_id: str) -> dict[str, object]:
+    """Compatibility alias for request-to-task triage."""
+    return plan_request_item(loom, rq_id)
+
+
+def derive_task_title(item: RequestItem) -> str:
     first_line = next((line.strip() for line in item.body.splitlines() if line.strip()), item.id)
     title = first_line.rstrip("。.!? ")
     return title[:40] or item.id

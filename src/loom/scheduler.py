@@ -6,11 +6,13 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 from .frontmatter import read_model
-from .models import AgentRecord, InboxItem, InboxStatus, Task, TaskKind, TaskStatus, Thread
+from .lease import is_thread_stale
+from .models import AgentRecord, RequestItem, RequestStatus, Task, TaskKind, TaskStatus, Thread
 from .repository import (
     agent_pending_dir,
     agent_replied_dir,
     agents_dir,
+    requests_dir,
     root_config_path,
     task_file_path,
     worker_agents_dir,
@@ -79,7 +81,13 @@ def get_ready_tasks(loom_dir: Path, thread_filter: str | None = None, *, for_age
         ready = [task for task in ready if task.thread == thread_filter]
 
     if for_agent:
-        ready = [task for task in ready if not threads[task.thread].owner or threads[task.thread].owner == for_agent]
+        ready = [
+            task
+            for task in ready
+            if not threads[task.thread].owner
+            or threads[task.thread].owner == for_agent
+            or is_thread_stale(threads[task.thread])
+        ]
 
     ready.sort(key=lambda task: sort_key(task, threads))
     return ready
@@ -107,20 +115,21 @@ def sort_key(task: Task, threads: dict[str, Thread]) -> tuple[int, int, int, str
     return (-thread_prio, -task.priority, task.seq, task.id)
 
 
-def load_all_inbox_items(loom_dir: Path) -> list[InboxItem]:
-    """Load all inbox items from .loom/inbox/."""
-    items: list[InboxItem] = []
-    inbox_dir = loom_dir / "inbox"
-    if not inbox_dir.exists():
+def load_all_inbox_items(loom_dir: Path) -> list[RequestItem]:
+    """Load all request items from `.loom/requests/` or the inbox compatibility path."""
+    items: list[RequestItem] = []
+    request_dir = requests_dir(loom_dir)
+    if not request_dir.exists():
         return items
-    for path in sorted(inbox_dir.glob("RQ-*.md")):
-        items.append(read_model(path, InboxItem))
+    for path in sorted(request_dir.glob("RQ-*.md")):
+        items.append(read_model(path, RequestItem))
     return items
 
 
 def get_pending_inbox_items(loom_dir: Path, limit: int | None = None) -> list[dict[str, Any]]:
     """Return pending inbox items in planning order without mutating files."""
-    pending_items = [item for item in load_all_inbox_items(loom_dir) if item.status == InboxStatus.PENDING]
+    request_dir = requests_dir(loom_dir)
+    pending_items = [item for item in load_all_inbox_items(loom_dir) if item.status == RequestStatus.PENDING]
     if limit is not None and limit > 0:
         pending_items = pending_items[:limit]
 
@@ -130,7 +139,7 @@ def get_pending_inbox_items(loom_dir: Path, limit: int | None = None) -> list[di
             "status": item.status.value,
             "title": item.body.splitlines()[0] if item.body else item.id,
             "body": item.body,
-            "file": str(loom_dir / "inbox" / f"{item.id}.md"),
+            "file": str(request_dir / f"{item.id}.md"),
         }
         for item in pending_items
     ]
@@ -275,7 +284,15 @@ def get_status_summary(loom_dir: Path) -> dict[str, Any]:
         inbox_by_status[item.status.value] = inbox_by_status.get(item.status.value, 0) + 1
 
     owned_threads = {
-        name: {"owner": thread.owner, "owned_at": thread.owned_at} for name, thread in threads.items() if thread.owner
+        name: {
+            "owner": thread.owner,
+            "owned_at": thread.owned_at,
+            "heartbeat_at": thread.owner_heartbeat_at,
+            "lease_expires_at": thread.owner_lease_expires_at,
+            "stale": is_thread_stale(thread),
+        }
+        for name, thread in threads.items()
+        if thread.owner
     }
 
     return {
@@ -290,11 +307,12 @@ def get_status_summary(loom_dir: Path) -> dict[str, Any]:
         },
         "inbox": {
             "total": len(inbox_items),
-            "pending": inbox_by_status.get(InboxStatus.PENDING.value, 0),
+            "pending": inbox_by_status.get(RequestStatus.PENDING.value, 0),
             "by_status": inbox_by_status,
         },
-        "inbox_pending": inbox_by_status.get(InboxStatus.PENDING.value, 0),
+        "inbox_pending": inbox_by_status.get(RequestStatus.PENDING.value, 0),
         "agents": agents,
+        "stale_owned_threads": [name for name, details in owned_threads.items() if details.get("stale")],
         "queue": get_interaction_queue(loom_dir),
         "capabilities": summarize_capabilities(threads, all_tasks),
     }

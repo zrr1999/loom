@@ -29,10 +29,17 @@ class TaskKind(StrEnum):
     DESIGN = "design"
 
 
-class InboxStatus(StrEnum):
+class RequestStatus(StrEnum):
     PENDING = "pending"
-    PLANNED = "planned"
+    PROCESSING = "processing"
+    DONE = "done"
+
+
+class RequestResolution(StrEnum):
+    TASK = "task"
+    ROUTINE = "routine"
     MERGED = "merged"
+    REJECTED = "rejected"
 
 
 class AgentRole(StrEnum):
@@ -83,10 +90,10 @@ REVIEW_INCOMPLETE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
-INBOX_TRANSITIONS: dict[InboxStatus, set[InboxStatus]] = {
-    InboxStatus.PENDING: {InboxStatus.PLANNED, InboxStatus.MERGED},
-    InboxStatus.PLANNED: {InboxStatus.MERGED},
-    InboxStatus.MERGED: set(),
+REQUEST_TRANSITIONS: dict[RequestStatus, set[RequestStatus]] = {
+    RequestStatus.PENDING: {RequestStatus.PROCESSING},
+    RequestStatus.PROCESSING: {RequestStatus.PENDING, RequestStatus.DONE},
+    RequestStatus.DONE: set(),
 }
 
 
@@ -135,6 +142,8 @@ class Thread(BaseModel):
     created: date = Field(default_factory=date.today)
     owner: str | None = None
     owned_at: str | None = None
+    owner_heartbeat_at: str | None = None
+    owner_lease_expires_at: str | None = None
     body: str = ""
 
 
@@ -220,12 +229,79 @@ def find_review_blockers(task: Task, *, output: str | None = None) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-class InboxItem(BaseModel):
+class RequestItem(BaseModel):
     id: str
     created: date = Field(default_factory=date.today)
-    status: InboxStatus = InboxStatus.PENDING
-    planned_to: list[str] = Field(default_factory=list)
+    status: RequestStatus = RequestStatus.PENDING
+    resolved_as: RequestResolution | None = None
+    resolved_to: list[str] = Field(default_factory=list)
+    resolution_note: str | None = None
+    planned_to: list[str] | None = None  # deprecated legacy field, read-only compatibility
     body: str = ""
+
+    @field_validator("resolved_to", "planned_to", mode="before")
+    @classmethod
+    def _coerce_resolution_lists(cls, value: object) -> list[str] | None:
+        if value is None or value == "":
+            return None if value is None else []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, Iterable):
+            return [str(item) for item in value]
+        msg = "resolution references must be a string or iterable of strings"
+        raise TypeError(msg)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_legacy_inbox_fields(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+
+        data = dict(value)
+        raw_status = data.get("status")
+        planned_to = data.get("planned_to")
+        if raw_status == "planned":
+            data["status"] = RequestStatus.DONE.value
+            data.setdefault("resolved_as", RequestResolution.TASK.value)
+            data.setdefault("resolved_to", planned_to or [])
+        elif raw_status == "merged":
+            data["status"] = RequestStatus.DONE.value
+            data.setdefault("resolved_as", RequestResolution.MERGED.value)
+            data.setdefault("resolved_to", planned_to or [])
+
+        if not data.get("resolved_to") and planned_to:
+            data["resolved_to"] = planned_to
+        return data
+
+    @model_validator(mode="after")
+    def _validate_resolution_fields(self) -> RequestItem:
+        if self.status == RequestStatus.DONE and self.resolved_as is None:
+            msg = "Done request must include 'resolved_as'"
+            raise ValueError(msg)
+
+        if (
+            self.status == RequestStatus.DONE
+            and self.resolved_as
+            in {
+                RequestResolution.TASK,
+                RequestResolution.ROUTINE,
+                RequestResolution.MERGED,
+            }
+            and not self.resolved_to
+        ):
+            msg = "Resolved task/routine/merged requests must include 'resolved_to'"
+            raise ValueError(msg)
+
+        if self.status != RequestStatus.DONE and (
+            self.resolved_as is not None or self.resolved_to or self.resolution_note
+        ):
+            msg = "Only done requests may carry resolution details"
+            raise ValueError(msg)
+
+        return self
+
+
+InboxItem = RequestItem
 
 
 class AgentRecord(BaseModel):

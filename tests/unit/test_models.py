@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import pytest
 
-from loom.models import Decision, Task, TaskKind, TaskStatus, find_review_blockers
+from loom.models import (
+    Decision,
+    RequestItem,
+    RequestResolution,
+    RequestStatus,
+    Task,
+    TaskKind,
+    TaskStatus,
+    find_review_blockers,
+)
 
 
 def test_task_coerces_created_from_and_depends_on_strings():
@@ -106,4 +115,32 @@ def test_reviewing_task_rejects_incomplete_markers():
             status=TaskStatus.REVIEWING,
             acceptance="- [ ] ready",
             output="TODO: finish tests",
+        )
+
+
+def test_request_item_upgrades_legacy_planned_inbox_fields():
+    item = RequestItem.model_validate(
+        {
+            "id": "RQ-001",
+            "created": "2026-03-18",
+            "status": "planned",
+            "planned_to": ["backend-001"],
+            "body": "Legacy request",
+        }
+    )
+
+    assert item.status == RequestStatus.DONE
+    assert item.resolved_as == RequestResolution.TASK
+    assert item.resolved_to == ["backend-001"]
+
+
+def test_done_request_requires_resolution_details():
+    with pytest.raises(ValueError, match="resolved_as"):
+        RequestItem.model_validate(
+            {
+                "id": "RQ-001",
+                "created": "2026-03-18",
+                "status": "done",
+                "body": "Missing resolution",
+            }
         )

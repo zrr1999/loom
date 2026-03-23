@@ -60,7 +60,7 @@ default_priority = 50
 
 When pending inbox items exist, `loom agent next` returns a `kind: "plan"` payload describing which `RQ-*` files the agent should convert into tasks. That work may involve both `new-thread` and `new-task`. The conversion logic is not built into `next`; the agent performs the actual restructuring.
 
-When there is no inbox planning work, `loom agent next` claims up to `task_batch` ready tasks for the current agent and returns them as `kind: "task"`.
+When there is no inbox planning work, `loom agent next` claims up to `task_batch` ready tasks for the current agent and returns them as `kind: "task"`. Thread ownership records now include checkpoint-driven lease timestamps, so stale ownership can be reclaimed after the lease expires.
 
 If neither planning nor ready tasks exist, `loom agent next` can optionally poll before returning idle: configure `[agent].next_wait_seconds` + `[agent].next_retries`, or override with `--wait-seconds` / `--retries`. Each retry re-checks both pending inbox planning work and ready tasks before the command finally prints `ACTION  idle`.
 Default remains immediate (`0.0` / `0`), preserving current behavior.

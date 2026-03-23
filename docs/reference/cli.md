@@ -3,6 +3,8 @@
 ## Human commands
 
 - `loom init`
+- `loom request add "..."`
+- `loom request ls`
 - `loom inbox add "..."`
 - `loom inbox`
 - `loom status`
@@ -19,7 +21,8 @@ Difference between `loom` and `loom review`:
 
 - `loom`: interactive approval loop for `paused` and `reviewing`
 - `loom review`: non-interactive list of reviewing items only
-- `loom inbox`: interactive planning loop for pending inbox requirements
+- `loom request ls`: list requests and their resolution state
+- `loom inbox`: interactive planning loop for pending requests via the compatibility alias
 - `loom tui`: full-screen Textual TUI for the same approval queue
 
 - `paused`: use compact keyed actions like `d`, `s`, `o`, or `?`
@@ -66,7 +69,7 @@ If `loom agent pause` is called without `--question`, it falls back to a small t
 
 `loom agent done` only sends work to `reviewing` when the task looks review-ready. If the task body or output still contains TODO markers, proposal-only output, or explicit follow-up-improvement notes, the command pauses the task instead and generates a decision block for the human queue.
 
-`loom agent next` first returns pending inbox items that should be planned into tasks, then returns ready tasks.
+`loom agent next` first returns pending requests that should be planned into tasks, then returns ready tasks.
 
 - thread arguments still use human-facing thread names like `backend`
 - task ids shown in CLI output use the readable name-based form like `backend-001`
@@ -82,9 +85,11 @@ If `loom agent pause` is called without `--question`, it falls back to a small t
 - `--retries <n>`: retry count when the action is idle
 
 By default (`0.0` seconds, `0` retries), behavior is unchanged: a single immediate check.
-Each retry re-checks both pending inbox planning work and ready tasks before the command finally returns `ACTION  idle`.
+Each retry re-checks both pending request planning work and ready tasks before the command finally returns `ACTION  idle`.
 
-Important: `loom agent next` is no longer read-only for task execution. Worker calls claim the returned thread(s) for the current worker, but the command still does not perform inbox-to-task planning for you.
+Important: `loom agent next` is no longer read-only for task execution. Worker calls claim the returned thread(s) for the current worker, but the command still does not perform request-to-task planning for you.
+
+Claimed thread ownership now carries a visible lease in `_thread.md`. `loom agent checkpoint` refreshes that lease for every thread currently owned by the worker, and stale ownership becomes reclaimable by another worker once the stored lease expires. The default lease window matches `agent.offline_after_minutes`.
 
 Current behavior note: worker-safe `loom agent` commands infer the acting worker from `LOOM_WORKER_ID`. If that environment variable is missing, the command fails with guidance to use `--role manager`, `--role director`, or `--role reviewer`, or to set `LOOM_WORKER_ID`. Read-only commands like `loom agent status` and bootstrap guidance such as `loom agent start` do not require a worker id.
 
@@ -151,5 +156,5 @@ Role generation/discovery settings for this repo live in `roles.toml`.
 
 Human commands keep two interactive surfaces separate:
 
-- `loom` handles approval-only work (`paused` / `reviewing`), and does not plan inbox items
-- `loom inbox` handles pending inbox planning work
+- `loom` handles approval-only work (`paused` / `reviewing`), and does not plan requests
+- `loom inbox` handles pending request planning work

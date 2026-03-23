@@ -38,6 +38,8 @@ def test_claim_thread_sets_owner(loom: Path) -> None:
     _, thread = claim_thread(loom, "backend", agent_id="worker-1")
     assert thread.owner == "worker-1"
     assert thread.owned_at is not None
+    assert thread.owner_heartbeat_at is not None
+    assert thread.owner_lease_expires_at is not None
 
 
 def test_claim_thread_idempotent_for_same_agent(loom: Path) -> None:
@@ -46,6 +48,7 @@ def test_claim_thread_idempotent_for_same_agent(loom: Path) -> None:
     claim_thread(loom, "backend", agent_id="worker-1")
     _, thread = claim_thread(loom, "backend", agent_id="worker-1")
     assert thread.owner == "worker-1"
+    assert thread.owner_lease_expires_at is not None
 
 
 def test_claim_thread_rejects_different_agent(loom: Path) -> None:
@@ -63,6 +66,8 @@ def test_release_thread_clears_owner(loom: Path) -> None:
     _, thread = release_thread(loom, "backend", note="done working")
     assert thread.owner is None
     assert thread.owned_at is None
+    assert thread.owner_heartbeat_at is None
+    assert thread.owner_lease_expires_at is None
 
 
 def test_release_unclaimed_thread_raises(loom: Path) -> None:
@@ -161,6 +166,35 @@ def test_get_ready_tasks_excludes_other_owner(loom: Path) -> None:
     assert len(ready) == 1
 
 
+def test_get_ready_tasks_allows_stale_owner_reassignment(loom: Path) -> None:
+    from loom.frontmatter import write_model
+    from loom.scheduler import get_ready_tasks, load_all_threads
+    from loom.services import claim_thread, create_task
+
+    create_task(
+        loom,
+        thread_name="backend",
+        title="task1",
+        acceptance="- [ ] ok",
+    )
+    path, thread = claim_thread(loom, "backend", agent_id="worker-1")
+    stale_thread = thread.model_copy(
+        update={
+            "owner_heartbeat_at": "2026-03-20T08:00:00+00:00",
+            "owner_lease_expires_at": "2026-03-20T08:10:00+00:00",
+        }
+    )
+    write_model(path, stale_thread)
+
+    ready = get_ready_tasks(loom, for_agent="worker-2")
+    assert [task.id for task in ready] == ["backend-001"]
+
+    _, reclaimed = claim_thread(loom, "backend", agent_id="worker-2")
+    assert reclaimed.owner == "worker-2"
+    assert reclaimed.owner_lease_expires_at is not None
+    assert load_all_threads(loom)["backend"].owner == "worker-2"
+
+
 def test_get_ready_tasks_includes_unowned(loom: Path) -> None:
     """Tasks in unowned threads are available to any agent."""
     from loom.scheduler import get_ready_tasks
@@ -186,10 +220,69 @@ def test_thread_owner_fields_in_model() -> None:
     t = Thread(name="test", priority=50)
     assert t.owner is None
     assert t.owned_at is None
+    assert t.owner_heartbeat_at is None
+    assert t.owner_lease_expires_at is None
 
-    t2 = t.model_copy(update={"owner": "w1", "owned_at": "2026-01-01T00:00:00+00:00"})
+    t2 = t.model_copy(
+        update={
+            "owner": "w1",
+            "owned_at": "2026-01-01T00:00:00+00:00",
+            "owner_heartbeat_at": "2026-01-01T00:05:00+00:00",
+            "owner_lease_expires_at": "2026-01-01T00:35:00+00:00",
+        }
+    )
     assert t2.owner == "w1"
     assert t2.owned_at == "2026-01-01T00:00:00+00:00"
+    assert t2.owner_heartbeat_at == "2026-01-01T00:05:00+00:00"
+    assert t2.owner_lease_expires_at == "2026-01-01T00:35:00+00:00"
+
+
+def test_update_checkpoint_refreshes_owned_thread_lease(loom: Path) -> None:
+    from loom.frontmatter import read_model, write_model
+    from loom.repository import load_agent
+    from loom.services import claim_thread, touch_agent, update_checkpoint
+
+    path, thread = claim_thread(loom, "backend", agent_id="worker-1")
+    stale_thread = thread.model_copy(
+        update={
+            "owner_heartbeat_at": "2026-03-20T08:00:00+00:00",
+            "owner_lease_expires_at": "2026-03-20T08:10:00+00:00",
+        }
+    )
+    write_model(path, stale_thread)
+    touch_agent(loom, "worker-1")
+
+    update_checkpoint(loom, "worker-1", phase="implementing", summary="still working")
+
+    _agent_path, agent = load_agent(loom, "worker-1")
+    assert agent.checkpoint_summary == "still working"
+    updated_thread = read_model(path, Thread)
+    assert updated_thread.owner == "worker-1"
+    assert updated_thread.owner_heartbeat_at != stale_thread.owner_heartbeat_at
+    assert updated_thread.owner_lease_expires_at != stale_thread.owner_lease_expires_at
+
+
+def test_status_summary_marks_stale_owned_thread(loom: Path) -> None:
+    from loom.frontmatter import write_model
+    from loom.scheduler import get_status_summary
+    from loom.services import claim_thread
+
+    path, thread = claim_thread(loom, "backend", agent_id="worker-1")
+    write_model(
+        path,
+        thread.model_copy(
+            update={
+                "owner_heartbeat_at": "2026-03-20T08:00:00+00:00",
+                "owner_lease_expires_at": "2026-03-20T08:10:00+00:00",
+            }
+        ),
+    )
+
+    summary = get_status_summary(loom)
+    owned = summary["owned_threads"]["backend"]
+    assert owned["owner"] == "worker-1"
+    assert owned["stale"] is True
+    assert summary["stale_owned_threads"] == ["backend"]
 
 
 def test_migration_upgrades_claimed_task_to_thread_owner(loom: Path) -> None:

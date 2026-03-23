@@ -22,7 +22,12 @@ from .agent_command_catalog import (
     manager_spawn_command,
 )
 from .config import load_settings
-from .migration import ensure_name_based_threads, ensure_thread_ownership_metadata, ensure_worker_agent_subtree
+from .migration import (
+    ensure_name_based_threads,
+    ensure_request_storage,
+    ensure_thread_ownership_metadata,
+    ensure_worker_agent_subtree,
+)
 from .models import AgentRole, AgentStatus, MessageType, Task, TaskKind
 from .repository import agent_pending_dir, load_message, load_task, require_loom, task_file_path, workspace_root
 from .runtime import global_root, is_global_mode_active, set_root
@@ -92,6 +97,7 @@ def _emit_error(message: str, *, code: str = "error") -> None:
 def _resolve_loom() -> Path:
     try:
         loom = require_loom()
+        ensure_request_storage(loom)
         ensure_worker_agent_subtree(loom)
         ensure_name_based_threads(loom)
         ensure_thread_ownership_metadata(loom)
@@ -421,10 +427,10 @@ def next_task(
             "ACTION  plan",
             f"COUNT   {len(pending_inbox)}",
             "",
-            "These human requirements have not been arranged into threads/tasks yet.",
+            "These requests have not been arranged into threads/tasks yet.",
             "Manager action is required before worker execution can continue.",
             "",
-            "UNPLANNED REQUIREMENTS",
+            "UNPLANNED REQUESTS",
             *item_lines,
             "",
             "Manager next steps:",
@@ -905,6 +911,18 @@ def agent_status() -> None:
             if is_offline:
                 line += "  WARNING: appears offline"
             lines.append(line)
+
+    owned_threads = summary.get("owned_threads", {})
+    if owned_threads:
+        lines += ["", "OWNED THREADS"]
+        for thread_name, details in sorted(owned_threads.items()):
+            owner = details.get("owner", "?")
+            state = "stale" if details.get("stale") else "fresh"
+            claimed_at = details.get("owned_at") or "unknown"
+            lease_expires_at = details.get("lease_expires_at") or "unknown"
+            lines.append(
+                f" {thread_name:<20} owner:{owner} state:{state} owned_at:{claimed_at} lease_expires:{lease_expires_at}"
+            )
 
     if queue:
         lines += ["", "QUEUE (needs attention)"]
