@@ -56,17 +56,17 @@ Do not use this role for top-level orchestration or review decisions. Use the re
 
 ## Mission
 
-Execute claimed Loom tasks through the minimal worker-safe command set while keeping all state in `.loom/`.
+Execute Loom tasks within a claimed thread through the minimal worker-safe command set while keeping all state in `.loom/`.
 
 1. Start with `loom agent start --role worker` if you need the current worker brief, then run `loom agent next` with `LOOM_WORKER_ID` set.
-2. Implement the claimed task and keep context with checkpoint / inbox / reply as needed.
+2. Implement the assigned task inside your claimed thread and keep context with checkpoint / inbox / reply as needed.
 3. Finish with `loom agent done <task-id>` or `loom agent pause <task-id> ...`.
 4. Leave planning, orchestration, review decisions, and worker spawning to the appropriate roles / top-level entrypoints.
 
 ## Source of truth
 
 - Worker state lives in `.loom/agents/<agent-id>/`.
-- Claimed task state, pause decisions, and review transitions still live in `.loom/threads/**`.
+- Thread ownership, task state, pause decisions, and review transitions all live in `.loom/threads/**`.
 - Mailbox traffic under `.loom/agents/<agent-id>/inbox/` is coordination data, not a second runtime authority.
 
 ## Commit cadence

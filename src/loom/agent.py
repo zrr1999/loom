@@ -7,7 +7,7 @@ import os
 import sys
 import time
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 
@@ -22,7 +22,7 @@ from .agent_command_catalog import (
     manager_spawn_command,
 )
 from .config import load_settings
-from .migration import ensure_name_based_threads, ensure_worker_agent_subtree
+from .migration import ensure_name_based_threads, ensure_thread_ownership_metadata, ensure_worker_agent_subtree
 from .models import AgentRole, AgentStatus, MessageType, Task, TaskKind
 from .repository import agent_pending_dir, load_message, load_task, require_loom, task_file_path, workspace_root
 from .runtime import global_root, is_global_mode_active, set_root
@@ -54,6 +54,9 @@ _SINGLETON_ACTORS = {
 }
 _ROLE_HELP = "Run as worker, manager, director, or reviewer. Defaults to worker."
 _START_ROLE_HELP = "Show bootstrap guidance for worker, manager, director, or reviewer."
+WorkerRoleOption = Annotated[AgentRole, typer.Option("--role", help=_ROLE_HELP)]
+StartRoleOption = Annotated[AgentRole, typer.Option("--role", help=_START_ROLE_HELP)]
+GlobalModeOption = Annotated[bool, typer.Option("-g", help="Use the home-level loom directory.")]
 _WORKER_SAFE_COMMANDS = (
     "next",
     "done",
@@ -73,7 +76,7 @@ _WORKER_SAFE_COMMANDS = (
 @app.callback(invoke_without_command=True)
 def agent_root_options(
     ctx: typer.Context,
-    global_mode: bool = typer.Option(False, "-g", help="Use the home-level loom directory."),
+    global_mode: GlobalModeOption = False,
 ) -> None:
     set_root(global_root() if global_mode else None)
     if ctx.invoked_subcommand is None:
@@ -91,6 +94,7 @@ def _resolve_loom() -> Path:
         loom = require_loom()
         ensure_worker_agent_subtree(loom)
         ensure_name_based_threads(loom)
+        ensure_thread_ownership_metadata(loom)
         return loom
     except FileNotFoundError as exc:
         _emit_error(str(exc), code="loom_not_found")
@@ -275,9 +279,9 @@ def _touch_if_agent(loom: Path, actor: str) -> None:
 
 @app.command("new-thread")
 def new_thread(
-    name: str = typer.Option("", help="Thread name."),
-    priority: int = typer.Option(50, help="Thread priority."),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    name: Annotated[str, typer.Option(help="Thread name.")] = "",
+    priority: Annotated[int, typer.Option(help="Thread priority.")] = 50,
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Create a new thread using its canonical readable name."""
     loom = _resolve_loom()
@@ -301,17 +305,20 @@ def new_thread(
 
 @app.command("new-task")
 def new_task(
-    thread: str = typer.Option(..., "--thread", help="Canonical thread name (e.g. backend)."),
-    title: str = typer.Option("", help="Task title."),
-    kind: TaskKind = typer.Option(TaskKind.IMPLEMENTATION, "--kind", help="Task kind."),
-    priority: int = typer.Option(50, help="Task priority."),
-    acceptance: str = typer.Option("", help="Acceptance criteria."),
-    depends_on: str = typer.Option("", help="Comma-separated dependency IDs."),
-    after: str = typer.Option("", "--after", help="Sugar for --depends-on: single task ID this task comes after."),
-    created_from: str = typer.Option("", help="Comma-separated source inbox RQ IDs."),
-    background: str = typer.Option("", help="Task background section content."),
-    implementation_direction: str = typer.Option("", help="Implementation direction section content."),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    thread: Annotated[str, typer.Option("--thread", help="Canonical thread name (e.g. backend).")],
+    title: Annotated[str, typer.Option(help="Task title.")] = "",
+    kind: Annotated[TaskKind, typer.Option("--kind", help="Task kind.")] = TaskKind.IMPLEMENTATION,
+    priority: Annotated[int, typer.Option(help="Task priority.")] = 50,
+    acceptance: Annotated[str, typer.Option(help="Acceptance criteria.")] = "",
+    depends_on: Annotated[str, typer.Option(help="Comma-separated dependency IDs.")] = "",
+    after: Annotated[
+        str,
+        typer.Option("--after", help="Sugar for --depends-on: single task ID this task comes after."),
+    ] = "",
+    created_from: Annotated[str, typer.Option(help="Comma-separated source inbox RQ IDs.")] = "",
+    background: Annotated[str, typer.Option(help="Task background section content.")] = "",
+    implementation_direction: Annotated[str, typer.Option(help="Implementation direction section content.")] = "",
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Create a new task file in the given thread."""
     loom = _resolve_loom()
@@ -351,21 +358,21 @@ def new_task(
 
 @app.command("next")
 def next_task(
-    thread: str = typer.Option("", "--thread", help="Limit to a specific thread."),
-    plan_limit: int = typer.Option(0, "--plan-limit", min=0, help="Plan up to this many pending inbox items first."),
-    task_limit: int = typer.Option(0, "--task-limit", min=0, help="Return up to this many ready tasks."),
-    wait_seconds: float | None = typer.Option(
-        None,
-        "--wait-seconds",
-        help="Seconds to wait between retries when action is idle.",
-    ),
-    retries: int | None = typer.Option(
-        None,
-        "--retries",
-        min=0,
-        help="Retry count when no plan/task action is ready.",
-    ),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    thread: Annotated[str, typer.Option("--thread", help="Limit to a specific thread.")] = "",
+    plan_limit: Annotated[
+        int,
+        typer.Option("--plan-limit", min=0, help="Plan up to this many pending inbox items first."),
+    ] = 0,
+    task_limit: Annotated[int, typer.Option("--task-limit", min=0, help="Return up to this many ready tasks.")] = 0,
+    wait_seconds: Annotated[
+        float | None,
+        typer.Option("--wait-seconds", help="Seconds to wait between retries when action is idle."),
+    ] = None,
+    retries: Annotated[
+        int | None,
+        typer.Option("--retries", min=0, help="Retry count when no plan/task action is ready."),
+    ] = None,
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Get the next agent action."""
     loom = _resolve_loom()
@@ -574,7 +581,7 @@ def _render_manager_bootstrap(loom: Path) -> list[str]:
         f"        Then run {manager_next_command()} again.",
         "",
         "      If output starts with ACTION  task:",
-        "        Execute every claimed task that was returned.",
+        "        Execute every task returned from the claimed thread(s).",
         f"        Finish each completed task with `{manager_done_command()}`.",
         f"        If blocked on a human decision, use `{manager_pause_command()}`.",
         f"        After handling all returned tasks, run {manager_next_command()} again.",
@@ -642,7 +649,10 @@ def _render_worker_bootstrap(loom: Path) -> list[str]:
         "WORKER LOOP",
         "  1. Run: loom agent next",
         "  2. Read pending manager handoffs: loom agent inbox / loom agent inbox-read <msg-id>",
-        "  3. Implement the claimed task or ask for clarification with loom agent ask / propose / reply",
+        (
+            "  3. Implement the assigned task inside your claimed thread "
+            "or ask for clarification with loom agent ask / propose / reply"
+        ),
         "  4. Finish with loom agent done <task-id> [--output <path-or-url>]",
         "  5. If blocked on a decision, use loom agent pause <task-id> --question '<question>'",
         "",
@@ -736,7 +746,7 @@ def _render_director_bootstrap(loom: Path) -> list[str]:
         "",
         "ORCHESTRATION LOOP",
         "  1. Inspect status with `loom status` or `loom agent status`.",
-        "  2. Launch manager work with `loom manage` when planning or task claiming is needed.",
+        "  2. Launch manager work with `loom manage` when planning or thread assignment is needed.",
         "  3. Launch workers via `loom spawn` when configured, then hand them mailbox-driven task context.",
         "  4. Launch reviewer work with `loom review` when tasks are waiting for human review.",
         "",
@@ -749,7 +759,7 @@ def _render_director_bootstrap(loom: Path) -> list[str]:
 
 @app.command("start")
 def start(
-    role: AgentRole = typer.Option(AgentRole.MANAGER, "--role", help=_START_ROLE_HELP),
+    role: StartRoleOption = AgentRole.MANAGER,
 ) -> None:
     """Print bootstrap guidance for the requested role."""
     loom = _resolve_loom()
@@ -769,8 +779,8 @@ def start(
 @app.command("done")
 def done(
     task_id: str = typer.Argument(..., help="Task ID to mark done."),
-    output: str = typer.Option("", "--output", help="Output path or link."),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    output: Annotated[str, typer.Option("--output", help="Output path or link.")] = "",
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Mark a task as reviewing when it is ready for human review."""
     loom = _resolve_loom()
@@ -796,9 +806,9 @@ def done(
 @app.command("pause")
 def pause(
     task_id: str = typer.Argument(..., help="Task ID to pause."),
-    question: str = typer.Option("", "--question", help="Decision question."),
-    options: str = typer.Option("", "--options", help="JSON array of {id, label, note} options."),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    question: Annotated[str, typer.Option("--question", help="Decision question.")] = "",
+    options: Annotated[str, typer.Option("--options", help="JSON array of {id, label, note} options.")] = "",
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Pause a task with a decision question."""
     loom = _resolve_loom()
@@ -990,7 +1000,7 @@ def spawn_worker_runtime(
 
 @app.command("spawn", hidden=True)
 def spawn(
-    threads: str = typer.Option("", "--threads", help="Comma-separated thread assignment."),
+    threads: Annotated[str, typer.Option("--threads", help="Comma-separated thread assignment.")] = "",
 ) -> None:
     """Legacy entrypoint kept only to print migration guidance."""
     suggestion = f"loom spawn --threads {threads}" if threads else manager_spawn_command()
@@ -1001,7 +1011,7 @@ def spawn(
 
 
 @app.command("whoami")
-def whoami(role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP)) -> None:
+def whoami(role: WorkerRoleOption = AgentRole.WORKER) -> None:
     """Show the current actor identity."""
     actor = _resolve_actor_for_command("whoami", role=role)
     resolved_role = role.value if actor in _SINGLETON_ACTORS else AgentRole.WORKER.value
@@ -1011,8 +1021,8 @@ def whoami(role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE
 @app.command("checkpoint")
 def checkpoint(
     summary: str = typer.Argument(..., help="Checkpoint summary."),
-    phase: str = typer.Option("implementing", "--phase", help="Current phase."),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    phase: Annotated[str, typer.Option("--phase", help="Current phase.")] = "implementing",
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Update the current agent checkpoint."""
     loom = _resolve_loom()
@@ -1026,7 +1036,7 @@ def checkpoint(
 
 
 @app.command("resume")
-def resume(role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP)) -> None:
+def resume(role: WorkerRoleOption = AgentRole.WORKER) -> None:
     """Show the current agent checkpoint body."""
     loom = _resolve_loom()
     actor = _resolve_actor_for_command("resume", role=role)
@@ -1037,7 +1047,7 @@ def resume(role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE
 
 
 @app.command("inbox")
-def inbox(role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP)) -> None:
+def inbox(role: WorkerRoleOption = AgentRole.WORKER) -> None:
     """List pending messages for the current agent."""
     loom = _resolve_loom()
     actor = _resolve_actor_for_command("inbox", role=role)
@@ -1060,7 +1070,7 @@ def inbox(role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_
 @app.command("inbox-read")
 def inbox_read(
     msg_id: str = typer.Argument(..., help="Message ID to read (e.g. MSG-001)."),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Show message content without moving it."""
     loom = _resolve_loom()
@@ -1091,9 +1101,9 @@ def inbox_read(
 def send(
     to: str = typer.Argument(..., help="Recipient agent id."),
     body: str = typer.Argument(..., help="Message body."),
-    type_: str = typer.Option("info", "--type", help="Message type."),
-    ref: str = typer.Option("", "--ref", help="Optional related entity id."),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    type_: Annotated[str, typer.Option("--type", help="Message type.")] = "info",
+    ref: Annotated[str, typer.Option("--ref", help="Optional related entity id.")] = "",
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Send a message to another agent."""
     loom = _resolve_loom()
@@ -1121,8 +1131,8 @@ def send(
 def ask(
     to: str = typer.Argument(..., help="Recipient agent id (or 'manager' / 'human')."),
     question: str = typer.Argument(..., help="The question to ask."),
-    ref: str = typer.Option("", "--ref", help="Optional related task/entity id."),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    ref: Annotated[str, typer.Option("--ref", help="Optional related task/entity id.")] = "",
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Shorthand for send --type question."""
     loom = _resolve_loom()
@@ -1150,9 +1160,9 @@ def ask(
 def propose(
     to: str = typer.Argument(..., help="Recipient agent id (or 'manager' / 'human')."),
     proposal: str = typer.Argument(..., help="The task proposal body."),
-    thread: str = typer.Option("", "--thread", help="Optional related thread name."),
-    ref: str = typer.Option("", "--ref", help="Optional related entity id."),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    thread: Annotated[str, typer.Option("--thread", help="Optional related thread name.")] = "",
+    ref: Annotated[str, typer.Option("--ref", help="Optional related entity id.")] = "",
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Shorthand for send --type task_proposal."""
     loom = _resolve_loom()
@@ -1181,7 +1191,7 @@ def propose(
 def reply(
     msg_id: str = typer.Argument(..., help="Pending message id."),
     body: str = typer.Argument(..., help="Reply body."),
-    role: AgentRole = typer.Option(AgentRole.WORKER, "--role", help=_ROLE_HELP),
+    role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Reply to a pending message and move it to replied."""
     loom = _resolve_loom()

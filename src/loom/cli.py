@@ -16,7 +16,7 @@ from .agent import spawn_worker_runtime
 from .agent import start as agent_start
 from .config import ensure_settings
 from .history import read_events
-from .migration import ensure_name_based_threads, ensure_worker_agent_subtree
+from .migration import ensure_name_based_threads, ensure_thread_ownership_metadata, ensure_worker_agent_subtree
 from .models import AgentRole, Decision, TaskStatus
 from .prompting import select, text
 from .repository import load_inbox_item, load_task, require_loom, root_config_path
@@ -52,6 +52,7 @@ def _resolve_loom() -> Path:
         loom = require_loom()
         ensure_worker_agent_subtree(loom)
         ensure_name_based_threads(loom)
+        ensure_thread_ownership_metadata(loom)
         return loom
     except FileNotFoundError as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -470,7 +471,7 @@ def tui() -> None:
       r  reject the selected reviewing task (prompts for reason)
       d  decide on the selected paused task (prompts for choice)
       n  add a new inbox requirement (multi-line)
-      l  release the selected claimed queue item (prompts for reason)
+      l  release the selected thread-owned queue item (prompts for reason)
       R  refresh the queue from disk
       w  toggle watch mode (polls .loom/ every 1s)
       ?  show the in-app shortcut/help overlay

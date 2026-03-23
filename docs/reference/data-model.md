@@ -23,10 +23,10 @@
 
 - filename is only the per-thread sequence (`001.md`, `002.md`, ...)
 - `id`: global task id composed as `<thread-id>-<seq>` (for example `thaa-001`)
-- `status`: `draft | scheduled | reviewing | paused | done` (CLAIMED kept for backward-compat)
+- `status`: `draft | scheduled | reviewing | paused | done` (legacy `claimed` values are migrated to thread ownership and then rewritten to `scheduled`)
 - `depends_on`: cross-thread task dependencies
 - `created_from`: source inbox IDs
-- `claim`: *(deprecated)* legacy task-level claim, kept for old files
+- `claim`: *(deprecated)* legacy task-level claim; migration strips it from task files after upgrading old workspaces
 - `acceptance`: required before entering `scheduled`
 - `decision`: required while `paused`
 - `reviewing`: rejected for tasks whose body/output still advertises TODOs, proposal-only output, or known follow-up improvements

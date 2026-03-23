@@ -37,7 +37,7 @@ Difference between `loom` and `loom review`:
   - `a` — accept the selected reviewing task → done
   - `r` — reject the selected reviewing task → scheduled (prompts for reason)
   - `d` — decide on the selected paused task → scheduled (prompts for choice)
-  - `l` — release the selected claimed queue item → scheduled (prompts for reason)
+  - `l` — release the selected thread-owned queue item → scheduled (prompts for reason)
   - `R` — refresh the queue from disk
   - `q` — quit
 - `.loom/` files remain the source of truth; the TUI reuses the same scheduler/service layer as plain CLI commands
@@ -50,7 +50,7 @@ Difference between `loom` and `loom review`:
 - `loom agent new-task --thread backend`
 - `loom agent next`
 - `loom agent start`
-- `loom agent spawn --manager`
+- `loom spawn`
 - `loom agent whoami`
 - `loom agent checkpoint "..."`
 - `loom agent resume`
@@ -69,7 +69,7 @@ If `loom agent pause` is called without `--question`, it falls back to a small t
 `loom agent next` first returns pending inbox items that should be planned into tasks, then returns ready tasks.
 
 - thread arguments still use human-facing thread names like `backend`
-- task ids shown in CLI output now use the short internal form like `thaa-001`
+- task ids shown in CLI output use the readable name-based form like `backend-001`
 
 - planning batch size comes from `agent.inbox_plan_batch` and defaults to `10`
 - ready-task batch size comes from `agent.task_batch` and defaults to `1`
@@ -84,9 +84,9 @@ If `loom agent pause` is called without `--question`, it falls back to a small t
 By default (`0.0` seconds, `0` retries), behavior is unchanged: a single immediate check.
 Each retry re-checks both pending inbox planning work and ready tasks before the command finally returns `ACTION  idle`.
 
-Important: `loom agent next` is no longer read-only for task execution. It claims returned tasks for the current agent, but it still does not perform inbox-to-task planning for you.
+Important: `loom agent next` is no longer read-only for task execution. Worker calls claim the returned thread(s) for the current worker, but the command still does not perform inbox-to-task planning for you.
 
-Current behavior note: mutating `loom agent` commands infer the acting agent from `LOOM_AGENT_ID`. If that environment variable is missing, the command fails unless `--manager` is passed explicitly. Read-only commands like `loom agent status` and `loom agent start` do not require it.
+Current behavior note: worker-safe `loom agent` commands infer the acting worker from `LOOM_WORKER_ID`. If that environment variable is missing, the command fails with guidance to use `--role manager`, `--role director`, or `--role reviewer`, or to set `LOOM_WORKER_ID`. Read-only commands like `loom agent status` and bootstrap guidance such as `loom agent start` do not require a worker id.
 
 `loom agent start` returns a concise manager bootstrap prompt describing the expected loop around `loom agent next`, `done`, and `pause`.
 

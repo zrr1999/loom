@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from .frontmatter import read_raw, write_model
 from .ids import canonical_thread_name, task_filename, task_id
+from .models import Claim, TaskStatus
 from .repository import (
     agents_dir,
     load_agent,
@@ -148,3 +149,75 @@ def ensure_worker_agent_subtree(loom: Path) -> None:
                 entry.rmdir()
             continue
         entry.rename(target_dir)
+
+
+def ensure_thread_ownership_metadata(loom: Path) -> None:
+    """Upgrade legacy task-level claims into thread ownership metadata.
+
+    Old workspaces may still store `status: claimed` and `claim:` blocks on task
+    files. The thread-ownership runtime expects active ownership on
+    `.loom/threads/<thread>/_thread.md` instead, while task files should no
+    longer persist claim metadata.
+    """
+    threads = load_all_threads(loom)
+    tasks = load_all_tasks(loom)
+    if not threads or not tasks:
+        return
+
+    active_claims: dict[str, tuple[str, str | None]] = {}
+    for task in tasks:
+        if task.claim is None:
+            continue
+
+        claim = task.claim if isinstance(task.claim, Claim) else Claim.model_validate(task.claim)
+        if task.status != TaskStatus.CLAIMED:
+            continue
+        if not claim.agent:
+            msg = f"cannot migrate claimed task '{task.id}' without claim.agent"
+            raise ValueError(msg)
+
+        existing = active_claims.get(task.thread)
+        if existing is not None and existing[0] != claim.agent:
+            msg = (
+                f"cannot migrate thread '{task.thread}': conflicting legacy claims from "
+                f"'{existing[0]}' and '{claim.agent}'"
+            )
+            raise ValueError(msg)
+
+        claimed_at = claim.claimed_at
+        if existing is None or (claimed_at or "") >= (existing[1] or ""):
+            active_claims[task.thread] = (claim.agent, claimed_at)
+
+    for thread_name, (agent_id, owned_at) in active_claims.items():
+        thread = threads.get(thread_name)
+        if thread is None:
+            msg = f"cannot migrate claimed task metadata: missing thread '{thread_name}'"
+            raise ValueError(msg)
+        if thread.owner and thread.owner != agent_id:
+            msg = (
+                f"cannot migrate thread '{thread_name}': existing owner '{thread.owner}' "
+                f"conflicts with legacy claim owner '{agent_id}'"
+            )
+            raise ValueError(msg)
+
+        next_owned_at = owned_at or thread.owned_at
+        if thread.owner == agent_id and thread.owned_at == next_owned_at:
+            continue
+
+        thread_path = loom / "threads" / thread_name / "_thread.md"
+        updated_thread = thread.model_copy(update={"owner": agent_id, "owned_at": next_owned_at})
+        write_model(thread_path, updated_thread)
+        threads[thread_name] = updated_thread
+
+    for task in tasks:
+        updates: dict[str, object] = {}
+        if task.claim is not None:
+            updates["claim"] = None
+        if task.status == TaskStatus.CLAIMED:
+            updates["status"] = TaskStatus.SCHEDULED
+        if not updates:
+            continue
+
+        path, latest = load_task(loom, task.id)
+        updated_task = latest.model_copy(update=updates)
+        write_model(path, updated_task)

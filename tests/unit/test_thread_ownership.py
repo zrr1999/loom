@@ -8,7 +8,6 @@ import pytest
 
 from loom.models import TaskStatus, Thread
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -191,3 +190,69 @@ def test_thread_owner_fields_in_model() -> None:
     t2 = t.model_copy(update={"owner": "w1", "owned_at": "2026-01-01T00:00:00+00:00"})
     assert t2.owner == "w1"
     assert t2.owned_at == "2026-01-01T00:00:00+00:00"
+
+
+def test_migration_upgrades_claimed_task_to_thread_owner(loom: Path) -> None:
+    from loom.frontmatter import read_raw
+    from loom.migration import ensure_thread_ownership_metadata
+    from loom.repository import load_task
+    from loom.services import create_task
+
+    task, path = create_task(
+        loom,
+        thread_name="backend",
+        title="legacy claimed task",
+        acceptance="- [ ] migrated",
+    )
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "status: scheduled\n",
+            "status: claimed\nclaim:\n  agent: worker-7\n  claimed_at: '2026-03-20T08:00:00+00:00'\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    ensure_thread_ownership_metadata(loom)
+
+    _, migrated = load_task(loom, task.id)
+    assert migrated.status == TaskStatus.SCHEDULED
+    assert migrated.claim is None
+
+    metadata, _body = read_raw(loom / "threads" / "backend" / "_thread.md")
+    assert metadata["owner"] == "worker-7"
+    assert metadata["owned_at"] == "2026-03-20T08:00:00+00:00"
+
+
+def test_migration_removes_legacy_claim_from_completed_task(loom: Path) -> None:
+    from loom.frontmatter import read_raw
+    from loom.migration import ensure_thread_ownership_metadata
+    from loom.repository import load_task
+    from loom.services import create_task, transition_task
+
+    task, _path = create_task(
+        loom,
+        thread_name="backend",
+        title="legacy completed task",
+        acceptance="- [ ] migrated",
+    )
+    transition_task(loom, task.id, TaskStatus.REVIEWING)
+    transition_task(loom, task.id, TaskStatus.DONE)
+    path, completed = load_task(loom, task.id)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "review_history: []\n",
+            "claim:\n  agent: worker-2\n  claimed_at: '2026-03-20T07:00:00+00:00'\nreview_history: []\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    ensure_thread_ownership_metadata(loom)
+
+    _, migrated = load_task(loom, completed.id)
+    metadata, _body = read_raw(path)
+    assert migrated.claim is None
+    assert "claim" not in metadata
+    thread_metadata, _thread_body = read_raw(loom / "threads" / "backend" / "_thread.md")
+    assert "owner" not in thread_metadata

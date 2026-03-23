@@ -23,14 +23,14 @@
 
 ### Manager
 
-- Run `uv run loom agent next --manager`
+- Run `uv run loom agent next --role manager`
 - If the result is `ACTION  plan`, create threads and tasks from pending `RQ-*` inbox items
-- If the result is `ACTION  task`, execute or coordinate the claimed task
-- Use `uv run loom agent new-thread --manager`, `uv run loom agent new-task --manager`, `uv run loom agent done <task-id> --manager`, and `uv run loom agent pause <task-id> --manager`
+- If the result is `ACTION  task`, execute or coordinate the ready task inside the assigned thread
+- Use `uv run loom agent new-thread --role manager`, `uv run loom agent new-task --role manager`, `uv run loom agent done <task-id> --role manager`, and `uv run loom agent pause <task-id> --role manager`
 
-### Executor
+### Worker
 
-- Must run with `LOOM_AGENT_ID` set
+- Must run with `LOOM_WORKER_ID` set
 - Loop on `uv run loom agent next`
 - Finish work with `uv run loom agent done <task-id> [--output ...]`
 - Ask for decisions with `uv run loom agent pause <task-id> --question ... [--options ...]`

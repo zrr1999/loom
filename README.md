@@ -69,11 +69,11 @@ Default remains immediate (`0.0` / `0`), preserving current behavior.
 
 `loom inbox` (without subcommand) runs an interactive planning loop for pending inbox items and plans each selected item into an initial task.
 
-Mutating `loom agent` commands infer the actor from `LOOM_AGENT_ID`. If that variable is missing, those commands fail unless you pass `--manager`, which explicitly acts as manager.
+Worker-safe `loom agent` commands infer the actor from `LOOM_WORKER_ID`. Singleton-only mutations such as manager planning/task commands require `--role manager`, `--role director`, or `--role reviewer`.
 
-Agents are stored under `.loom/agents/`. `loom init` ensures the manager record exists, and `loom agent spawn --manager` creates executor records plus env files.
+Agents are stored under `.loom/agents/`. `loom init` ensures the manager record exists, and `loom spawn` creates worker records plus env files.
 
-`loom agent done` normally moves a claimed task into `reviewing`, but it now gates obviously incomplete work. If the task body or output still contains TODO markers, proposal-only output, or explicit follow-up-improvement notes, the command pauses the task instead and writes a generated decision request so a human can decide how to proceed.
+`loom agent done` normally moves an assigned task into `reviewing`, but it now gates obviously incomplete work. If the task body or output still contains TODO markers, proposal-only output, or explicit follow-up-improvement notes, the command pauses the task instead and writes a generated decision request so a human can decide how to proceed.
 
 `loom agent start` prints a worker-oriented prompt that explains the loop around `loom agent next` and makes explicit that `loom agent done` / `loom agent pause` must always be called with a concrete task id.
 

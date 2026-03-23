@@ -479,7 +479,6 @@ if _TEXTUAL_AVAILABLE:
 
         def on_mount(self) -> None:
             self._reload_queue()
-            lv = self.query_one("#queue-list", ListView)
             self._set_status(self._idle_status())
 
         # ------------------------------------------------------------------
@@ -596,7 +595,6 @@ if _TEXTUAL_AVAILABLE:
             self.push_screen(
                 _TextAreaModal(
                     "New requirement",
-                    placeholder="Describe the requirement here. Multiple lines are supported.",
                 ),
                 _on_body,
             )

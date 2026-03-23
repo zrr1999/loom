@@ -176,7 +176,7 @@ def summarize_capabilities(threads: dict[str, Thread], tasks: list[Task]) -> lis
         tasks_by_thread[task.thread].append(task)
 
     summaries: list[dict[str, Any]] = []
-    for thread_name, thread in sorted(threads.items(), key=lambda item: (-item[1].priority, item[0])):
+    for thread_name, _thread in sorted(threads.items(), key=lambda item: (-item[1].priority, item[0])):
         thread_tasks = sorted(tasks_by_thread.get(thread_name, []), key=lambda task: (task.seq, task.id))
         if not thread_tasks:
             continue
