@@ -182,10 +182,12 @@ def _make_reviewing_task(loom: Path) -> str:
 def test_reject_appends_to_review_history(_loom_project: Path):
     """A single rejection creates a review_history entry."""
     from loom.repository import load_task
-    from loom.services import reject_task
+    from loom.scheduler import load_all_threads
+    from loom.services import claim_thread, reject_task
 
     loom = _loom_project
     task_id = _make_reviewing_task(loom)
+    claim_thread(loom, "backend", agent_id="worker-1")
 
     reject_task(loom, task_id, "Missing validation tests")
 
@@ -196,6 +198,7 @@ def test_reject_appends_to_review_history(_loom_project: Path):
     assert task.review_history[0].note == "Missing validation tests"
     # Backward compat: rejection_note is also set
     assert task.rejection_note == "Missing validation tests"
+    assert load_all_threads(loom)["backend"].owner == "worker-1"
 
 
 def test_accept_appends_to_review_history(_loom_project: Path):

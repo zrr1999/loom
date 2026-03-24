@@ -19,15 +19,27 @@ def manager_next_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
 
 
 def manager_new_thread_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
-    return _command(prefix, "agent new-thread --name <name> [--priority <n>] --role manager")
+    return _command(prefix, "manage new-thread --name <name> [--priority <n>]")
 
 
 def manager_new_task_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
-    return _command(prefix, "agent new-task --thread <id> --title '<title>' --acceptance '<criteria>' --role manager")
+    return _command(prefix, "manage new-task --thread <id> --title '<title>' --acceptance '<criteria>'")
+
+
+def manager_plan_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
+    return _command(prefix, "manage plan <rq-id>")
 
 
 def manager_done_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
     return _command(prefix, "agent done <task-id> --output <path-or-url> --role manager")
+
+
+def manager_priority_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
+    return _command(prefix, "manage priority [--task <id> | --thread <name>] [--set <n>]")
+
+
+def manager_assign_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
+    return _command(prefix, "manage assign --thread <name> --worker <agent-id>")
 
 
 def manager_pause_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
@@ -52,9 +64,11 @@ def render_manager_command_contract(prefix: str = DEFAULT_COMMAND_PREFIX) -> str
         f"- Fetch the next action: `{manager_next_command(prefix)}`",
         f"- Create a planning thread: `{manager_new_thread_command(prefix)}`",
         f"- Create a planned task: `{manager_new_task_command(prefix)}`",
+        f"- Plan a pending request directly: `{manager_plan_command(prefix)}`",
         f"- Finish completed manager-owned work: `{manager_done_command(prefix)}`",
         f"- Pause for a human decision: `{manager_pause_command(prefix)}`",
-        f"- Spawn or wake a worker when configured: `{manager_spawn_command(prefix)}`",
+        f"- Assign a thread to a worker: `{manager_assign_command(prefix)}`",
+        f"- Inspect or adjust task/thread priority: `{manager_priority_command(prefix)}`",
         f"- Delegate the initial handoff: `{manager_propose_command(prefix)}`",
         f"- Send follow-up context: `{manager_send_command(prefix)}`",
     ]
@@ -68,26 +82,36 @@ def render_manager_command_access(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
         "agent pause <id> --question ... --options ...",
         'agent checkpoint "..."',
         "agent resume",
-        "agent inbox",
-        "agent inbox-read <msg-id>",
+        "agent mailbox",
+        "agent mailbox-read <msg-id>",
         "agent whoami",
+        "agent worktree list|add|attach|remove",
         'agent ask <to> "..."',
         'agent propose <to> "..."',
         'agent reply <msg-id> "..."',
     ]
     singleton_only = [
-        "agent new-thread [--role <manager|director|reviewer>]",
-        "agent new-task --thread backend [--role <manager|director|reviewer>]",
         'agent send <to> "..." [--role <manager|director|reviewer>]',
     ]
     manager_only = [
         "manage",
-        "spawn [--threads <backend,frontend>]",
+        "manage new-thread --name <name> [--priority <n>]",
+        "manage new-task --thread <id> --title '<title>' --acceptance '<criteria>'",
+        "manage plan <rq-id>",
+        "manage assign --thread <name> --worker <agent-id>",
+        "manage priority [--task <id> | --thread <name>] [--set <n>]",
     ]
 
     lines = [
         ("- Worker-safe `loom agent` commands default to the worker role and require `LOOM_WORKER_ID`."),
         *[f"  - `{_command(prefix, suffix)}`" for suffix in worker_safe],
+        (
+            "- Mailbox commands can also target singleton mailboxes with "
+            "`--role manager`, `--role director`, or `--role reviewer`."
+        ),
+        f"  - `{_command(prefix, 'agent mailbox --role <manager|director|reviewer>')}`",
+        f"  - `{_command(prefix, 'agent mailbox-read <msg-id> --role <manager|director|reviewer>')}`",
+        f"  - `{_command(prefix, 'agent reply <msg-id> "..." --role <manager|director|reviewer>')}`",
         ("- Singleton-only `loom agent` commands require `--role manager`, `--role director`, or `--role reviewer`."),
         *[f"  - `{_command(prefix, suffix)}`" for suffix in singleton_only],
         f"- Read-only status remains available without a worker id: `{_command(prefix, 'agent status')}`",
@@ -95,6 +119,11 @@ def render_manager_command_access(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
         "- Director and human share the full top-level `loom` command surface.",
         "- Manager entrypoints outside `loom agent`: require a clean manager process without `LOOM_WORKER_ID`.",
         *[f"  - `{_command(prefix, suffix)}`" for suffix in manager_only],
-        f"- Reviewer entrypoint outside `loom agent`: `{_command(prefix, 'review')}`",
+        f"- Human/director worker-launch entrypoint: `{manager_spawn_command(prefix)}`",
+        "- Reviewer/human entrypoints outside `loom agent`:",
+        f"  - `{_command(prefix, 'review')}`",
+        f"  - `{_command(prefix, 'review accept <id>')}`",
+        f"  - `{_command(prefix, 'review reject <id> "reason"')}`",
+        f"  - `{_command(prefix, 'review decide <id> <option>')}`",
     ]
     return "\n".join(lines)

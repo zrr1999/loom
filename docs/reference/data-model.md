@@ -44,6 +44,24 @@
 - `<agent-id>/inbox/pending/`: incoming messages
 - `<agent-id>/inbox/replied/`: processed messages
 
+## `.loom/agents/workers/<agent-id>/worktrees/`
+
+- worker-local worktree storage root
+- contains both worker-local checkout directories and adjacent `<name>.md` metadata records
+- only the owning worker reads or mutates this subtree through `loom agent worktree ...`
+
+## `.loom/agents/workers/<agent-id>/worktrees/<name>.md`
+
+- optional registry record for one worker-local Git worktree checkout
+- `name`: stable worker-local id used by `loom agent worktree ...`
+- `path`: absolute path to the registered checkout directory, always under the owning worker subtree
+- `branch`: advisory branch label shown in `loom agent worktree list`
+- `status`: advisory status such as `registered`, `active`, or `idle`
+- `worker`: owning worker id; worker-local commands do not let another worker rewrite it
+- `thread`: optional thread currently associated with that checkout
+- `created_at` / `updated_at`: registry bookkeeping timestamps
+- non-authoritative by design: removing or editing this file does not change actual task/thread state
+
 ## Agent polling settings (`loom.toml`)
 
 Under `[agent]`, `loom agent next` uses:

@@ -6,8 +6,8 @@ from pathlib import Path
 
 from .config import config_path, load_settings
 from .frontmatter import read_model, read_raw
-from .ids import split_task_id, task_filename
-from .models import AgentRecord, ManagerRecord, Message, RequestItem, Task
+from .ids import canonical_thread_name, split_task_id, task_filename
+from .models import AgentRecord, ManagerRecord, Message, RequestItem, Task, WorktreeRecord
 from .runtime import resolve_root
 
 
@@ -162,3 +162,24 @@ def message_path(message_dir: Path, msg_id: str) -> Path:
 def load_message(message_dir: Path, msg_id: str) -> tuple[Path, Message]:
     path = message_path(message_dir, msg_id)
     return path, read_model(path, Message)
+
+
+def agent_worktrees_dir(loom: Path, agent_id: str) -> Path:
+    return agent_dir(loom, agent_id) / "worktrees"
+
+
+def worktree_record_path(loom: Path, agent_id: str, name: str) -> Path:
+    canonical = canonical_thread_name(name)
+    return agent_worktrees_dir(loom, agent_id) / f"{canonical}.md"
+
+
+def find_worktree_path(loom: Path, agent_id: str, name: str) -> Path:
+    path = worktree_record_path(loom, agent_id, name)
+    if not path.exists():
+        raise FileNotFoundError(f"worktree '{canonical_thread_name(name)}' not found for worker '{agent_id}'")
+    return path
+
+
+def load_worktree(loom: Path, agent_id: str, name: str) -> tuple[Path, WorktreeRecord]:
+    path = find_worktree_path(loom, agent_id, name)
+    return path, read_model(path, WorktreeRecord)

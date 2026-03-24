@@ -54,6 +54,13 @@ class AgentStatus(StrEnum):
     IDLE = "idle"
 
 
+class WorktreeStatus(StrEnum):
+    REGISTERED = "registered"
+    ACTIVE = "active"
+    IDLE = "idle"
+    ARCHIVED = "archived"
+
+
 class MessageType(StrEnum):
     TASK_ASSIGNMENT = "task_assignment"
     QUESTION = "question"
@@ -340,4 +347,16 @@ class Message(BaseModel):
     ref: str | None = None
     sent: str | None = None
     reply_ref: str | None = None
+    body: str = ""
+
+
+class WorktreeRecord(BaseModel):
+    name: str
+    path: str
+    branch: str
+    status: WorktreeStatus = WorktreeStatus.REGISTERED
+    worker: str
+    thread: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
     body: str = ""

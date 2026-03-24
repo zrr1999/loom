@@ -8,6 +8,16 @@ next_wait_seconds = 60.0
 next_retries = 5
 executor_command = ""
 offline_after_minutes = 30
+# TODO: resume/reattach-related agent config is still under research.
+# Possible future settings may include explicit resume command templates.
 
 [threads]
 default_priority = 50
+
+[hooks.next]
+# all = "Shared reminder shown to every role."
+# worker = "Run tests before `loom agent done`."
+# examples = ["commit-message-policy"]
+
+[hooks.done.before]
+examples = ["worker-done-review"]

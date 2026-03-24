@@ -21,13 +21,57 @@ Pass `-g` to use the home-level loom workspace at `~/.loom` with `~/loom.toml`.
 ```bash
 uv sync --all-groups
 uv run loom init --project my-app
-uv run loom agent new-thread --name backend --priority 90
-uv run loom agent new-task --thread backend --title "实现 token 刷新接口" --acceptance "- [ ] POST /auth/refresh 返回新 access token"
+uv run loom manage new-thread --name backend --priority 90
+uv run loom manage new-task --thread backend --title "实现 token 刷新接口" --acceptance "- [ ] POST /auth/refresh 返回新 access token"
 uv run loom agent next
 uv run loom agent start
 uv run loom status
 uv run loom
 ```
+
+## Worker-local worktrees
+
+Loom now keeps optional, non-authoritative worktree records under each worker agent at
+`.loom/agents/workers/<worker-id>/worktrees/`.
+Only the owning worker sees and manages those records through `loom agent worktree ...`.
+Thread/task truth still lives under `.loom/threads/`.
+
+Recommended flow:
+
+1. enter a worker shell with `LOOM_WORKER_ID` set
+2. create or register a worker-local checkout path under that agent subtree
+3. attach advisory thread metadata so the worker can track what the checkout is for
+
+```bash
+export LOOM_WORKER_ID=aaap
+mkdir -p .loom/agents/workers/aaap/worktrees/worktree-flow
+uv run loom agent worktree add worktree-flow --branch feat/worktree-flow
+uv run loom agent worktree attach worktree-flow --thread worktree-flow
+uv run loom agent worktree list
+```
+
+Guardrails:
+
+- `loom agent worktree ...` fails without `LOOM_WORKER_ID`
+- each worker only sees its own worktrees under `.loom/agents/workers/<worker-id>/worktrees/`
+- `loom agent worktree remove <name>` removes only the Loom record; it does **not** delete the checkout on disk
+- if a worktree is still attached to thread metadata, clear it first with
+  `loom agent worktree attach <name> --clear` or use `--force`
+
+When a worker shell runs from one of those registered secondary checkouts, keep
+`LOOM_DIR` pointed at the primary `.loom/` directory:
+
+```bash
+export LOOM_WORKER_ID=aaap
+export LOOM_DIR=$PWD/.loom
+cd .loom/agents/workers/aaap/worktrees/worktree-flow
+uv run loom agent whoami
+uv run loom agent next
+```
+
+`loom agent whoami`, `loom agent start --role worker`, and `loom agent status`
+now report the current worker/worktree mapping, while worker hook/config loading
+follows the active checkout root so secondary-checkout settings stay unambiguous.
 
 ## Tooling
 
@@ -65,15 +109,28 @@ When there is no inbox planning work, `loom agent next` claims up to `task_batch
 If neither planning nor ready tasks exist, `loom agent next` can optionally poll before returning idle: configure `[agent].next_wait_seconds` + `[agent].next_retries`, or override with `--wait-seconds` / `--retries`. Each retry re-checks both pending inbox planning work and ready tasks before the command finally prints `ACTION  idle`.
 Default remains immediate (`0.0` / `0`), preserving current behavior.
 
-`loom review` is a non-interactive listing of tasks waiting for human acceptance. Plain `loom` is the interactive approval loop for paused/reviewing items.
+`loom review` is a non-interactive listing of tasks waiting for human acceptance. Use `loom review accept`, `loom review reject`, and `loom review decide` for explicit approval actions. Plain `loom` is the interactive approval loop for paused/reviewing items.
+
+Review records are append-only. Each `accept` or `reject` adds an entry to `review_history`, so a task can move through repeated reject → revise → review cycles without losing earlier reviewer notes. The legacy `rejection_note` remains a compatibility mirror for the latest rejection, but reviewers should treat `review_history` as the full user-facing audit trail.
+
+Review detail is outcome-first. `loom review` and other review-detail surfaces prioritize:
+
+1. acceptance coverage
+2. delivered outputs / previews
+3. append-only review history
+4. secondary metadata such as task kind, dependencies, and provenance
+
+That ordering keeps reviewer attention on what was delivered and what prior review rounds said before falling back to changed-file-style metadata.
 
 `loom inbox` (without subcommand) runs an interactive planning loop for pending inbox items and plans each selected item into an initial task.
 
 Worker-safe `loom agent` commands infer the actor from `LOOM_WORKER_ID`. Singleton-only mutations such as manager planning/task commands require `--role manager`, `--role director`, or `--role reviewer`.
 
-Agents are stored under `.loom/agents/`. `loom init` ensures the manager record exists, and `loom spawn` creates worker records plus env files.
+Agents are stored under `.loom/agents/`. `loom init` ensures the manager record exists, and top-level `loom spawn` creates worker records plus env files for director/human orchestration.
 
 `loom agent done` normally moves an assigned task into `reviewing`, but it now gates obviously incomplete work. If the task body or output still contains TODO markers, proposal-only output, or explicit follow-up-improvement notes, the command pauses the task instead and writes a generated decision request so a human can decide how to proceed.
+
+Like `loom agent next`, `loom agent done` now supports advisory soft hooks from `loom.toml`: `[hooks.done.before]` prints reminders before Loom validates/submits the completion attempt, and `[hooks.done.after]` prints follow-up reminders after the result block. These reminders stay soft — they never bypass validation and they never hard-block the command.
 
 `loom agent start` prints a worker-oriented prompt that explains the loop around `loom agent next` and makes explicit that `loom agent done` / `loom agent pause` must always be called with a concrete task id.
 
@@ -90,11 +147,13 @@ Agents are stored under `.loom/agents/`. `loom init` ensures the manager record 
 <!-- BEGIN: manager-command-contract -->
 - Bootstrap the manager loop: `uvx --from git+https://github.com/zrr1999/loom loom manage`
 - Fetch the next action: `uvx --from git+https://github.com/zrr1999/loom loom agent next --role manager`
-- Create a planning thread: `uvx --from git+https://github.com/zrr1999/loom loom agent new-thread --name <name> [--priority <n>] --role manager`
-- Create a planned task: `uvx --from git+https://github.com/zrr1999/loom loom agent new-task --thread <id> --title '<title>' --acceptance '<criteria>' --role manager`
+- Create a planning thread: `uvx --from git+https://github.com/zrr1999/loom loom manage new-thread --name <name> [--priority <n>]`
+- Create a planned task: `uvx --from git+https://github.com/zrr1999/loom loom manage new-task --thread <id> --title '<title>' --acceptance '<criteria>'`
+- Plan a pending request directly: `uvx --from git+https://github.com/zrr1999/loom loom manage plan <rq-id>`
 - Finish completed manager-owned work: `uvx --from git+https://github.com/zrr1999/loom loom agent done <task-id> --output <path-or-url> --role manager`
 - Pause for a human decision: `uvx --from git+https://github.com/zrr1999/loom loom agent pause <task-id> --question '<question>' --role manager`
-- Spawn or wake a worker when configured: `uvx --from git+https://github.com/zrr1999/loom loom spawn [--threads <backend,frontend>]`
+- Assign a thread to a worker: `uvx --from git+https://github.com/zrr1999/loom loom manage assign --thread <name> --worker <agent-id>`
+- Inspect or adjust task/thread priority: `uvx --from git+https://github.com/zrr1999/loom loom manage priority [--task <id> | --thread <name>] [--set <n>]`
 - Delegate the initial handoff: `uvx --from git+https://github.com/zrr1999/loom loom agent propose <agent-id> '<task handoff>' --ref <task-id> --role manager`
 - Send follow-up context: `uvx --from git+https://github.com/zrr1999/loom loom agent send <agent-id> '<extra context>' --ref <task-id> --role manager`
 <!-- END: manager-command-contract -->
@@ -108,21 +167,35 @@ Agents are stored under `.loom/agents/`. `loom init` ensures the manager record 
   - `uvx --from git+https://github.com/zrr1999/loom loom agent pause <id> --question ... --options ...`
   - `uvx --from git+https://github.com/zrr1999/loom loom agent checkpoint "..."`
   - `uvx --from git+https://github.com/zrr1999/loom loom agent resume`
-  - `uvx --from git+https://github.com/zrr1999/loom loom agent inbox`
-  - `uvx --from git+https://github.com/zrr1999/loom loom agent inbox-read <msg-id>`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent mailbox`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent mailbox-read <msg-id>`
   - `uvx --from git+https://github.com/zrr1999/loom loom agent whoami`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent worktree list|add|attach|remove`
   - `uvx --from git+https://github.com/zrr1999/loom loom agent ask <to> "..."`
   - `uvx --from git+https://github.com/zrr1999/loom loom agent propose <to> "..."`
   - `uvx --from git+https://github.com/zrr1999/loom loom agent reply <msg-id> "..."`
+- Mailbox commands can also target singleton mailboxes with `--role manager`, `--role director`, or `--role reviewer`.
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent mailbox --role <manager|director|reviewer>`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent mailbox-read <msg-id> --role <manager|director|reviewer>`
+  - `uvx --from git+https://github.com/zrr1999/loom loom agent reply <msg-id> "..." --role <manager|director|reviewer>`
 - Singleton-only `loom agent` commands require `--role manager`, `--role director`, or `--role reviewer`.
-  - `uvx --from git+https://github.com/zrr1999/loom loom agent new-thread [--role <manager|director|reviewer>]`
-  - `uvx --from git+https://github.com/zrr1999/loom loom agent new-task --thread backend [--role <manager|director|reviewer>]`
   - `uvx --from git+https://github.com/zrr1999/loom loom agent send <to> "..." [--role <manager|director|reviewer>]`
 - Read-only status remains available without a worker id: `uvx --from git+https://github.com/zrr1999/loom loom agent status`
 - Director/orchestrator bootstrap in this repo: `just start`.
 - Director and human share the full top-level `loom` command surface.
 - Manager entrypoints outside `loom agent`: require a clean manager process without `LOOM_WORKER_ID`.
   - `uvx --from git+https://github.com/zrr1999/loom loom manage`
-  - `uvx --from git+https://github.com/zrr1999/loom loom spawn [--threads <backend,frontend>]`
-- Reviewer entrypoint outside `loom agent`: `uvx --from git+https://github.com/zrr1999/loom loom review`
+  - `uvx --from git+https://github.com/zrr1999/loom loom manage new-thread --name <name> [--priority <n>]`
+  - `uvx --from git+https://github.com/zrr1999/loom loom manage new-task --thread <id> --title '<title>' --acceptance '<criteria>'`
+  - `uvx --from git+https://github.com/zrr1999/loom loom manage plan <rq-id>`
+  - `uvx --from git+https://github.com/zrr1999/loom loom manage assign --thread <name> --worker <agent-id>`
+  - `uvx --from git+https://github.com/zrr1999/loom loom manage priority [--task <id> | --thread <name>] [--set <n>]`
+- Human/director worker-launch entrypoint: `uvx --from git+https://github.com/zrr1999/loom loom spawn [--threads <backend,frontend>]`
+- Reviewer/human entrypoints outside `loom agent`:
+  - `uvx --from git+https://github.com/zrr1999/loom loom review`
+  - `uvx --from git+https://github.com/zrr1999/loom loom review accept <id>`
+  - `uvx --from git+https://github.com/zrr1999/loom loom review reject <id> "reason"`
+  - `uvx --from git+https://github.com/zrr1999/loom loom review decide <id> <option>`
 <!-- END: manager-command-access -->
+
+Terminology note: `.loom/requests/` / `loom inbox` is the project request inbox, while `loom agent mailbox` is the per-agent message queue for handoffs, questions, and replies. Legacy `loom agent inbox` / `inbox-read` aliases still work for compatibility.

@@ -5,9 +5,14 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .runtime import resolve_root
+from .soft_hooks import (
+    available_done_after_hook_examples,
+    available_done_before_hook_examples,
+    available_next_hook_examples,
+)
 
 
 class ProjectSettings(BaseModel):
@@ -27,10 +32,73 @@ class ThreadDefaults(BaseModel):
     default_priority: int = 50
 
 
+def _validate_examples(value: list[str], *, available_examples: tuple[str, ...], field_name: str) -> list[str]:
+    valid_examples = set(available_examples)
+    unknown = sorted({name for name in value if name not in valid_examples})
+    if unknown:
+        available = ", ".join(available_examples)
+        detail = f" Available examples: {available}." if available else ""
+        raise ValueError(f"Unknown {field_name} entries: {', '.join(unknown)}.{detail}")
+    return value
+
+
+class RoleHooksSettings(BaseModel):
+    all: str = ""
+    manager: str = ""
+    worker: str = ""
+    director: str = ""
+    reviewer: str = ""
+    examples: list[str] = Field(default_factory=list)
+
+
+class NextHooksSettings(RoleHooksSettings):
+    @field_validator("examples")
+    @classmethod
+    def validate_examples(cls, value: list[str]) -> list[str]:
+        return _validate_examples(
+            value,
+            available_examples=available_next_hook_examples(),
+            field_name="hooks.next.examples",
+        )
+
+
+class DoneBeforeHooksSettings(RoleHooksSettings):
+    @field_validator("examples")
+    @classmethod
+    def validate_examples(cls, value: list[str]) -> list[str]:
+        return _validate_examples(
+            value,
+            available_examples=available_done_before_hook_examples(),
+            field_name="hooks.done.before.examples",
+        )
+
+
+class DoneAfterHooksSettings(RoleHooksSettings):
+    @field_validator("examples")
+    @classmethod
+    def validate_examples(cls, value: list[str]) -> list[str]:
+        return _validate_examples(
+            value,
+            available_examples=available_done_after_hook_examples(),
+            field_name="hooks.done.after.examples",
+        )
+
+
+class DoneHooksSettings(BaseModel):
+    before: DoneBeforeHooksSettings = Field(default_factory=DoneBeforeHooksSettings)
+    after: DoneAfterHooksSettings = Field(default_factory=DoneAfterHooksSettings)
+
+
+class HooksSettings(BaseModel):
+    next: NextHooksSettings = Field(default_factory=NextHooksSettings)
+    done: DoneHooksSettings = Field(default_factory=DoneHooksSettings)
+
+
 class LoomSettings(BaseModel):
     project: ProjectSettings = Field(default_factory=ProjectSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
     threads: ThreadDefaults = Field(default_factory=ThreadDefaults)
+    hooks: HooksSettings = Field(default_factory=HooksSettings)
 
 
 def config_path(base_dir: Path | None = None) -> Path:
@@ -55,11 +123,29 @@ def load_settings(base_dir: Path | None = None) -> LoomSettings:
     return settings
 
 
+def _toml_string(value: str) -> str:
+    if "\n" in value:
+        return '"""\n' + value.rstrip("\n") + '\n"""'
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _render_role_hook_lines(hooks: RoleHooksSettings) -> list[str]:
+    rendered_hook_lines: list[str] = []
+    for key in ("all", "manager", "worker", "director", "reviewer"):
+        value = getattr(hooks, key)
+        if value:
+            rendered_hook_lines.append(f"{key} = {_toml_string(value)}\n")
+    if hooks.examples:
+        examples = ", ".join(_toml_string(name) for name in hooks.examples)
+        rendered_hook_lines.append(f"examples = [{examples}]\n")
+    return rendered_hook_lines
+
+
 def dump_settings(settings: LoomSettings) -> str:
     executor_command = settings.agent.executor_command.replace("\\", "\\\\").replace('"', '\\"')
-    return (
-        "[project]\n"
-        f'name = "{settings.project.name}"\n\n'
+    parts = [
+        f'[project]\nname = "{settings.project.name}"\n\n',
         "[agent]\n"
         f"inbox_plan_batch = {settings.agent.inbox_plan_batch}\n"
         f"task_batch = {settings.agent.task_batch}\n"
@@ -68,10 +154,47 @@ def dump_settings(settings: LoomSettings) -> str:
         f'executor_command = "{executor_command}"\n'
         f"offline_after_minutes = {settings.agent.offline_after_minutes}\n"
         "# TODO: resume/reattach-related agent config is still under research.\n"
-        "# Possible future settings may include explicit resume command templates.\n\n"
-        "[threads]\n"
-        f"default_priority = {settings.threads.default_priority}\n"
-    )
+        "# Possible future settings may include explicit resume command templates.\n\n",
+        f"[threads]\ndefault_priority = {settings.threads.default_priority}\n\n",
+        "[hooks.next]\n",
+    ]
+    next_hooks = settings.hooks.next
+    rendered_hook_lines = _render_role_hook_lines(next_hooks)
+    if rendered_hook_lines:
+        parts.extend(rendered_hook_lines)
+    else:
+        parts.extend(
+            [
+                '# all = "Shared reminder shown to every role."\n',
+                '# worker = "Run tests before `loom agent done`."\n',
+                '# examples = ["commit-message-policy"]\n',
+            ]
+        )
+    parts.extend(["\n", "[hooks.done.before]\n"])
+    done_before_hooks = _render_role_hook_lines(settings.hooks.done.before)
+    if done_before_hooks:
+        parts.extend(done_before_hooks)
+    else:
+        parts.extend(
+            [
+                '# worker = "Before `loom agent done`, refresh your checkpoint and re-scan the diff."\n',
+                '# examples = ["worker-done-review"]\n',
+            ]
+        )
+    parts.extend(["\n", "[hooks.done.after]\n"])
+    done_after_hooks = _render_role_hook_lines(settings.hooks.done.after)
+    if done_after_hooks:
+        parts.extend(done_after_hooks)
+    else:
+        parts.extend(
+            [
+                (
+                    '# worker = "After `loom agent done`, make sure the review handoff '
+                    'names tests, output, and blockers."\n'
+                ),
+            ]
+        )
+    return "".join(parts)
 
 
 def ensure_settings(base_dir: Path | None = None, project_name: str = "") -> tuple[LoomSettings, bool]:

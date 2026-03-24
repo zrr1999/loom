@@ -1,6 +1,6 @@
 ---
 name: loom-reviewer
-description: Use when a task is already in `reviewing` and a human needs a concise review summary plus the exact `loom review` / `loom accept` / `loom reject` commands to finish the decision.
+description: Use when a task is already in `reviewing` and a human needs a concise review summary plus the exact `loom review` / `loom review accept` / `loom review reject` commands to finish the decision.
 role: supporting
 
 model:
@@ -14,11 +14,13 @@ capabilities:
   - write
   - bash:
       - "uvx --from agent-loom loom review*"
-      - "uvx --from agent-loom loom accept *"
-      - "uvx --from agent-loom loom reject *"
+      - "uvx --from agent-loom loom review accept *"
+      - "uvx --from agent-loom loom review reject *"
+      - "uvx --from agent-loom loom review decide *"
       - "loom review*"
-      - "loom accept *"
-      - "loom reject *"
+      - "loom review accept *"
+      - "loom review reject *"
+      - "loom review decide *"
   - delegate
 ---
 
@@ -54,8 +56,9 @@ Follow this review sequence unless the human explicitly asks for something else:
 1. Run `loom review` (or `uvx --from agent-loom loom review`) to list the tasks currently waiting for review.
 2. Open the relevant task file, output artifact, and any rejection / review notes so you can compare the result against the task acceptance criteria.
 3. Produce a concise review handoff that clearly separates facts, risks, and recommendation.
-4. If the human decides to accept, run `loom accept <task-id>`.
-5. If the human decides to send the task back, run `loom reject <task-id> '<reason>'` with a concrete rejection note that explains what still needs to change.
+4. If the human decides to accept, run `loom review accept <task-id>`.
+5. If the human decides to send the task back, run `loom review reject <task-id> '<reason>'` with a concrete rejection note that explains what still needs to change.
+6. If a paused human decision must be resolved from the plain CLI, run `loom review decide <task-id> <option>`.
 
 When you recommend a decision, always include the exact command the human can run next, or the exact command you would run after explicit approval.
 

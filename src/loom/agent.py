@@ -7,51 +7,60 @@ import os
 import sys
 import time
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Annotated
+from pathlib import Path
+from typing import Annotated
 
 import typer
 
 from .agent_command_catalog import (
+    manager_assign_command,
     manager_done_command,
     manager_new_task_command,
     manager_new_thread_command,
     manager_next_command,
     manager_pause_command,
+    manager_plan_command,
     manager_propose_command,
     manager_send_command,
     manager_spawn_command,
 )
-from .config import load_settings
+from .config import LoomSettings, load_settings
 from .migration import (
     ensure_name_based_threads,
     ensure_request_storage,
     ensure_thread_ownership_metadata,
     ensure_worker_agent_subtree,
 )
-from .models import AgentRole, AgentStatus, MessageType, Task, TaskKind
+from .models import AgentRole, AgentStatus, MessageType, Task, TaskKind, WorktreeStatus
 from .repository import agent_pending_dir, load_message, load_task, require_loom, task_file_path, workspace_root
 from .runtime import global_root, is_global_mode_active, set_root
 from .scheduler import get_next_tasks, get_pending_inbox_items, get_status_summary
 from .services import (
+    add_worktree,
+    attach_worktree,
     claim_thread,
     complete_task,
     create_message,
     create_task,
     create_thread,
     list_pending_messages,
+    load_all_worktrees,
     pause_task,
+    remove_worktree,
     reply_to_message,
+    resolve_actor_workspace_root,
+    resolve_current_worktree,
     resume_agent,
     spawn_agent,
     touch_agent,
     update_checkpoint,
 )
+from .soft_hooks import render_done_hook_lines, render_next_hook_lines
 from .state import InvalidTransitionError
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 app = typer.Typer(invoke_without_command=True)
+worktree_app = typer.Typer(help="Worker-local worktree commands.")
+app.add_typer(worktree_app, name="worktree")
 _SINGLETON_ACTORS = {
     AgentRole.MANAGER.value,
     AgentRole.DIRECTOR.value,
@@ -70,6 +79,8 @@ _WORKER_SAFE_COMMANDS = (
     "whoami",
     "checkpoint",
     "resume",
+    "mailbox",
+    "mailbox-read",
     "inbox",
     "inbox-read",
     "ask",
@@ -171,6 +182,142 @@ def _resolve_actor_for_command(command_name: str, *, role: AgentRole) -> str:
     raise  # unreachable
 
 
+def _format_worktree_line(record) -> list[str]:
+    path = Path(record.path)
+    effective_status = record.status.value
+    if not path.exists():
+        effective_status = f"{effective_status} (missing path)"
+    lines = [f"{record.name}  {effective_status}"]
+    lines.append(f"  path    : {record.path}")
+    lines.append(f"  branch  : {record.branch}")
+    lines.append(f"  worker  : {record.worker}")
+    lines.append(f"  thread  : {record.thread or '-'}")
+    return lines
+
+
+def _load_settings_for_actor(loom: Path, actor: str) -> LoomSettings:
+    base_dir = resolve_actor_workspace_root(loom, actor if actor not in _SINGLETON_ACTORS else "")
+    return load_settings(base_dir)
+
+
+def _current_worker_context_lines(loom: Path, worker_id: str) -> list[str]:
+    checkout_root = resolve_actor_workspace_root(loom, worker_id)
+    current = resolve_current_worktree(loom, worker_id)
+    lines = [f"  checkout root : {checkout_root}"]
+    if current is None:
+        lines.append("  worktree      : primary workspace (no registered worker-local checkout matched cwd)")
+        return lines
+
+    _root, record = current
+    lines.append(f"  worktree      : {record.name}")
+    lines.append(f"  branch        : {record.branch}")
+    lines.append(f"  status        : {record.status.value}")
+    if record.thread:
+        lines.append(f"  thread        : {record.thread}")
+    return lines
+
+
+@worktree_app.command("ls")
+@worktree_app.command("list")
+def worktree_list() -> None:
+    """List worktrees registered under the current worker only."""
+    loom = _resolve_loom()
+    worker_id = _resolve_actor(role=AgentRole.WORKER)
+    records = load_all_worktrees(loom, worker_id)
+    if not records:
+        typer.echo("No worker-local worktrees.")
+        return
+    for record in records:
+        for line in _format_worktree_line(record):
+            typer.echo(line)
+
+
+@worktree_app.command("add")
+def worktree_add(
+    name: str = typer.Argument(..., help="Worker-local worktree name."),
+    path: str = typer.Option(
+        "",
+        "--path",
+        help=("Optional directory path under .loom/agents/workers/<id>/worktrees/. Defaults to the worktree name."),
+    ),
+    branch: str = typer.Option("", "--branch", help="Branch name. Auto-detected when omitted."),
+    status: Annotated[WorktreeStatus, typer.Option("--status", help="Worker-local advisory status.")] = (
+        WorktreeStatus.REGISTERED
+    ),
+) -> None:
+    """Register a worker-local worktree directory."""
+    loom = _resolve_loom()
+    worker_id = _resolve_actor(role=AgentRole.WORKER)
+    try:
+        record, record_path = add_worktree(loom, worker_id, name=name, path=path, branch=branch, status=status)
+    except (FileNotFoundError, ValueError) as exc:
+        _emit_error(str(exc), code="worktree_invalid")
+        raise  # unreachable
+
+    typer.echo(f"REGISTERED worktree {record.name}")
+    typer.echo(f"  file   : {record_path}")
+    typer.echo(f"  path   : {record.path}")
+    typer.echo(f"  branch : {record.branch}")
+    typer.echo(f"  worker : {record.worker}")
+    typer.echo(f"  status : {record.status.value}")
+    typer.echo("  note   : worker-local metadata only; other workers do not see this worktree.")
+
+
+@worktree_app.command("attach")
+def worktree_attach(
+    name: str = typer.Argument(..., help="Registered worker-local worktree name."),
+    thread: str = typer.Option("", "--thread", help="Thread name currently worked in this checkout."),
+    status: Annotated[
+        WorktreeStatus | None,
+        typer.Option("--status", help="Advisory status after updating thread metadata."),
+    ] = None,
+    clear: bool = typer.Option(False, "--clear", help="Clear thread metadata for this worktree."),
+) -> None:
+    """Update worker-local thread metadata for one worktree."""
+    loom = _resolve_loom()
+    worker_id = _resolve_actor(role=AgentRole.WORKER)
+    try:
+        path, record = attach_worktree(
+            loom,
+            worker_id,
+            name,
+            thread=thread or None,
+            status=status,
+            clear=clear,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        _emit_error(str(exc), code="worktree_invalid")
+        raise  # unreachable
+
+    action = "CLEARED" if clear else "ATTACHED"
+    typer.echo(f"{action} worktree {record.name}")
+    typer.echo(f"  file   : {path}")
+    typer.echo(f"  worker : {record.worker}")
+    typer.echo(f"  thread : {record.thread or '-'}")
+    typer.echo(f"  status : {record.status.value}")
+    if not clear:
+        typer.echo("  note   : worktree visibility is scoped to this worker agent.")
+
+
+@worktree_app.command("remove")
+def worktree_remove(
+    name: str = typer.Argument(..., help="Registered worker-local worktree name."),
+    force: bool = typer.Option(False, "--force", help="Remove even if thread metadata is still attached."),
+) -> None:
+    """Remove a worker-local worktree record without deleting the checkout directory."""
+    loom = _resolve_loom()
+    worker_id = _resolve_actor(role=AgentRole.WORKER)
+    try:
+        _path, record = remove_worktree(loom, worker_id, name, force=force)
+    except (FileNotFoundError, ValueError) as exc:
+        _emit_error(str(exc), code="worktree_invalid")
+        raise  # unreachable
+
+    typer.echo(f"REMOVED worktree {record.name}")
+    typer.echo(f"  path   : {record.path}")
+    typer.echo("  note   : record removed only; clean up the worker-local checkout separately when safe.")
+
+
 def _format_executor_command(template: str, *, agent_id: str, loom_dir: Path, threads: list[str], env_path: str) -> str:
     return (
         template.replace("{agent_id}", agent_id)
@@ -187,17 +334,20 @@ def _has_configured_executor_command(settings: object) -> bool:
 def _manager_mailbox_steps(settings: object) -> list[str]:
     lines = ["Manager next steps:"]
     if _has_configured_executor_command(settings):
-        lines.append(f"  1. Start or wake a worker agent if needed: {manager_spawn_command()}")
+        lines.append(
+            f"  1. Ask the director or host system to run `{manager_spawn_command()}` if a worker needs waking."
+        )
     else:
         lines.append(
             "  1. Ask the director or host system to start or wake a worker runtime with LOOM_WORKER_ID + LOOM_DIR."
         )
     lines.extend(
         [
-            (f"  2. Prefer mailbox-first delegation: {manager_propose_command()}"),
-            (f"  3. Follow up with {manager_send_command()} when needed."),
-            "  4. Tell the worker to run `loom agent next` in its own executor environment.",
-            "  5. Keep using `loom agent status` to monitor ready / paused / reviewing work.",
+            (f"  2. Assign the thread explicitly when useful: {manager_assign_command()}"),
+            (f"  3. Prefer mailbox-first delegation: {manager_propose_command()}"),
+            (f"  4. Follow up with {manager_send_command()} when needed."),
+            "  5. Tell the worker to run `loom agent next` in its own executor environment.",
+            "  6. Keep using `loom agent status` to monitor ready / paused / reviewing work.",
             "",
         ]
     )
@@ -207,8 +357,8 @@ def _manager_mailbox_steps(settings: object) -> list[str]:
 def _manager_launch_guidance(settings: object) -> list[str]:
     if _has_configured_executor_command(settings):
         return [
-            f"  {manager_spawn_command()}",
-            "    Create or wake a worker assignment and print the configured launch command.",
+            f"  Ask the director or host system to run: {manager_spawn_command()}",
+            "    That top-level command creates or wakes a worker assignment and prints the configured launch command.",
             "",
         ]
     return [
@@ -283,7 +433,7 @@ def _touch_if_agent(loom: Path, actor: str) -> None:
     touch_agent(loom, actor, status=AgentStatus.ACTIVE)
 
 
-@app.command("new-thread")
+@app.command("new-thread", hidden=True)
 def new_thread(
     name: Annotated[str, typer.Option(help="Thread name.")] = "",
     priority: Annotated[int, typer.Option(help="Thread priority.")] = 50,
@@ -309,7 +459,7 @@ def new_thread(
     typer.echo("\n".join(lines))
 
 
-@app.command("new-task")
+@app.command("new-task", hidden=True)
 def new_task(
     thread: Annotated[str, typer.Option("--thread", help="Canonical thread name (e.g. backend).")],
     title: Annotated[str, typer.Option(help="Task title.")] = "",
@@ -384,7 +534,7 @@ def next_task(
     loom = _resolve_loom()
     actor = _resolve_actor_for_command("next", role=role)
     _touch_if_agent(loom, actor)
-    settings = load_settings(workspace_root(loom))
+    settings = _load_settings_for_actor(loom, actor)
     effective_wait_seconds = settings.agent.next_wait_seconds if wait_seconds is None else wait_seconds
     effective_retries = settings.agent.next_retries if retries is None else retries
 
@@ -392,6 +542,49 @@ def next_task(
         _emit_error("--wait-seconds must be >= 0", code="invalid_wait_seconds")
     if effective_retries < 0:
         _emit_error("--retries must be >= 0", code="invalid_retries")
+
+    if actor == AgentRole.REVIEWER.value:
+        reviewing_count = 0
+        paused_count = 0
+        for attempt in range(effective_retries + 1):
+            summary = get_status_summary(loom)
+            queue = summary.get("queue", [])
+            reviewing_count = sum(1 for item in queue if item.get("kind") == "reviewing")
+            paused_count = sum(1 for item in queue if item.get("kind") == "paused")
+            if reviewing_count or paused_count:
+                break
+            if attempt < effective_retries and effective_wait_seconds > 0:
+                if _interactive_wait_feedback_enabled():
+                    _emit_wait_feedback(
+                        attempt=attempt,
+                        retries=effective_retries,
+                        wait_seconds=effective_wait_seconds,
+                    )
+                time.sleep(effective_wait_seconds)
+
+        lines = [
+            "ACTION  idle",
+            "",
+            "Reviewer work is queue-driven; `loom agent next --role reviewer` only tracks review-ready state.",
+        ]
+        if reviewing_count or paused_count:
+            lines.append("")
+            lines.append("WAITING ON")
+            if reviewing_count:
+                lines.append(f"  reviewing : {reviewing_count} (human must accept or reject)")
+            if paused_count:
+                lines.append(f"  paused    : {paused_count} (human must decide)")
+        lines.extend(
+            _singleton_role_idle_steps(
+                actor,
+                reviewing_count=reviewing_count,
+                paused_count=paused_count,
+                inbox_pending=0,
+            )
+        )
+        lines.extend(render_next_hook_lines(settings, actor))
+        typer.echo("\n".join(lines))
+        return
 
     pending_inbox: list[dict[str, object]] = []
     tasks: list[Task] = []
@@ -428,18 +621,45 @@ def next_task(
             f"COUNT   {len(pending_inbox)}",
             "",
             "These requests have not been arranged into threads/tasks yet.",
-            "Manager action is required before worker execution can continue.",
+            (
+                "Manager action is required before worker execution can continue."
+                if actor == AgentRole.MANAGER.value
+                else "Planning work is blocking normal execution until a manager clears it."
+            ),
             "",
             "UNPLANNED REQUESTS",
             *item_lines,
             "",
-            "Manager next steps:",
-            "  1. Create or choose a thread for each requirement.",
-            f"  2. Run: {manager_new_thread_command()}",
-            f"  3. Run: {manager_new_task_command()}",
-            f"  4. Repeat `{manager_next_command()}` after all requirements above are arranged.",
-            "",
         ]
+        if actor == AgentRole.MANAGER.value:
+            lines.extend(
+                [
+                    "Manager next steps:",
+                    "  1. Prefer planning each request directly from the manager CLI.",
+                    f"  2. Run: {manager_plan_command()}",
+                    "  3. If the request needs a brand-new thread first, use:",
+                    f"     {manager_new_thread_command()}",
+                    "  4. If you need to shape the first task manually, use:",
+                    f"     {manager_new_task_command()}",
+                    f"  5. Repeat `{manager_next_command()}` after all requirements above are arranged.",
+                    "",
+                ]
+            )
+        elif actor in _SINGLETON_ACTORS:
+            lines.extend(_singleton_role_plan_steps(actor))
+        else:
+            lines.extend(
+                [
+                    "Worker next steps:",
+                    "  1. Planning work is blocking execution; notify the manager or director immediately.",
+                    "  2. Ask for planning clearance with",
+                    "     `loom agent ask manager 'Please clear pending request planning.'`",
+                    "     or propose the handoff with `loom agent propose manager '<planning handoff>' --ref <rq-id>`.",
+                    "  3. After planning clears, run `loom agent next` again.",
+                    "",
+                ]
+            )
+        lines.extend(render_next_hook_lines(settings, actor))
         typer.echo("\n".join(lines))
         return
 
@@ -464,6 +684,15 @@ def next_task(
             if inbox_pending:
                 lines.append(f"  inbox     : {inbox_pending} pending items")
         if actor in _SINGLETON_ACTORS:
+            lines.extend(
+                _singleton_role_idle_steps(
+                    actor,
+                    reviewing_count=reviewing_count,
+                    paused_count=paused_count,
+                    inbox_pending=inbox_pending,
+                )
+            )
+            lines.extend(render_next_hook_lines(settings, actor))
             typer.echo("\n".join(lines))
             return
 
@@ -471,7 +700,7 @@ def next_task(
             [
                 "",
                 "Worker next steps:",
-                "  1. Check `loom agent inbox` for pending manager handoffs.",
+                "  1. Check `loom agent mailbox` for pending manager handoffs.",
                 "  2. If you want more work, proactively ask to claim a thread or task.",
                 "     Example: `loom agent ask manager 'Can I take thread <thread> or task <task-id>?'`",
                 (
@@ -480,6 +709,7 @@ def next_task(
                 ),
             ]
         )
+        lines.extend(render_next_hook_lines(settings, actor))
         typer.echo("\n".join(lines))
         return
 
@@ -498,17 +728,10 @@ def next_task(
             *(
                 _manager_mailbox_steps(settings)
                 if actor == AgentRole.MANAGER.value
-                else [
-                    f"{actor.title()} next steps:",
-                    "  1. Coordinate with the manager or worker role before mutating task state.",
-                    (
-                        "  2. Re-run with `--role manager` for manager-loop actions, or configure "
-                        "LOOM_WORKER_ID to claim as a worker."
-                    ),
-                    "",
-                ]
+                else _singleton_role_next_steps(actor)
             ),
         ]
+        lines.extend(render_next_hook_lines(settings, actor))
         typer.echo("\n".join(lines))
         return
 
@@ -538,6 +761,7 @@ def next_task(
         "If blocked and need a decision:",
         "  loom agent pause <task-id> --question '<question>'",
     ]
+    lines.extend(render_next_hook_lines(settings, actor))
     typer.echo("\n".join(lines))
 
 
@@ -615,7 +839,7 @@ def _render_manager_bootstrap(loom: Path) -> list[str]:
         "  Mailbox-first delegation once a worker exists",
         f"    {manager_propose_command()}",
         f"    {manager_send_command()}",
-        "    Workers inspect with `loom agent inbox` / `loom agent inbox-read` and answer with `loom agent reply`.",
+        "    Workers inspect with `loom agent mailbox` / `loom agent mailbox-read` and answer with `loom agent reply`.",
         "",
         "  loom agent status",
         "    Review ready, paused, and reviewing work across the project.",
@@ -651,10 +875,14 @@ def _render_worker_bootstrap(loom: Path) -> list[str]:
         "  role           : worker",
         f"  loom dir       : {loom_dir_env or str(loom)}",
         f"  worker id      : {worker_id or '(set LOOM_WORKER_ID before running worker commands)'}",
+    ]
+    if worker_id:
+        lines.extend(["", "WORKTREE CONTEXT", *_current_worker_context_lines(loom, worker_id)])
+    lines += [
         "",
         "WORKER LOOP",
         "  1. Run: loom agent next",
-        "  2. Read pending manager handoffs: loom agent inbox / loom agent inbox-read <msg-id>",
+        "  2. Read pending manager handoffs: loom agent mailbox / loom agent mailbox-read <msg-id>",
         (
             "  3. Implement the assigned task inside your claimed thread "
             "or ask for clarification with loom agent ask / propose / reply"
@@ -668,8 +896,8 @@ def _render_worker_bootstrap(loom: Path) -> list[str]:
         "  loom agent pause <task-id> --question '<question>'",
         "  loom agent checkpoint '<summary>'",
         "  loom agent resume",
-        "  loom agent inbox",
-        "  loom agent inbox-read <msg-id>",
+        "  loom agent mailbox",
+        "  loom agent mailbox-read <msg-id>",
         "  loom agent whoami",
         "  loom agent ask <to> '<question>'",
         "  loom agent propose <to> '<proposal>' --ref <thread-or-task-id>",
@@ -677,8 +905,9 @@ def _render_worker_bootstrap(loom: Path) -> list[str]:
         "  loom agent status",
         "",
         "NOTES",
-        "  - `loom agent new-thread`, `loom agent new-task`, and `loom agent send` require a singleton role override.",
-        "  - `loom spawn` is the manager-owned worker launch entrypoint; workers should not call it.",
+        "  - `loom agent send` requires a singleton role override.",
+        "  - Canonical manager planning commands now live under `loom manage`.",
+        "  - `loom spawn` is a director/human top-level worker launch entrypoint; workers should not call it.",
     ]
     if paused_count or reviewing_count:
         lines.extend(
@@ -703,6 +932,7 @@ def _render_reviewer_bootstrap(loom: Path) -> list[str]:
         "",
         "DO THIS NOW",
         "  Inspect tasks already in `reviewing` and help a human decide whether to accept or reject them.",
+        "  Keep re-running `loom agent next --role reviewer` so you refresh what needs review next.",
         "",
         "IDENTITY",
         "  role           : reviewer",
@@ -712,17 +942,123 @@ def _render_reviewer_bootstrap(loom: Path) -> list[str]:
         f"  review queue  : {reviewing_count}",
         f"  paused queue  : {paused_count}",
         "",
+        "MAIN LOOP",
+        "  Repeat this loop immediately:",
+        "    1. Run: loom agent next --role reviewer",
+        "    2. If review work is waiting, inspect it with `loom review`.",
+        "    3. Accept with `loom review accept <task-id>` or reject with",
+        "       `loom review reject <task-id> '<reason>'` as needed.",
+        "    4. After each review action or handoff, run",
+        "       `loom agent next --role reviewer` again.",
+        "",
         "REVIEW LOOP",
         "  1. Run: loom review",
-        "  2. Compare each reviewing task against its acceptance criteria and output.",
-        "  3. Accept with: loom accept <task-id>",
-        "  4. Reject with: loom reject <task-id> '<reason>'",
+        "  2. Compare reviewing tasks against their acceptance criteria, output, and review history.",
+        "  3. Accept with: loom review accept <task-id>",
+        "  4. Reject with: loom review reject <task-id> '<reason>'",
+        "  5. If a paused human decision must be resolved from the plain CLI,",
+        "     use: loom review decide <task-id> <option>",
         "",
         "GUARDRAILS",
         "  - Reviewer work starts after implementation is finished; do not act as manager or worker here.",
+        "  - Focus on reviewing: summarize evidence, highlight gaps, and recommend accept/reject clearly.",
         "  - If more runtime work is needed, hand the task back with a concrete rejection note.",
     ]
     return lines
+
+
+def _singleton_role_next_steps(actor: str) -> list[str]:
+    if actor == AgentRole.REVIEWER.value:
+        return [
+            "Reviewer next steps:",
+            "  1. This is execution work, not review work; do not claim or implement it yourself.",
+            "  2. Surface the ready task/thread to the director or manager if it needs dispatch.",
+            "  3. Use `loom review`, `loom review accept`, or `loom review reject`",
+            "     only for tasks already in reviewing.",
+            "  4. After the handoff or after queue changes, run",
+            "     `loom agent next --role reviewer` again.",
+            "",
+        ]
+    if actor == AgentRole.DIRECTOR.value:
+        return [
+            "Director next steps:",
+            "  1. Decide which role should act next on the ready work.",
+            "  2. Launch or wake the manager with `loom manage` when planning,",
+            "     assignment, or mailbox coordination is needed.",
+            "  3. Launch or wake workers via `loom spawn` when execution should start now.",
+            "  4. Launch reviewer work with `loom review` when human review or queue triage is needed.",
+            "  5. After each orchestration step or state change, run",
+            "     `loom agent next --role director` again.",
+            "",
+        ]
+    return [
+        f"{actor.title()} next steps:",
+        "  1. Coordinate with the manager or worker role before mutating task state.",
+        "",
+    ]
+
+
+def _singleton_role_plan_steps(actor: str) -> list[str]:
+    if actor == AgentRole.REVIEWER.value:
+        return [
+            "Reviewer next steps:",
+            "  1. This is planning work, not review work; do not plan requests yourself.",
+            "  2. Surface the request backlog to the director or manager immediately.",
+            "  3. After the handoff or after planning clears, run",
+            "     `loom agent next --role reviewer` again.",
+            "",
+        ]
+    if actor == AgentRole.DIRECTOR.value:
+        return [
+            "Director next steps:",
+            "  1. Pending requests need planning now; start or wake the manager with `loom manage`.",
+            "  2. Let the manager arrange the listed requests into threads/tasks.",
+            "  3. After planning lands, run `loom agent next --role director` again.",
+            "",
+        ]
+    return []
+
+
+def _singleton_role_idle_steps(
+    actor: str,
+    *,
+    reviewing_count: int,
+    paused_count: int,
+    inbox_pending: int,
+) -> list[str]:
+    if actor == AgentRole.REVIEWER.value:
+        lines = ["", "Reviewer next steps:"]
+        if reviewing_count:
+            lines.append("  1. Review work is waiting now; run `loom review`.")
+            step = 2
+        else:
+            lines.append("  1. No review item is ready right now; monitor `loom review` / `loom status`.")
+            step = 2
+        if paused_count:
+            lines.append(f"  {step}. If a paused human decision needs a plain CLI resolution,")
+            lines.append("     use `loom review decide <task-id> <option>`.")
+            step += 1
+        lines.append(f"  {step}. Run `loom agent next --role reviewer` again after each review action")
+        lines.append("     or when queue state changes.")
+        return lines
+
+    if actor == AgentRole.DIRECTOR.value:
+        lines = ["", "Director next steps:"]
+        step = 1
+        if inbox_pending:
+            lines.append(f"  {step}. Pending requests exist; start or wake the manager with `loom manage`.")
+            step += 1
+        if reviewing_count or paused_count:
+            lines.append(f"  {step}. Human/reviewer queue work exists; inspect with `loom review` or plain `loom`.")
+            step += 1
+        if step == 1:
+            lines.append("  1. No immediate queue action is waiting; monitor `loom status` / `loom agent status`.")
+            step = 2
+        lines.append(f"  {step}. Run `loom agent next --role director` again after each orchestration")
+        lines.append("     action or when state changes.")
+        return lines
+
+    return []
 
 
 def _render_director_bootstrap(loom: Path) -> list[str]:
@@ -736,9 +1072,7 @@ def _render_director_bootstrap(loom: Path) -> list[str]:
         "LOOM DIRECTOR BOOTSTRAP",
         "=======================",
         "",
-        "DO THIS NOW",
-        "  Stay above the runtime loop and decide which role should act next.",
-        "  Director and human share the full top-level `loom` command surface, but runtime truth stays in `.loom/`.",
+        "You are the Director. Coordinate the full task flow across manager, reviewer, and worker roles.",
         "",
         "IDENTITY",
         "  role           : director",
@@ -750,14 +1084,44 @@ def _render_director_bootstrap(loom: Path) -> list[str]:
         f"  paused queue  : {paused_count}",
         f"  review queue  : {reviewing_count}",
         "",
-        "ORCHESTRATION LOOP",
-        "  1. Inspect status with `loom status` or `loom agent status`.",
-        "  2. Launch manager work with `loom manage` when planning or thread assignment is needed.",
-        "  3. Launch workers via `loom spawn` when configured, then hand them mailbox-driven task context.",
-        "  4. Launch reviewer work with `loom review` when tasks are waiting for human review.",
+        "BEFORE STARTING",
+        "  1. Check `loom --help` and the relevant subcommand help before taking action.",
+        "  2. If a command is unclear, read the help text first; do not guess.",
+        "",
+        "STARTUP",
+        "  1. Launch exactly one Manager, exactly one Reviewer, and as many Workers as needed in parallel.",
+        (
+            "  2. When starting a Worker, prefer resuming from an existing checkpoint "
+            "under a new agent identity instead of starting from scratch."
+        ),
+        "",
+        "DURING THE ROUND",
+        "  1. Continuously inspect agent state and coordinate dependencies, blockers, and handoffs.",
+        "  2. Start `loom manage` when planning, assignment, or request -> thread/task work is needed.",
+        "  3. Start `loom review` when review or human queue triage is needed.",
+        "  4. Use `loom spawn` from the director/human surface when an executor needs waking.",
+        "  5. Summarize important progress and decisions in the Director log.",
+        "  6. Record and surface bugs or missing capability immediately.",
+        "     If Loom itself lacks the needed capability, capture it locally and carry it into the next round.",
+        "",
+        "ROUND CHECK",
+        "  1. Review this round's output, leftovers, and issue list.",
+        "  2. Plan the next round's goals and task breakdown.",
+        "  3. Restart the required agents, again preferring checkpoint recovery where possible.",
+        "  4. If the Director still has work to do directly, start it immediately.",
+        "",
+        "MAIN LOOP",
+        "  1. Run: loom agent next --role director",
+        "  2. Follow the returned ACTION and complete the suggested orchestration step.",
+        "  3. After each orchestration step or state change, run",
+        "     `loom agent next --role director` again.",
+        "",
+        "DIRECTOR NEXT",
+        "  `loom agent next --role director` points to the most important orchestration step right now,",
+        "  but it does not replace the manager, reviewer, or worker roles.",
         "",
         "GUARDRAILS",
-        "  - Do not silently collapse into manager, worker, or reviewer behavior.",
+        "  - Do not silently collapse into manager, reviewer, or worker behavior.",
         "  - Keep orchestration explicit and preserve `.loom/` as the only runtime source of truth.",
     ]
     return lines
@@ -790,7 +1154,13 @@ def done(
 ) -> None:
     """Mark a task as reviewing when it is ready for human review."""
     loom = _resolve_loom()
-    _touch_if_agent(loom, _resolve_actor_for_command("done", role=role))
+    actor = _resolve_actor_for_command("done", role=role)
+    _touch_if_agent(loom, actor)
+    settings = _load_settings_for_actor(loom, actor)
+
+    before_hook_lines = render_done_hook_lines(settings, actor, when="before", leading_blank=False)
+    if before_hook_lines:
+        typer.echo("\n".join(before_hook_lines))
 
     try:
         _, task, blockers = complete_task(loom, task_id, output=output or None)
@@ -806,6 +1176,7 @@ def done(
         lines.append("  Waiting for human decision. Run: loom")
     else:
         lines.append("  Waiting for human review. Run: loom review")
+    lines.extend(render_done_hook_lines(settings, actor, when="after"))
     typer.echo("\n".join(lines))
 
 
@@ -834,7 +1205,7 @@ def pause(
         f"PAUSED task {task.id}",
         f"  status   : {task.status.value}",
         f"  question : {question}",
-        "  Waiting for human decision. Run: loom decide <id> <choice>",
+        "  Waiting for human decision. Run: loom review decide <id> <choice>",
     ]
     typer.echo("\n".join(lines))
 
@@ -844,7 +1215,8 @@ def agent_status() -> None:
     """Describe current project state."""
     loom = _resolve_loom()
     summary = get_status_summary(loom)
-    settings = load_settings(workspace_root(loom))
+    worker_id = os.environ.get("LOOM_WORKER_ID", "").strip()
+    settings = _load_settings_for_actor(loom, worker_id)
 
     tasks = summary.get("tasks", {})
     by_status = tasks.get("by_status", {})
@@ -923,6 +1295,9 @@ def agent_status() -> None:
             lines.append(
                 f" {thread_name:<20} owner:{owner} state:{state} owned_at:{claimed_at} lease_expires:{lease_expires_at}"
             )
+
+    if worker_id:
+        lines += ["", "CURRENT WORKER CONTEXT", *_current_worker_context_lines(loom, worker_id)]
 
     if queue:
         lines += ["", "QUEUE (needs attention)"]
@@ -1028,12 +1403,27 @@ def spawn(
     )
 
 
+@app.command("plan", hidden=True)
+def plan(
+    rq_id: Annotated[str, typer.Argument(help="Request id to plan.")],
+) -> None:
+    """Legacy entrypoint kept only to print migration guidance."""
+    suggestion = f"loom manage plan {rq_id}"
+    _emit_error(
+        f"`loom agent plan` moved to `{suggestion}`. Run `{suggestion}` instead.",
+        code="moved_command",
+    )
+
+
 @app.command("whoami")
 def whoami(role: WorkerRoleOption = AgentRole.WORKER) -> None:
     """Show the current actor identity."""
     actor = _resolve_actor_for_command("whoami", role=role)
     resolved_role = role.value if actor in _SINGLETON_ACTORS else AgentRole.WORKER.value
-    typer.echo(f"IDENTITY\n  id   : {actor}\n  role : {resolved_role}")
+    lines = ["IDENTITY", f"  id   : {actor}", f"  role : {resolved_role}"]
+    if actor not in _SINGLETON_ACTORS:
+        lines.extend(_current_worker_context_lines(_resolve_loom(), actor))
+    typer.echo("\n".join(lines))
 
 
 @app.command("checkpoint")
@@ -1064,37 +1454,38 @@ def resume(role: WorkerRoleOption = AgentRole.WORKER) -> None:
     typer.echo(f"CHECKPOINT body for {record.id}\n\n{record.body}")
 
 
-@app.command("inbox")
-def inbox(role: WorkerRoleOption = AgentRole.WORKER) -> None:
-    """List pending messages for the current agent."""
+def _render_mailbox(actor: str) -> None:
     loom = _resolve_loom()
-    actor = _resolve_actor_for_command("inbox", role=role)
-    if actor in _SINGLETON_ACTORS:
-        _emit_error(f"{actor} inbox is not implemented via this command.", code="not_supported")
     messages = list_pending_messages(loom, actor)
 
     if not messages:
-        typer.echo(f"INBOX {actor}\n  No pending messages.")
+        typer.echo(f"MAILBOX {actor}\n  No pending messages.")
         return
 
-    lines = [f"INBOX {actor}", f"  count : {len(messages)}", ""]
+    lines = [f"MAILBOX {actor}", f"  count : {len(messages)}", ""]
     for msg in messages:
         ref_part = f"  ref:{msg.ref}" if msg.ref else ""
         lines.append(f"  {msg.id}  type:{msg.type.value}  from:{msg.from_}{ref_part}")
-    lines += ["", "To read a message: loom agent inbox-read <msg-id>"]
+    lines += ["", "To read a message: loom agent mailbox-read <msg-id> (legacy: `loom agent inbox-read`)"]
     typer.echo("\n".join(lines))
 
 
-@app.command("inbox-read")
-def inbox_read(
-    msg_id: str = typer.Argument(..., help="Message ID to read (e.g. MSG-001)."),
-    role: WorkerRoleOption = AgentRole.WORKER,
-) -> None:
-    """Show message content without moving it."""
+@app.command("mailbox")
+def mailbox(role: WorkerRoleOption = AgentRole.WORKER) -> None:
+    """List pending messages for the current agent mailbox."""
+    actor = _resolve_actor_for_command("mailbox", role=role)
+    _render_mailbox(actor)
+
+
+@app.command("inbox", hidden=True)
+def inbox(role: WorkerRoleOption = AgentRole.WORKER) -> None:
+    """Compatibility alias for `loom agent mailbox`."""
+    actor = _resolve_actor_for_command("inbox", role=role)
+    _render_mailbox(actor)
+
+
+def _read_mailbox_message(actor: str, msg_id: str) -> None:
     loom = _resolve_loom()
-    actor = _resolve_actor_for_command("inbox-read", role=role)
-    if actor in _SINGLETON_ACTORS:
-        _emit_error(f"{actor} inbox-read is not implemented via this command.", code="not_supported")
     pending_dir = agent_pending_dir(loom, actor)
     try:
         _, message = load_message(pending_dir, msg_id)
@@ -1113,6 +1504,26 @@ def inbox_read(
         lines.append(f"  ref  : {message.ref}")
     lines += ["", message.body]
     typer.echo("\n".join(lines))
+
+
+@app.command("mailbox-read")
+def mailbox_read(
+    msg_id: str = typer.Argument(..., help="Message ID to read (e.g. MSG-001)."),
+    role: WorkerRoleOption = AgentRole.WORKER,
+) -> None:
+    """Show mailbox message content without moving it."""
+    actor = _resolve_actor_for_command("mailbox-read", role=role)
+    _read_mailbox_message(actor, msg_id)
+
+
+@app.command("inbox-read", hidden=True)
+def inbox_read(
+    msg_id: str = typer.Argument(..., help="Message ID to read (e.g. MSG-001)."),
+    role: WorkerRoleOption = AgentRole.WORKER,
+) -> None:
+    """Compatibility alias for `loom agent mailbox-read`."""
+    actor = _resolve_actor_for_command("inbox-read", role=role)
+    _read_mailbox_message(actor, msg_id)
 
 
 @app.command("send")
@@ -1214,10 +1625,9 @@ def reply(
     """Reply to a pending message and move it to replied."""
     loom = _resolve_loom()
     actor = _resolve_actor_for_command("reply", role=role)
-    if actor in _SINGLETON_ACTORS:
-        _emit_error(f"{actor} reply is not implemented via this command.", code="not_supported")
     payload = reply_to_message(loom, actor, msg_id, body)
-    typer.echo(f"REPLIED to {msg_id}\n  reply id : {payload.get('reply_id', '')}")
+    reply_id = payload.get("reply_id", payload.get("id", ""))
+    typer.echo(f"REPLIED to {msg_id}\n  reply id : {reply_id}")
 
 
 def find_task(loom: Path, task_id: str) -> tuple[Path, Task]:

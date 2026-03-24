@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 from .config import load_settings
 from .frontmatter import write_model
@@ -35,6 +36,8 @@ from .models import (
     TaskKind,
     TaskStatus,
     Thread,
+    WorktreeRecord,
+    WorktreeStatus,
     find_review_blockers,
 )
 from .repository import (
@@ -42,15 +45,18 @@ from .repository import (
     agent_pending_dir,
     agent_record_path,
     agent_replied_dir,
+    agent_worktrees_dir,
     agents_dir,
     load_agent,
     load_message,
     load_request_item,
     load_task,
+    load_worktree,
     manager_path,
     requests_dir,
     worker_agents_dir,
     workspace_root,
+    worktree_record_path,
 )
 from .scheduler import load_all_tasks, load_all_threads
 from .state import (
@@ -60,9 +66,6 @@ from .state import (
     validate_task_transition,
 )
 from .templates import agent_body, task_body, thread_body
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def parse_csv_list(value: str | list[str] | None) -> list[str]:
@@ -115,6 +118,204 @@ def ensure_agent_layout(loom: Path) -> None:
     if not manager_file.exists():
         manager = ManagerRecord(last_seen=datetime.now(UTC).isoformat(timespec="seconds"), checkpoint_summary="ready")
         write_model(manager_file, manager)
+
+
+def ensure_worktree_storage(loom: Path, agent_id: str) -> Path:
+    path = agent_worktrees_dir(loom, agent_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _resolve_worktree_name(name: str) -> str:
+    resolved = canonical_thread_name(name)
+    if not resolved:
+        raise ValueError("worktree name must not be empty")
+    return resolved
+
+
+def _resolve_worktree_path(loom: Path, agent_id: str, *, name: str, value: str = "") -> Path:
+    root = ensure_worktree_storage(loom, agent_id).resolve()
+    candidate = Path(value).expanduser() if value.strip() else root / name
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"worktree path '{resolved}' must stay under '{root}' for worker '{agent_id}'") from exc
+    return resolved
+
+
+def _detect_git_branch(path: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(path), "branch", "--show-current"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def load_all_worktrees(loom: Path, agent_id: str) -> list[WorktreeRecord]:
+    root = agent_worktrees_dir(loom, agent_id)
+    if not root.exists():
+        return []
+    return [load_worktree(loom, agent_id, path.stem)[1] for path in sorted(root.glob("*.md"))]
+
+
+def resolve_current_worktree(
+    loom: Path,
+    agent_id: str,
+    *,
+    cwd: Path | None = None,
+) -> tuple[Path, WorktreeRecord] | None:
+    current_dir = (cwd or Path.cwd()).resolve()
+    matches: list[tuple[int, Path, WorktreeRecord]] = []
+    for record in load_all_worktrees(loom, agent_id):
+        checkout_root = Path(record.path).resolve()
+        try:
+            current_dir.relative_to(checkout_root)
+        except ValueError:
+            continue
+        matches.append((len(checkout_root.parts), checkout_root, record))
+    if not matches:
+        return None
+    _depth, checkout_root, record = max(matches, key=lambda item: item[0])
+    return checkout_root, record
+
+
+def resolve_actor_workspace_root(loom: Path, agent_id: str = "", *, cwd: Path | None = None) -> Path:
+    if agent_id:
+        current = resolve_current_worktree(loom, agent_id, cwd=cwd)
+        if current is not None:
+            checkout_root, _record = current
+            return checkout_root
+    return workspace_root(loom)
+
+
+def add_worktree(
+    loom: Path,
+    agent_id: str,
+    *,
+    name: str,
+    path: str = "",
+    branch: str = "",
+    status: WorktreeStatus = WorktreeStatus.REGISTERED,
+) -> tuple[WorktreeRecord, Path]:
+    resolved_name = _resolve_worktree_name(name.strip())
+    resolved_path = _resolve_worktree_path(loom, agent_id, name=resolved_name, value=path)
+    if resolved_path.exists() and not resolved_path.is_dir():
+        raise ValueError(f"worktree path '{resolved_path}' must be a directory")
+
+    existing = load_all_worktrees(loom, agent_id)
+    if any(record.name == resolved_name for record in existing):
+        raise ValueError(f"worktree '{resolved_name}' already exists")
+    if any(Path(record.path) == resolved_path for record in existing):
+        duplicate = next(record.name for record in existing if Path(record.path) == resolved_path)
+        raise ValueError(f"path '{resolved_path}' is already registered as worktree '{duplicate}'")
+    resolved_path.mkdir(parents=True, exist_ok=True)
+
+    resolved_branch = branch.strip() or _detect_git_branch(resolved_path)
+    if not resolved_branch:
+        raise ValueError(
+            f"could not determine git branch for '{resolved_path}'; create the git worktree there "
+            "first or pass --branch explicitly"
+        )
+
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    record = WorktreeRecord(
+        name=resolved_name,
+        path=str(resolved_path),
+        branch=resolved_branch,
+        status=status,
+        worker=agent_id,
+        created_at=now,
+        updated_at=now,
+        body=(
+            "Worker-local metadata only. Task state still lives under .loom/threads/, "
+            "and other workers only see worktrees inside their own agent subtree."
+        ),
+    )
+    record_path = worktree_record_path(loom, agent_id, resolved_name)
+    write_model(record_path, record)
+    append_event(
+        loom,
+        "worktree.registered",
+        "worktree",
+        record.name,
+        {
+            "path": record.path,
+            "branch": record.branch,
+            "status": record.status.value,
+            "worker": agent_id,
+        },
+    )
+    return record, record_path
+
+
+def attach_worktree(
+    loom: Path,
+    agent_id: str,
+    name: str,
+    *,
+    thread: str | None = None,
+    status: WorktreeStatus | None = None,
+    clear: bool = False,
+) -> tuple[Path, WorktreeRecord]:
+    path, record = load_worktree(loom, agent_id, name)
+    if record.worker != agent_id:
+        raise ValueError(f"worktree '{record.name}' belongs to worker '{record.worker}', not '{agent_id}'")
+
+    updates: dict[str, object] = {
+        "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+    }
+    if clear:
+        updates["thread"] = None
+        updates["status"] = status or WorktreeStatus.REGISTERED
+    else:
+        normalized_thread = canonical_thread_name(thread) if thread else None
+        if thread is not None:
+            updates["thread"] = normalized_thread
+        updates["status"] = status or (WorktreeStatus.ACTIVE if normalized_thread else record.status)
+
+    updated = record.model_copy(update=updates)
+    write_model(path, updated)
+    append_event(
+        loom,
+        "worktree.attached",
+        "worktree",
+        updated.name,
+        {
+            "worker": updated.worker,
+            "thread": updated.thread,
+            "status": updated.status.value,
+            "clear": clear,
+        },
+    )
+    return path, updated
+
+
+def remove_worktree(loom: Path, agent_id: str, name: str, *, force: bool = False) -> tuple[Path, WorktreeRecord]:
+    path, record = load_worktree(loom, agent_id, name)
+    if record.worker != agent_id:
+        raise ValueError(f"worktree '{record.name}' belongs to worker '{record.worker}', not '{agent_id}'")
+    if record.thread and not force:
+        raise ValueError(
+            f"worktree '{record.name}' is still attached to thread metadata; "
+            "clear it first with `loom agent worktree attach <name> --clear` or pass --force"
+        )
+
+    append_event(
+        loom,
+        "worktree.removed",
+        "worktree",
+        record.name,
+        {"path": record.path, "worker": record.worker, "thread": record.thread, "forced": force},
+    )
+    path.unlink()
+    return path, record
 
 
 def create_request_item(loom: Path, description: str) -> tuple[RequestItem, Path]:
@@ -300,6 +501,42 @@ def reply_to_message(loom: Path, agent_id: str, msg_id: str, body: str) -> dict[
     path.rename(replied_dir / path.name)
     append_event(loom, "message.replied", "message", msg_id, {"agent": agent_id})
     return response
+
+
+def adjust_thread_priority(loom: Path, thread_name: str, *, priority: int) -> tuple[Path, Thread]:
+    """Persist a thread priority change and return the updated record."""
+    canonical = canonical_thread_name(thread_name)
+    threads = load_all_threads(loom)
+    if canonical not in threads:
+        raise FileNotFoundError(f"thread '{canonical}' does not exist")
+
+    thread = threads[canonical]
+    path = loom / "threads" / canonical / "_thread.md"
+    updated = thread.model_copy(update={"priority": priority})
+    write_model(path, updated)
+    append_event(
+        loom,
+        "thread.priority_updated",
+        "thread",
+        canonical,
+        {"from": thread.priority, "to": updated.priority},
+    )
+    return path, updated
+
+
+def adjust_task_priority(loom: Path, task_id: str, *, priority: int) -> tuple[Path, Task]:
+    """Persist a task priority change and return the updated record."""
+    path, task = load_task(loom, task_id)
+    updated = task.model_copy(update={"priority": priority})
+    write_model(path, updated)
+    append_event(
+        loom,
+        "task.priority_updated",
+        "task",
+        task.id,
+        {"from": task.priority, "to": updated.priority, "thread": task.thread},
+    )
+    return path, updated
 
 
 def release_claim(loom: Path, task_id: str, *, note: str) -> tuple[Path, Task]:
@@ -520,6 +757,40 @@ def release_thread(loom: Path, thread_name: str, *, note: str = "") -> tuple[Pat
     return path, updated
 
 
+def assign_thread(loom: Path, thread_name: str, *, agent_id: str, note: str = "") -> tuple[Path, Thread]:
+    """Explicitly assign a thread to an agent, including bounded reassignment."""
+    threads = load_all_threads(loom)
+    canonical = canonical_thread_name(thread_name)
+    if canonical not in threads:
+        raise FileNotFoundError(f"thread '{canonical}' does not exist")
+
+    thread = threads[canonical]
+    if thread.owner == agent_id:
+        return claim_thread(loom, canonical, agent_id=agent_id)
+    if not thread.owner or is_thread_stale(thread):
+        return claim_thread(loom, canonical, agent_id=agent_id)
+
+    path = loom / "threads" / canonical / "_thread.md"
+    now = utc_now()
+    claimed_at = now.isoformat(timespec="seconds")
+    updated = refresh_thread_lease(thread.model_copy(update={"owner": agent_id, "owned_at": claimed_at}), loom, now=now)
+    write_model(path, updated)
+    append_event(
+        loom,
+        "thread.reassigned",
+        "thread",
+        canonical,
+        {
+            "agent": agent_id,
+            "owned_at": claimed_at,
+            "previous_owner": thread.owner,
+            "lease_expires_at": updated.owner_lease_expires_at,
+            "note": note,
+        },
+    )
+    return path, updated
+
+
 def pause_task(
     loom: Path,
     task_id: str,
@@ -653,7 +924,8 @@ def reject_task(loom: Path, task_id: str, note: str) -> tuple[Path, Task]:
         note=note,
         source="cli",
     )
-    return transition_task(loom, task_id, TaskStatus.SCHEDULED, rejection_note=note, review_entry=entry)
+    path, updated = transition_task(loom, task_id, TaskStatus.SCHEDULED, rejection_note=note, review_entry=entry)
+    return path, updated
 
 
 def accept_task(loom: Path, task_id: str, *, note: str = "") -> tuple[Path, Task]:

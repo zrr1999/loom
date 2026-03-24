@@ -89,7 +89,7 @@ def get_ready_tasks(loom_dir: Path, thread_filter: str | None = None, *, for_age
             or is_thread_stale(threads[task.thread])
         ]
 
-    ready.sort(key=lambda task: sort_key(task, threads))
+    ready.sort(key=lambda task: sort_key(task, threads, preferred_agent=for_agent))
     return ready
 
 
@@ -110,9 +110,14 @@ def get_next_task(loom_dir: Path, thread_filter: str | None = None) -> Task | No
     return ready[0]
 
 
-def sort_key(task: Task, threads: dict[str, Thread]) -> tuple[int, int, int, str]:
+def sort_key(
+    task: Task, threads: dict[str, Thread], *, preferred_agent: str | None = None
+) -> tuple[int, int, int, int, str]:
     thread_prio = threads[task.thread].priority if task.thread in threads else 0
-    return (-thread_prio, -task.priority, task.seq, task.id)
+    continuity_boost = (
+        1 if preferred_agent and threads.get(task.thread) and threads[task.thread].owner == preferred_agent else 0
+    )
+    return (-continuity_boost, -thread_prio, -task.priority, task.seq, task.id)
 
 
 def load_all_inbox_items(loom_dir: Path) -> list[RequestItem]:

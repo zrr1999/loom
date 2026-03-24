@@ -36,3 +36,10 @@ rev = "v1.33.1"
 hooks = [
   { id = "typos", args = ["--force-exclude"] },
 ]
+
+[[repos]]
+repo = "https://github.com/zrr1999/zendev"
+rev = "v0.0.4"
+hooks = [
+  { id = "zendev-commit-msg" },
+]

@@ -210,6 +210,31 @@ def test_get_ready_tasks_includes_unowned(loom: Path) -> None:
     assert len(ready) == 1
 
 
+def test_get_ready_tasks_prefers_same_worker_continuity(loom: Path) -> None:
+    from loom.scheduler import get_ready_tasks
+    from loom.services import claim_thread, create_task, create_thread
+
+    create_thread(loom, name="frontend", priority=95)
+    create_task(
+        loom,
+        thread_name="backend",
+        title="continue backend",
+        acceptance="- [ ] ok",
+        priority=40,
+    )
+    create_task(
+        loom,
+        thread_name="frontend",
+        title="new frontend",
+        acceptance="- [ ] ok",
+        priority=90,
+    )
+    claim_thread(loom, "backend", agent_id="worker-1")
+
+    ready = get_ready_tasks(loom, for_agent="worker-1")
+    assert [task.id for task in ready[:2]] == ["backend-001", "frontend-001"]
+
+
 # ---------------------------------------------------------------------------
 # Thread model fields
 # ---------------------------------------------------------------------------

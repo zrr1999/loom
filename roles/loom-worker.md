@@ -19,8 +19,8 @@ capabilities:
       - "uvx --from agent-loom loom agent pause*"
       - "uvx --from agent-loom loom agent checkpoint*"
       - "uvx --from agent-loom loom agent resume*"
-      - "uvx --from agent-loom loom agent inbox*"
-      - "uvx --from agent-loom loom agent inbox-read*"
+      - "uvx --from agent-loom loom agent mailbox*"
+      - "uvx --from agent-loom loom agent mailbox-read*"
       - "uvx --from agent-loom loom agent whoami*"
       - "uvx --from agent-loom loom agent ask*"
       - "uvx --from agent-loom loom agent propose*"
@@ -31,8 +31,8 @@ capabilities:
       - "loom agent pause*"
       - "loom agent checkpoint*"
       - "loom agent resume*"
-      - "loom agent inbox*"
-      - "loom agent inbox-read*"
+      - "loom agent mailbox*"
+      - "loom agent mailbox-read*"
       - "loom agent whoami*"
       - "loom agent ask*"
       - "loom agent propose*"
@@ -76,7 +76,7 @@ Commit meaningful completed changes promptly as you work — do not accumulate a
 ## Guardrails
 
 - Always act through a concrete `LOOM_WORKER_ID`.
-- Stay on the worker-safe command surface: `next`, `done`, `pause`, `checkpoint`, `resume`, `inbox`, `inbox-read`, `whoami`, `ask`, `propose`, `reply`, and `status`.
+- Stay on the worker-safe command surface: `next`, `done`, `pause`, `checkpoint`, `resume`, `mailbox`, `mailbox-read`, `whoami`, `ask`, `propose`, `reply`, and `status`.
 - Do not use worker default role semantics for `new-thread`, `new-task`, or raw `send`; those require an explicit singleton-role override.
 - Do not bypass manager scheduling by editing task state out of band.
 - Keep changes task-scoped and finish with explicit `done` / `pause` commands.

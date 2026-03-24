@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 import typer
 from loguru import logger
@@ -22,14 +22,26 @@ from .migration import (
     ensure_thread_ownership_metadata,
     ensure_worker_agent_subtree,
 )
-from .models import AgentRole, Decision, RequestItem, RequestStatus, TaskStatus
+from .models import AgentRole, Decision, RequestItem, RequestStatus, Task, TaskKind, TaskStatus, Thread
 from .prompting import select, text
 from .repository import load_inbox_item, load_task, requests_dir, require_loom, root_config_path
 from .runtime import global_root, set_root
-from .scheduler import get_interaction_queue, get_pending_inbox_items, get_status_summary, load_all_tasks
+from .scheduler import (
+    get_interaction_queue,
+    get_pending_inbox_items,
+    get_status_summary,
+    load_all_tasks,
+    load_all_threads,
+    sort_key,
+)
 from .services import (
     accept_task,
+    adjust_task_priority,
+    adjust_thread_priority,
+    assign_thread,
     create_request_item,
+    create_task,
+    create_thread,
     decide_task,
     ensure_agent_layout,
     format_review_summary,
@@ -52,6 +64,10 @@ request_app = typer.Typer(help="Request commands.")
 app.add_typer(request_app, name="request")
 inbox_app = typer.Typer(help="Inbox commands.")
 app.add_typer(inbox_app, name="inbox")
+manage_app = typer.Typer(help="Manager commands.", invoke_without_command=True)
+app.add_typer(manage_app, name="manage")
+review_app = typer.Typer(help="Review and approval commands.", invoke_without_command=True)
+app.add_typer(review_app, name="review")
 
 
 def _resolve_loom() -> Path:
@@ -78,11 +94,45 @@ def _require_non_worker_review_context() -> None:
             "Finish runtime work with `loom agent done <task-id>` or "
             "`loom agent pause <task-id> --question '...'`, then switch to a clean reviewer "
             "or human process without `LOOM_WORKER_ID` and use `loom agent start --role reviewer`, "
-            "`loom review`, and `loom accept <task-id>` / `loom reject <task-id> '<reason>'` as needed."
+            "`loom review`, and `loom review accept <task-id>` / "
+            "`loom review reject <task-id> '<reason>'` as needed."
         ),
         err=True,
     )
     raise typer.Exit(1)
+
+
+def _require_non_worker_manage_context(command_name: str) -> None:
+    worker_id = os.environ.get("LOOM_WORKER_ID", "").strip()
+    if not worker_id:
+        return
+    typer.echo(
+        (
+            f"ERROR [worker_not_allowed]: loom {command_name} is manager-only. "
+            f"LOOM_WORKER_ID={worker_id!r} is set, so this process is running as a worker. "
+            "Finish runtime work with `loom agent done <task-id>` or "
+            "`loom agent pause <task-id> --question '...'`, then switch to a clean manager "
+            "process without `LOOM_WORKER_ID` and use `loom manage` / `loom manage priority` there."
+        ),
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+def _format_thread_priority_line(thread: Thread) -> str:
+    owner = thread.owner or "-"
+    return f"  {thread.name:<24} priority={thread.priority:<3} owner={owner}"
+
+
+def _format_task_priority_line(task: Task) -> str:
+    return (
+        f"  {task.id:<24} priority={task.priority:<3} "
+        f"status={task.status.value:<10} thread={task.thread:<20} {task.title}"
+    )
+
+
+def _sorted_tasks_for_priority_view(tasks: list[Task], threads: dict[str, Thread]) -> list[Task]:
+    return sorted(tasks, key=lambda task: sort_key(task, threads))
 
 
 @app.command()
@@ -224,26 +274,207 @@ def status() -> None:
                 typer.echo(f"    implementation follow-up: {follow_up['id']} [{follow_up['status']}]")
 
 
-@app.command()
-def manage() -> None:
-    """Open the manager bootstrap guide from the top-level CLI."""
+@manage_app.callback()
+def manage_main(ctx: typer.Context) -> None:
+    """Open the manager bootstrap guide when no subcommand is provided."""
+    if ctx.invoked_subcommand is not None:
+        _require_non_worker_manage_context(f"manage {ctx.invoked_subcommand}")
+        return
     agent_start(role=AgentRole.MANAGER)
 
 
-@app.command()
-def spawn(
-    threads: str = typer.Option("", "--threads", help="Comma-separated thread assignment."),
+@manage_app.command("priority")
+def manage_priority(
+    task_id: str = typer.Option("", "--task", help="Task id to inspect or update."),
+    thread_name: str = typer.Option("", "--thread", help="Thread name to inspect or update."),
+    set_to: int | None = typer.Option(None, "--set", min=0, max=100, help="Priority value to persist (0-100)."),
 ) -> None:
-    """Register a new worker agent from the top-level CLI."""
-    spawn_worker_runtime(threads=threads)
+    """List and adjust task or thread priorities from the manager CLI."""
+    _require_non_worker_manage_context("manage priority")
+    if task_id and thread_name:
+        typer.echo("Error: choose either --task or --thread, not both.", err=True)
+        raise typer.Exit(1)
+    if set_to is not None and not (task_id or thread_name):
+        typer.echo("Error: --set requires either --task or --thread.", err=True)
+        raise typer.Exit(1)
 
-
-@app.command()
-def review() -> None:
-    """List reviewing tasks without entering the interactive approval loop."""
-    _require_non_worker_review_context()
     loom = _resolve_loom()
+    update_lines: list[str] = []
+    try:
+        if task_id:
+            if set_to is not None:
+                path, task = adjust_task_priority(loom, task_id, priority=set_to)
+                update_lines = [
+                    f"Updated task {task.id} priority -> {task.priority}.",
+                    f"  file: {path}",
+                    "",
+                ]
+                task_id = task.id
+            else:
+                _path, task = load_task(loom, task_id)
+                task_id = task.id
+        elif thread_name and set_to is not None:
+            path, thread = adjust_thread_priority(loom, thread_name, priority=set_to)
+            update_lines = [
+                f"Updated thread {thread.name} priority -> {thread.priority}.",
+                f"  file: {path}",
+                "",
+            ]
+            thread_name = thread.name
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
 
+    threads = load_all_threads(loom)
+    tasks = load_all_tasks(loom)
+    if thread_name:
+        tasks = [task for task in tasks if task.thread == thread_name]
+        threads = {name: thread for name, thread in threads.items() if name == thread_name}
+    if task_id:
+        tasks = [task for task in tasks if task.id == task_id]
+
+    typer.echo("MANAGE PRIORITY")
+    if update_lines:
+        typer.echo("\n".join(update_lines).rstrip())
+
+    typer.echo("THREADS")
+    if threads:
+        for thread in sorted(threads.values(), key=lambda thread: (-thread.priority, thread.name)):
+            typer.echo(_format_thread_priority_line(thread))
+    else:
+        typer.echo("  (none)")
+
+    typer.echo("")
+    typer.echo("TASKS")
+    ordered_tasks = _sorted_tasks_for_priority_view(tasks, load_all_threads(loom))
+    if ordered_tasks:
+        for task in ordered_tasks:
+            typer.echo(_format_task_priority_line(task))
+    else:
+        typer.echo("  (none)")
+
+
+@manage_app.command("new-thread")
+def manage_new_thread(
+    name: str = typer.Option("", help="Thread name."),
+    priority: int = typer.Option(50, help="Thread priority."),
+) -> None:
+    """Create a new thread from the manager CLI."""
+    _require_non_worker_manage_context("manage new-thread")
+    loom = _resolve_loom()
+    try:
+        thread, path, duplicates = create_thread(loom, name=name, priority=priority)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    lines = [
+        f"CREATED thread {thread.name}",
+        f"  priority : {thread.priority}",
+        f"  path     : {path.parent}",
+    ]
+    if duplicates:
+        lines.append(f"  WARNING  : thread name '{thread.name}' already used by {', '.join(duplicates)}")
+    typer.echo("\n".join(lines))
+
+
+@manage_app.command("new-task")
+def manage_new_task(
+    thread: str = typer.Option(..., "--thread", help="Canonical thread name (e.g. backend)."),
+    title: str = typer.Option("", help="Task title."),
+    kind: Annotated[TaskKind, typer.Option("--kind", help="Task kind.")] = TaskKind.IMPLEMENTATION,
+    priority: int = typer.Option(50, help="Task priority."),
+    acceptance: str = typer.Option("", help="Acceptance criteria."),
+    depends_on: str = typer.Option("", help="Comma-separated dependency IDs."),
+    after: str = typer.Option("", "--after", help="Sugar for --depends-on: single task ID this task comes after."),
+    created_from: str = typer.Option("", help="Comma-separated source inbox RQ IDs."),
+    background: str = typer.Option("", help="Task background section content."),
+    implementation_direction: str = typer.Option("", help="Implementation direction section content."),
+) -> None:
+    """Create a new task file from the manager CLI."""
+    _require_non_worker_manage_context("manage new-task")
+    loom = _resolve_loom()
+    merged_deps = ",".join(filter(None, [depends_on, after]))
+    try:
+        task, path = create_task(
+            loom,
+            thread_name=thread,
+            title=title,
+            kind=kind,
+            priority=priority,
+            acceptance=acceptance,
+            depends_on=merged_deps,
+            created_from=created_from,
+            background=background,
+            implementation_direction=implementation_direction,
+        )
+    except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    lines = [
+        f"CREATED task {task.id}",
+        f"  kind   : {task.kind.value}",
+        f"  status : {task.status.value}",
+        f"  thread : {task.thread}",
+        f"  file   : {path}",
+    ]
+    typer.echo("\n".join(lines))
+
+
+@manage_app.command("plan")
+def manage_plan(
+    rq_id: str = typer.Argument(..., help="Request id to plan."),
+) -> None:
+    """Plan a pending request into the next task."""
+    _require_non_worker_manage_context("manage plan")
+    loom = _resolve_loom()
+    try:
+        planned = plan_inbox_item(loom, rq_id)
+    except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    lines = [
+        f"PLANNED {planned['rq_id']}",
+        f"  resolved_as : {planned['resolved_as']}",
+        f"  resolved_to : {', '.join(cast('list[str]', planned['resolved_to']))}",
+    ]
+    created_thread = cast("str | None", planned.get("created_thread"))
+    if created_thread:
+        lines.append(f"  created_thread : {created_thread}")
+    tasks = cast("list[dict[str, str]]", planned.get("tasks", []))
+    for task in tasks:
+        lines.append(f"  task       : {task['id']} ({task['file']})")
+    typer.echo("\n".join(lines))
+
+
+@manage_app.command("assign")
+def manage_assign(
+    thread_name: str = typer.Option(..., "--thread", help="Thread name to assign."),
+    worker_id: str = typer.Option(..., "--worker", help="Worker id that should own the thread."),
+) -> None:
+    """Assign or reclaim a thread for a specific worker."""
+    _require_non_worker_manage_context("manage assign")
+    loom = _resolve_loom()
+    try:
+        path, thread = assign_thread(loom, thread_name, agent_id=worker_id, note="explicit manager assignment")
+    except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    lines = [
+        f"ASSIGNED thread {thread.name}",
+        f"  owner  : {thread.owner}",
+        f"  file   : {path}",
+    ]
+    if thread.owner_lease_expires_at:
+        lines.append(f"  lease  : {thread.owner_lease_expires_at}")
+    typer.echo("\n".join(lines))
+
+
+def _list_review_queue() -> None:
+    loom = _resolve_loom()
     tasks = [task for task in load_all_tasks(loom) if task.status == TaskStatus.REVIEWING]
     if not tasks:
         typer.echo("No tasks in reviewing status.")
@@ -252,7 +483,81 @@ def review() -> None:
     for task in tasks:
         for line in format_review_summary(task):
             typer.echo(line)
-        typer.echo('  next: use `loom accept <id>` or `loom reject <id> "reason"`')
+        typer.echo('  next: use `loom review accept <id>` or `loom review reject <id> "reason"`')
+
+
+@review_app.callback()
+def review_main(ctx: typer.Context) -> None:
+    """List reviewing tasks without entering the interactive approval loop."""
+    _require_non_worker_review_context()
+    if ctx.invoked_subcommand is not None:
+        return
+    _list_review_queue()
+
+
+def _accept_review_task(task_id: str) -> None:
+    loom = _resolve_loom()
+    try:
+        accept_task(loom, task_id)
+    except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Accepted {task_id} -> done.")
+
+
+def _reject_review_task(task_id: str, note: str) -> None:
+    loom = _resolve_loom()
+    try:
+        reject_task(loom, task_id, note)
+    except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Rejected {task_id} -> scheduled. Note: {note}")
+
+
+def _decide_review_task(task_id: str, option: str) -> None:
+    loom = _resolve_loom()
+    try:
+        decide_task(loom, task_id, option)
+    except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"Decided {task_id} -> scheduled.")
+
+
+@review_app.command("accept")
+def review_accept(task_id: str = typer.Argument(..., help="Task ID to accept.")) -> None:
+    """Accept a reviewing task -> done."""
+    _require_non_worker_review_context()
+    _accept_review_task(task_id)
+
+
+@review_app.command("reject")
+def review_reject(
+    task_id: str = typer.Argument(..., help="Task ID to reject."),
+    note: str = typer.Argument(..., help="Rejection reason."),
+) -> None:
+    """Reject a task back to scheduled."""
+    _require_non_worker_review_context()
+    _reject_review_task(task_id, note)
+
+
+@review_app.command("decide")
+def review_decide(
+    task_id: str = typer.Argument(..., help="Task ID to decide."),
+    option: str = typer.Argument(..., help="Decision (option id or free text)."),
+) -> None:
+    """Resolve a paused task's decision -> scheduled."""
+    _require_non_worker_review_context()
+    _decide_review_task(task_id, option)
+
+
+@app.command()
+def spawn(
+    threads: str = typer.Option("", "--threads", help="Comma-separated thread assignment."),
+) -> None:
+    """Register a new worker agent from the top-level CLI."""
+    spawn_worker_runtime(threads=threads)
 
 
 @app.command()
@@ -273,46 +578,31 @@ def log(limit: int = typer.Option(20, min=1, help="Maximum number of log entries
                 typer.echo(f"  {detail_text}")
 
 
-@app.command()
+@app.command(hidden=True)
 def accept(task_id: str = typer.Argument(..., help="Task ID to accept.")) -> None:
-    """Accept a reviewing task -> done."""
-    loom = _resolve_loom()
-    try:
-        accept_task(loom, task_id)
-    except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(1) from exc
-    typer.echo(f"Accepted {task_id} -> done.")
+    """Compatibility alias for `loom review accept`."""
+    _require_non_worker_review_context()
+    _accept_review_task(task_id)
 
 
-@app.command()
+@app.command(hidden=True)
 def reject(
     task_id: str = typer.Argument(..., help="Task ID to reject."),
     note: str = typer.Argument(..., help="Rejection reason."),
 ) -> None:
-    """Reject a task back to scheduled."""
-    loom = _resolve_loom()
-    try:
-        reject_task(loom, task_id, note)
-    except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(1) from exc
-    typer.echo(f"Rejected {task_id} -> scheduled. Note: {note}")
+    """Compatibility alias for `loom review reject`."""
+    _require_non_worker_review_context()
+    _reject_review_task(task_id, note)
 
 
-@app.command()
+@app.command(hidden=True)
 def decide(
     task_id: str = typer.Argument(..., help="Task ID to decide."),
     option: str = typer.Argument(..., help="Decision (option id or free text)."),
 ) -> None:
-    """Resolve a paused task's decision -> scheduled."""
-    loom = _resolve_loom()
-    try:
-        decide_task(loom, task_id, option)
-    except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(1) from exc
-    typer.echo(f"Decided {task_id} -> scheduled.")
+    """Compatibility alias for `loom review decide`."""
+    _require_non_worker_review_context()
+    _decide_review_task(task_id, option)
 
 
 @app.command()

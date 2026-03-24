@@ -6,6 +6,7 @@
 
 - `requests/` stores raw requirements from humans (`inbox/` remains a compatibility alias)
 - `threads/` stores executable task streams for agents
+- `agents/workers/<id>/worktrees/` stores worker-local checkout records and directories
 - frontmatter drives scheduling, review, pause, and decision state
 
 See `docs/reference/cli.md` for commands and `docs/reference/data-model.md` for file shapes.

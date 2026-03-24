@@ -59,11 +59,13 @@ Keep the project moving by continuously running the manager loop:
 <!-- BEGIN: manager-command-contract -->
 - Bootstrap the manager loop: `loom manage`
 - Fetch the next action: `loom agent next --role manager`
-- Create a planning thread: `loom agent new-thread --name <name> [--priority <n>] --role manager`
-- Create a planned task: `loom agent new-task --thread <id> --title '<title>' --acceptance '<criteria>' --role manager`
+- Create a planning thread: `loom manage new-thread --name <name> [--priority <n>]`
+- Create a planned task: `loom manage new-task --thread <id> --title '<title>' --acceptance '<criteria>'`
+- Plan a pending request directly: `loom manage plan <rq-id>`
 - Finish completed manager-owned work: `loom agent done <task-id> --output <path-or-url> --role manager`
 - Pause for a human decision: `loom agent pause <task-id> --question '<question>' --role manager`
-- Spawn or wake a worker when configured: `loom spawn [--threads <backend,frontend>]`
+- Assign a thread to a worker: `loom manage assign --thread <name> --worker <agent-id>`
+- Inspect or adjust task/thread priority: `loom manage priority [--task <id> | --thread <name>] [--set <n>]`
 - Delegate the initial handoff: `loom agent propose <agent-id> '<task handoff>' --ref <task-id> --role manager`
 - Send follow-up context: `loom agent send <agent-id> '<extra context>' --ref <task-id> --role manager`
 <!-- END: manager-command-contract -->
@@ -77,21 +79,33 @@ Keep the project moving by continuously running the manager loop:
   - `loom agent pause <id> --question ... --options ...`
   - `loom agent checkpoint "..."`
   - `loom agent resume`
-  - `loom agent inbox`
-  - `loom agent inbox-read <msg-id>`
+  - `loom agent mailbox`
+  - `loom agent mailbox-read <msg-id>`
   - `loom agent whoami`
+  - `loom agent worktree list|add|attach|remove`
   - `loom agent ask <to> "..."`
   - `loom agent propose <to> "..."`
   - `loom agent reply <msg-id> "..."`
+- Mailbox commands can also target singleton mailboxes with `--role manager`, `--role director`, or `--role reviewer`.
+  - `loom agent mailbox --role <manager|director|reviewer>`
+  - `loom agent mailbox-read <msg-id> --role <manager|director|reviewer>`
+  - `loom agent reply <msg-id> "..." --role <manager|director|reviewer>`
 - Singleton-only `loom agent` commands require `--role manager`, `--role director`, or `--role reviewer`.
-  - `loom agent new-thread [--role <manager|director|reviewer>]`
-  - `loom agent new-task --thread backend [--role <manager|director|reviewer>]`
   - `loom agent send <to> "..." [--role <manager|director|reviewer>]`
 - Read-only status remains available without a worker id: `loom agent status`
 - Director/orchestrator bootstrap in this repo: `just start`.
 - Director and human share the full top-level `loom` command surface.
 - Manager entrypoints outside `loom agent`: require a clean manager process without `LOOM_WORKER_ID`.
   - `loom manage`
-  - `loom spawn [--threads <backend,frontend>]`
-- Reviewer entrypoint outside `loom agent`: `loom review`
+  - `loom manage new-thread --name <name> [--priority <n>]`
+  - `loom manage new-task --thread <id> --title '<title>' --acceptance '<criteria>'`
+  - `loom manage plan <rq-id>`
+  - `loom manage assign --thread <name> --worker <agent-id>`
+  - `loom manage priority [--task <id> | --thread <name>] [--set <n>]`
+- Human/director worker-launch entrypoint: `loom spawn [--threads <backend,frontend>]`
+- Reviewer/human entrypoints outside `loom agent`:
+  - `loom review`
+  - `loom review accept <id>`
+  - `loom review reject <id> "reason"`
+  - `loom review decide <id> <option>`
 <!-- END: manager-command-access -->

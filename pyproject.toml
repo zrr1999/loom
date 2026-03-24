@@ -1,39 +1,44 @@
-[build-system]
-requires = ["hatchling", "hatch-vcs"]
-build-backend = "hatchling.build"
-
 [project]
-name = "loom"
-dynamic = ["version"]
+name = "agent-loom"
 description = "A CLI tool where humans weave requirements and agents execute tasks."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
-    "typer >= 0.15",
-    "pydantic >= 2.0",
-    "loguru >= 0.7",
-    "PyYAML >= 6.0",
+  "PyYAML >= 6.0",
+  "loguru >= 0.7",
+  "pydantic >= 2.0",
+  "typer >= 0.15",
+  "zendev",
 ]
+dynamic = ["version"]
 
 [project.scripts]
 loom = "loom.cli:app"
 
 [project.optional-dependencies]
 tui = [
-    "textual>=8.1.1",
+  "textual>=8.1.1",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest >= 8.0",
-    "pytest-cov >= 6.0",
-    "syrupy >= 4.0",
-    "ty >= 0.0.23",
+  { include-group = "docs" },
+  { include-group = "test" },
 ]
 docs = [
-    "zensical >= 0.0.20",
+  "zensical >= 0.0.20",
 ]
+test = [
+  "mutmut>=3.5.0",
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "syrupy >= 4.0",
+]
+
+[build-system]
+requires = ["hatch-vcs", "hatchling"]
+build-backend = "hatchling.build"
 
 [tool.hatch.version]
 source = "vcs"
@@ -42,6 +47,10 @@ fallback-version = "0.0.0"
 [tool.hatch.build.targets.wheel]
 packages = ["src/loom"]
 
+[tool.pytest]
+addopts = ["-q", "-ra"]
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
@@ -49,15 +58,15 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = [
-  "E",    # pycodestyle errors
-  "W",    # pycodestyle warnings
-  "F",    # pyflakes
-  "I",    # isort
-  "UP",   # pyupgrade
-  "B",    # flake8-bugbear
+  "E",  # pycodestyle errors
+  "W",  # pycodestyle warnings
+  "F",  # pyflakes
+  "I",  # isort
+  "UP",  # pyupgrade
+  "B",  # flake8-bugbear
   "SIM",  # flake8-simplify
-  "C4",   # flake8-comprehensions
-  "FA",   # flake8-future-annotations
+  "C4",  # flake8-comprehensions
+  "FA",  # flake8-future-annotations
   "PGH",  # pygrep-hooks
   "RUF",  # ruff-specific rules
   "YTT",  # flake8-2020
@@ -81,9 +90,8 @@ indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
 
-[tool.pytest]
-testpaths = ["tests"]
-addopts = ["-ra", "-q"]
-
 [tool.uv]
 default-groups = ["dev"]
+
+[tool.uv.sources]
+zendev = { git = "https://github.com/zrr1999/zendev" }
