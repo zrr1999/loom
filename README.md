@@ -126,7 +126,7 @@ That ordering keeps reviewer attention on what was delivered and what prior revi
 
 Worker-safe `loom agent` commands infer the actor from `LOOM_WORKER_ID`. Singleton-only mutations such as manager planning/task commands require `--role manager`, `--role director`, or `--role reviewer`.
 
-Agents are stored under `.loom/agents/`. `loom init` ensures the manager record exists, and top-level `loom spawn` creates worker records plus env files for director/human orchestration.
+Agents are stored under `.loom/agents/`. `loom init` ensures the manager record exists, and top-level `loom spawn` creates worker records plus env files for director/human orchestration. It always creates a fresh worker id, so Loom now enforces active/idle worker-count safety limits and requires `--force` once those caps are reached. The defaults come from `[agent].spawn_limit_active_workers = 8` and `[agent].spawn_limit_idle_workers = 2`; set either value to `0` to disable that cap.
 
 `loom agent done` normally moves an assigned task into `reviewing`, but it now gates obviously incomplete work. If the task body or output still contains TODO markers, proposal-only output, or explicit follow-up-improvement notes, the command pauses the task instead and writes a generated decision request so a human can decide how to proceed.
 
@@ -190,7 +190,7 @@ Like `loom agent next`, `loom agent done` now supports advisory soft hooks from 
   - `uvx --from git+https://github.com/zrr1999/loom loom manage plan <rq-id>`
   - `uvx --from git+https://github.com/zrr1999/loom loom manage assign --thread <name> --worker <agent-id>`
   - `uvx --from git+https://github.com/zrr1999/loom loom manage priority [--task <id> | --thread <name>] [--set <n>]`
-- Human/director worker-launch entrypoint: `uvx --from git+https://github.com/zrr1999/loom loom spawn [--threads <backend,frontend>]`
+- Human/director worker-launch entrypoint: `uvx --from git+https://github.com/zrr1999/loom loom spawn [--threads <backend,frontend>] [--force]`
 - Reviewer/human entrypoints outside `loom agent`:
   - `uvx --from git+https://github.com/zrr1999/loom loom review`
   - `uvx --from git+https://github.com/zrr1999/loom loom review accept <id>`

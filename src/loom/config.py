@@ -26,6 +26,15 @@ class AgentSettings(BaseModel):
     next_retries: int = 0
     executor_command: str = ""
     offline_after_minutes: int = 30
+    spawn_limit_active_workers: int = 8
+    spawn_limit_idle_workers: int = 2
+
+    @field_validator("spawn_limit_active_workers", "spawn_limit_idle_workers")
+    @classmethod
+    def validate_spawn_limits(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("Spawn worker limits must be >= 0.")
+        return value
 
 
 class ThreadDefaults(BaseModel):
@@ -153,6 +162,8 @@ def dump_settings(settings: LoomSettings) -> str:
         f"next_retries = {settings.agent.next_retries}\n"
         f'executor_command = "{executor_command}"\n'
         f"offline_after_minutes = {settings.agent.offline_after_minutes}\n"
+        f"spawn_limit_active_workers = {settings.agent.spawn_limit_active_workers}\n"
+        f"spawn_limit_idle_workers = {settings.agent.spawn_limit_idle_workers}\n"
         "# TODO: resume/reattach-related agent config is still under research.\n"
         "# Possible future settings may include explicit resume command templates.\n\n",
         f"[threads]\ndefault_priority = {settings.threads.default_priority}\n\n",

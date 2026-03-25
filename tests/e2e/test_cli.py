@@ -137,6 +137,8 @@ def test_init_creates_default_structure(runner, isolated_project):
     assert "next_retries = 0" in config
     assert 'executor_command = ""' in config
     assert "offline_after_minutes = 30" in config
+    assert "spawn_limit_active_workers = 8" in config
+    assert "spawn_limit_idle_workers = 2" in config
     assert "[hooks.next]" in config
     assert '# examples = ["commit-message-policy"]' in config
     assert "[hooks.done.before]" in config
@@ -1755,7 +1757,7 @@ def test_manage_returns_loop_prompt(runner, isolated_project):
     assert "loom agent checkpoint" not in result.output
     assert "Global mode is active (-g)." not in result.output
     assert "Ask the director or host system to create or wake a worker runtime." in result.output
-    assert "loom spawn [--threads <backend,frontend>]" not in result.output
+    assert "loom spawn [--threads <backend,frontend>] [--force]" not in result.output
     assert "loom agent propose <agent-id> '<task handoff>' --ref <task-id> --role manager" in result.output
     assert "loom agent send <agent-id> '<extra context>' --ref <task-id> --role manager" in result.output
 
@@ -1778,7 +1780,7 @@ def test_manage_with_executor_command_mentions_spawn(runner, isolated_project):
     result = runner.invoke(app, ["manage"])
 
     assert result.exit_code == 0, result.output
-    assert "loom spawn [--threads <backend,frontend>]" in result.output
+    assert "loom spawn [--threads <backend,frontend>] [--force]" in result.output
     assert "configured launch command" in result.output
 
 
@@ -2556,7 +2558,7 @@ def test_agent_next_manager_with_executor_command_mentions_spawn(runner, isolate
 
     out = runner.invoke(app, ["agent", "next", "--plan-limit", "0", "--role", "manager"]).output
 
-    assert "loom spawn [--threads <backend,frontend>]" in out
+    assert "loom spawn [--threads <backend,frontend>] [--force]" in out
     assert "loom agent propose <agent-id> '<task handoff>' --ref <task-id> --role manager" in out
     assert "loom agent send <agent-id> '<extra context>' --ref <task-id> --role manager" in out
     assert task_id in out

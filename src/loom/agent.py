@@ -427,6 +427,77 @@ def _format_minutes_ago(timestamp: str | None) -> str:
         return timestamp
 
 
+def _agent_last_seen(timestamp: str | None) -> datetime | None:
+    if not timestamp:
+        return None
+    try:
+        last_seen = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=UTC)
+    return last_seen.astimezone(UTC)
+
+
+def _agent_is_offline(timestamp: str | None, *, offline_after_minutes: int) -> bool:
+    last_seen = _agent_last_seen(timestamp)
+    if last_seen is None:
+        return False
+    limit_minutes = max(offline_after_minutes, 1)
+    age_minutes = max(int((datetime.now(UTC) - last_seen).total_seconds() // 60), 0)
+    return age_minutes >= limit_minutes
+
+
+def _worker_spawn_counts(agents: object, *, offline_after_minutes: int) -> tuple[int, int]:
+    if not isinstance(agents, list):
+        return 0, 0
+    active_count = 0
+    idle_count = 0
+    for item in agents:
+        if not isinstance(item, dict):
+            continue
+        last_seen = item.get("last_seen")
+        last_seen_text = last_seen if isinstance(last_seen, str) else None
+        if _agent_is_offline(last_seen_text, offline_after_minutes=offline_after_minutes):
+            continue
+        status = item.get("status")
+        if status == AgentStatus.ACTIVE.value:
+            active_count += 1
+        elif status == AgentStatus.IDLE.value:
+            idle_count += 1
+    return active_count, idle_count
+
+
+def _enforce_spawn_limits(*, loom: Path, settings: LoomSettings, force: bool) -> None:
+    if force:
+        return
+    active_limit = settings.agent.spawn_limit_active_workers
+    idle_limit = settings.agent.spawn_limit_idle_workers
+    if active_limit <= 0 and idle_limit <= 0:
+        return
+
+    summary = get_status_summary(loom)
+    active_count, idle_count = _worker_spawn_counts(
+        summary.get("agents"),
+        offline_after_minutes=settings.agent.offline_after_minutes,
+    )
+    violations: list[str] = []
+    if active_limit > 0 and active_count >= active_limit:
+        violations.append(f"active workers {active_count}/{active_limit}")
+    if idle_limit > 0 and idle_count >= idle_limit:
+        violations.append(f"idle workers {idle_count}/{idle_limit}")
+    if not violations:
+        return
+
+    _emit_error(
+        "Refusing to spawn a new worker because "
+        + " and ".join(violations)
+        + ". Reuse or wake an existing worker when possible, inspect `loom agent status`, "
+        + "or pass `loom spawn --force` to override.",
+        code="spawn_limit_reached",
+    )
+
+
 def _touch_if_agent(loom: Path, actor: str) -> None:
     if actor in _SINGLETON_ACTORS:
         return
@@ -1323,11 +1394,14 @@ def agent_status() -> None:
 
 def spawn_worker_runtime(
     threads: str = "",
+    *,
+    force: bool = False,
 ) -> None:
     """Register a new worker agent from the top-level `loom spawn` entrypoint."""
     _require_manager_context("spawn")
     loom = _resolve_loom()
     settings = load_settings(workspace_root(loom))
+    _enforce_spawn_limits(loom=loom, settings=settings, force=force)
     payload = spawn_agent(loom, threads=[item.strip() for item in threads.split(",") if item.strip()])
     env_path = payload.get("env", "")
     agent_id = str(payload["id"])
@@ -1394,9 +1468,17 @@ def spawn_worker_runtime(
 @app.command("spawn", hidden=True)
 def spawn(
     threads: Annotated[str, typer.Option("--threads", help="Comma-separated thread assignment.")] = "",
+    force: Annotated[bool, typer.Option("--force", help="Override worker-count safety limits.")] = False,
 ) -> None:
     """Legacy entrypoint kept only to print migration guidance."""
-    suggestion = f"loom spawn --threads {threads}" if threads else manager_spawn_command()
+    if threads and force:
+        suggestion = f"loom spawn --threads {threads} --force"
+    elif threads:
+        suggestion = f"loom spawn --threads {threads}"
+    elif force:
+        suggestion = "loom spawn --force"
+    else:
+        suggestion = manager_spawn_command()
     _emit_error(
         f"`loom agent spawn` moved to `{suggestion}`. Run `{suggestion}` instead.",
         code="moved_command",

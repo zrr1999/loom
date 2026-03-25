@@ -12,6 +12,8 @@ def default_config_toml(project_name: str, inbox_plan_batch: int = 10) -> str:
         "task_batch = 1\n"
         'executor_command = ""\n'
         "offline_after_minutes = 30\n"
+        "spawn_limit_active_workers = 8\n"
+        "spawn_limit_idle_workers = 2\n"
         "# TODO: resume/reattach-related agent config is still under research.\n"
         "# Possible future settings may include explicit resume command templates.\n\n"
         "[threads]\n"

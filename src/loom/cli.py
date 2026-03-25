@@ -555,9 +555,10 @@ def review_decide(
 @app.command()
 def spawn(
     threads: str = typer.Option("", "--threads", help="Comma-separated thread assignment."),
+    force: bool = typer.Option(False, "--force", help="Override worker-count safety limits."),
 ) -> None:
     """Register a new worker agent from the top-level CLI."""
-    spawn_worker_runtime(threads=threads)
+    spawn_worker_runtime(threads=threads, force=force)
 
 
 @app.command()

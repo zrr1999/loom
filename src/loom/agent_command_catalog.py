@@ -47,7 +47,7 @@ def manager_pause_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
 
 
 def manager_spawn_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
-    return _command(prefix, "spawn [--threads <backend,frontend>]")
+    return _command(prefix, "spawn [--threads <backend,frontend>] [--force]")
 
 
 def manager_propose_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:

@@ -14,7 +14,7 @@
 - `loom manage assign --thread backend --worker worker-123`
 - `loom status`
 - `loom manage priority [--task <id> | --thread <name>] [--set <n>]`
-- `loom spawn [--threads <backend,frontend>]`
+- `loom spawn [--threads <backend,frontend>] [--force]`
 - `loom review`
 - `loom review accept <id>`
 - `loom review reject <id> "reason"`
@@ -207,6 +207,8 @@ Current behavior note: worker-safe `loom agent` commands infer the acting worker
 
 Role-scoped `loom agent next` output is intentionally narrow for singleton roles: reviewer `next` only reports review-ready queue state and does not dump pending request or execution-task details, while director `next` stays focused on orchestration steps rather than acting like a worker claim path.
 
+`loom spawn` always allocates a fresh worker id; it does not auto-reuse existing workers. To avoid silent worker-count growth, Loom refuses to spawn once the configured active/idle worker caps are reached unless `--force` is passed. The default caps are `[agent].spawn_limit_active_workers = 8` and `[agent].spawn_limit_idle_workers = 2`; set either value to `0` to disable that cap.
+
 `loom agent start` returns a concise manager bootstrap prompt describing the expected loop around `loom agent next`, `done`, and `pause`.
 
 That prompt includes a current-state summary, the practical command set for managers, and explicitly states that `loom agent done` and `loom agent pause` always require a specific task id.
@@ -270,7 +272,7 @@ Dedicated manager loop role definition lives at `roles/loom-manager.md`.
   - `loom manage plan <rq-id>`
   - `loom manage assign --thread <name> --worker <agent-id>`
   - `loom manage priority [--task <id> | --thread <name>] [--set <n>]`
-- Human/director worker-launch entrypoint: `loom spawn [--threads <backend,frontend>]`
+- Human/director worker-launch entrypoint: `loom spawn [--threads <backend,frontend>] [--force]`
 - Reviewer/human entrypoints outside `loom agent`:
   - `loom review`
   - `loom review accept <id>`
