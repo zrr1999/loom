@@ -1,0 +1,91 @@
+// loom-layout.kdl — Zellij runtime layout for Loom orchestration
+// Start with: ./start.sh up
+
+layout {
+    tab name="director" focus=true split_direction="vertical" {
+        pane name="director-shell" size="60%" focus=true {
+            command "bash"
+            args "-c" "printf 'director shell\\nrun your director loop here, eg:\\n  uv run loom agent start --role director\\n  uv run loom agent next --role director\\n\\n'; exec bash"
+        }
+        pane size="40%" split_direction="horizontal" {
+            pane name="status" size="45%" {
+                command "bash"
+                args "-c" "while true; do clear; printf '[loom status]\\n\\n'; uv run loom status || true; sleep 5; done"
+            }
+            pane name="review-queue" size="25%" {
+                command "bash"
+                args "-c" "while true; do clear; printf '[loom review]\\n\\n'; uv run loom review || true; sleep 7; done"
+            }
+            pane name="git-status" size="30%" {
+                command "bash"
+                args "-c" "while true; do clear; printf '[git status --short]\\n\\n'; git --no-pager status --short || true; sleep 7; done"
+            }
+        }
+    }
+
+    tab name="manager" split_direction="vertical" {
+        pane name="manager-shell" size="60%" {
+            command "bash"
+            args "-c" "printf 'manager shell\\nrun manager coordination here, eg:\\n  uv run loom agent start --role manager\\n  uv run loom agent next --role manager\\n\\n'; exec bash"
+        }
+        pane size="40%" split_direction="horizontal" {
+            pane name="manager-record" size="55%" {
+                command "bash"
+                args "-c" "while true; do clear; printf '[.loom/agents/manager/_agent.md]\\n\\n'; sed -n '1,220p' .loom/agents/manager/_agent.md 2>/dev/null || echo '(no manager record yet)'; sleep 7; done"
+            }
+            pane name="mailbox-summary" size="45%" {
+                command "bash"
+                args "-c" "while true; do clear; printf '[mailboxes]\\n\\n'; find .loom/agents -maxdepth 3 \\( -path '*/mailbox' -o -path '*/mailbox/*' \\) 2>/dev/null | sort || echo '(no mailboxes)'; sleep 9; done"
+            }
+        }
+    }
+
+    tab name="reviewer" split_direction="vertical" {
+        pane name="reviewer-shell" size="60%" {
+            command "bash"
+            args "-c" "printf 'reviewer shell\\nrun queue reviews here, eg:\\n  uv run loom agent next --role reviewer\\n  uv run loom review accept <task-id>\\n\\n'; exec bash"
+        }
+        pane size="40%" split_direction="horizontal" {
+            pane name="reviewing-tasks" size="50%" {
+                command "bash"
+                args "-c" "while true; do clear; printf '[reviewing tasks]\\n\\n'; find .loom/threads -mindepth 2 -maxdepth 2 -name '*.md' ! -name '_thread.md' -print0 2>/dev/null | xargs -0 grep -l '^status: reviewing$' 2>/dev/null | sort || true; sleep 7; done"
+            }
+            pane name="review-actions" size="50%" {
+                command "bash"
+                args "-c" "while true; do clear; printf '[review history tail]\\n\\n'; grep -R 'kind: reject\\|kind: accept' .loom/threads 2>/dev/null | tail -n 40 || echo '(no review history yet)'; sleep 11; done"
+            }
+        }
+    }
+
+    tab name="workers" split_direction="vertical" {
+        pane name="workers-shell" size="60%" {
+            command "bash"
+            args "-c" "printf 'workers shell\\nspawn or control workers here. useful commands:\\n  uv run loom spawn --threads <thread>\\n  ./start.sh list-panes\\n  ./start.sh send-pane <pane-id> \"...\"\\n\\n'; exec bash"
+        }
+        pane size="40%" split_direction="horizontal" {
+            pane name="worker-dirs" size="50%" {
+                command "bash"
+                args "-c" "while true; do clear; printf '[worker dirs]\\n\\n'; find .loom/agents/workers -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort || echo '(no workers yet)'; sleep 7; done"
+            }
+            pane name="worker-worktrees" size="50%" {
+                command "bash"
+                args "-c" "while true; do clear; printf '[worker worktrees]\\n\\n'; find .loom/agents/workers -mindepth 3 -maxdepth 3 -type d -name worktrees -print 2>/dev/null || echo '(no worker worktrees yet)'; sleep 9; done"
+            }
+        }
+    }
+
+    tab name="observe" split_direction="vertical" {
+        pane name="thread-ownership" size="34%" {
+            command "bash"
+            args "-c" "while true; do clear; printf '[thread ownership]\\n\\n'; find .loom/threads -mindepth 2 -maxdepth 2 -name '_thread.md' -print0 2>/dev/null | while IFS= read -r -d '' f; do thread=$(basename \"$(dirname \"$f\")\"); owner=$(grep '^owner:' \"$f\" 2>/dev/null | sed 's/^owner: //'); lease=$(grep '^owner_lease_expires_at:' \"$f\" 2>/dev/null | sed 's/^owner_lease_expires_at: //'); printf '%-32s owner=%-12s lease=%s\\n' \"$thread\" \"${owner:-none}\" \"${lease:-none}\"; done | sort || echo '(no thread metadata yet)'; sleep 9; done"
+        }
+        pane name="runtime-files" size="33%" {
+            command "bash"
+            args "-c" "while true; do clear; printf '[.loom/runtime/zellij]\\n\\n'; find .loom/runtime/zellij -maxdepth 2 -type f 2>/dev/null | sort || echo '(run ./start.sh up first)'; sleep 7; done"
+        }
+        pane name="ops-shell" size="33%" {
+            command "bash"
+            args "-c" "printf 'ops shell\\nexamples:\\n  ./start.sh list-tabs\\n  ./start.sh list-panes\\n  ./start.sh dump-pane terminal_1\\n  ./start.sh subscribe-pane terminal_1\\n  ./start.sh watch\\n\\n'; exec bash"
+        }
+    }
+}
