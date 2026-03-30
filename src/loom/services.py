@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import re
+import shutil
 import subprocess
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import load_settings
+from .duration import normalize_interval
 from .frontmatter import write_model
 from .history import append_event
 from .ids import (
@@ -25,6 +29,7 @@ from .models import (
     AgentStatus,
     Decision,
     DecisionOption,
+    DeliveryContract,
     ManagerRecord,
     Message,
     MessageType,
@@ -32,10 +37,15 @@ from .models import (
     RequestResolution,
     RequestStatus,
     ReviewEntry,
+    Routine,
+    RoutineResult,
+    RoutineStatus,
     Task,
     TaskKind,
     TaskStatus,
     Thread,
+    ThreadPR,
+    ThreadWorktree,
     WorktreeRecord,
     WorktreeStatus,
     find_review_blockers,
@@ -48,12 +58,19 @@ from .repository import (
     agent_worktrees_dir,
     agents_dir,
     load_agent,
+    load_manager,
     load_message,
     load_request_item,
+    load_routine,
     load_task,
     load_worktree,
+    manager_dir,
     manager_path,
+    products_dir,
+    products_reports_dir,
     requests_dir,
+    routines_dir,
+    task_file_path,
     worker_agents_dir,
     workspace_root,
     worktree_record_path,
@@ -62,10 +79,24 @@ from .scheduler import load_all_tasks, load_all_threads
 from .state import (
     validate_decision_payload,
     validate_request_transition,
+    validate_routine_transition,
     validate_task_scheduled,
     validate_task_transition,
 )
-from .templates import agent_body, task_body, thread_body
+from .templates import agent_body, routine_body, task_body, thread_body
+
+
+class AmbiguousRequestRoutingError(ValueError):
+    """Raised when request-to-thread inference is not reliable enough to continue."""
+
+
+@dataclass(frozen=True)
+class TaskMutationResult:
+    task: Task
+    path: Path
+    created: bool
+    merge_reason: str | None = None
+    priority_changed: bool = False
 
 
 def parse_csv_list(value: str | list[str] | None) -> list[str]:
@@ -74,6 +105,205 @@ def parse_csv_list(value: str | list[str] | None) -> list[str]:
     if isinstance(value, list):
         return [item.strip() for item in value if item.strip()]
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _merge_unique_items(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            if item and item not in seen:
+                seen.add(item)
+                merged.append(item)
+    return merged
+
+
+def _normalize_overlap_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", text.lower()).strip()
+
+
+def _title_overlap(left: str, right: str) -> bool:
+    left_normalized = _normalize_overlap_text(left)
+    right_normalized = _normalize_overlap_text(right)
+    if not left_normalized or not right_normalized:
+        return False
+    if left_normalized == right_normalized:
+        return True
+
+    left_tokens = set(left_normalized.split())
+    right_tokens = set(right_normalized.split())
+    if not left_tokens or not right_tokens:
+        return False
+
+    shared = left_tokens & right_tokens
+    if left_normalized in right_normalized or right_normalized in left_normalized:
+        return len(shared) >= max(1, min(len(left_tokens), len(right_tokens)) - 1)
+
+    overlap_ratio = len(shared) / max(len(left_tokens), len(right_tokens))
+    return len(shared) >= 2 and overlap_ratio >= 0.6
+
+
+def _elevated_priority(current: int, requested: int) -> int:
+    baseline = max(current, requested)
+    if baseline >= 100:
+        return 100
+    return min(100, baseline + 10)
+
+
+def _find_task_merge_candidate(
+    loom: Path,
+    *,
+    thread_name: str,
+    title: str,
+    created_from: list[str],
+    kind: TaskKind,
+) -> tuple[Task, str] | None:
+    candidates: list[tuple[int, Task, str]] = []
+    for existing in load_all_tasks(loom):
+        if existing.thread != thread_name or existing.kind != kind or existing.status != TaskStatus.SCHEDULED:
+            continue
+
+        overlap_reasons: list[str] = []
+        if created_from and set(existing.created_from) & set(created_from):
+            overlap_reasons.append("created_from overlap")
+        if _title_overlap(existing.title, title):
+            overlap_reasons.append("title overlap")
+        if not overlap_reasons:
+            continue
+
+        score = 2 if "created_from overlap" in overlap_reasons else 0
+        if "title overlap" in overlap_reasons:
+            score += 1
+        candidates.append((score, existing, " + ".join(overlap_reasons)))
+
+    if not candidates:
+        return None
+
+    _score, task, reason = sorted(
+        candidates,
+        key=lambda item: (-item[0], -item[1].priority, item[1].seq, item[1].id),
+    )[0]
+    return task, reason
+
+
+def _split_routine_body_sections(body: str) -> tuple[str, str]:
+    marker = "## Run Log"
+    if marker not in body:
+        msg = "Routine body must include a '## Run Log' section"
+        raise ValueError(msg)
+    head, _, tail = body.partition(marker)
+    return head.rstrip(), tail.lstrip()
+
+
+def extract_routine_log(body: str) -> str:
+    """Return the raw append-only run log section body."""
+    _head, log = _split_routine_body_sections(body)
+    return log.strip()
+
+
+def append_routine_log(body: str, *, ran_at: str, result: RoutineResult, note: str = "") -> str:
+    """Append a single markdown bullet to the routine run log section."""
+    head, log = _split_routine_body_sections(body)
+    log_lines = [line.rstrip() for line in log.splitlines()]
+    cleaned_lines = [line for line in log_lines if line.strip()]
+    if cleaned_lines == ["<!-- append-only notes -->"]:
+        cleaned_lines = []
+
+    entry = f"- {ran_at} [{result.value}]"
+    if note.strip():
+        note_lines = [line.strip() for line in note.strip().splitlines() if line.strip()]
+        if note_lines:
+            entry = f"{entry} {note_lines[0]}"
+            cleaned_lines.append(entry)
+            cleaned_lines.extend(f"  {line}" for line in note_lines[1:])
+        else:
+            cleaned_lines.append(entry)
+    else:
+        cleaned_lines.append(entry)
+
+    log_text = "\n".join(cleaned_lines) if cleaned_lines else "<!-- append-only notes -->"
+    return f"{head}\n\n## Run Log\n\n{log_text}"
+
+
+def _normalize_thread_signal(text: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", text.lower().strip()).strip("-")
+
+
+def _request_thread_signal(item: RequestItem) -> str:
+    title = derive_task_title(item)
+    return _normalize_thread_signal("\n".join(part for part in [title, item.body] if part))
+
+
+def _signal_mentions_thread(signal: str, thread_name: str) -> bool:
+    signal_parts = [part for part in signal.split("-") if part]
+    thread_parts = [part for part in thread_name.split("-") if part]
+    width = len(thread_parts)
+    if width == 0 or len(signal_parts) < width:
+        return False
+    return any(signal_parts[index : index + width] == thread_parts for index in range(len(signal_parts) - width + 1))
+
+
+def _ambiguous_thread_message(
+    item: RequestItem,
+    *,
+    reason: str,
+    available_threads: list[str],
+    candidate_threads: list[str] | None = None,
+) -> str:
+    lines = [
+        f"could not infer a target thread for {item.id}: {reason}",
+        f"available threads: {', '.join(available_threads)}",
+    ]
+    if candidate_threads:
+        lines.append(f"matching threads: {', '.join(candidate_threads)}")
+    lines.append(
+        f"choose one explicitly with `loom manage plan {item.id} --thread <name>` "
+        "or create a new thread first with `loom manage new-thread --name <name>`"
+    )
+    return "\n".join(lines)
+
+
+def _resolve_target_thread(
+    item: RequestItem,
+    threads: dict[str, Thread],
+    *,
+    requested_thread: str | None = None,
+) -> Thread:
+    if requested_thread:
+        canonical = canonical_thread_name(requested_thread)
+        thread = threads.get(canonical)
+        if thread is None:
+            raise FileNotFoundError(f"thread '{canonical}' does not exist")
+        return thread
+
+    if len(threads) == 1:
+        return next(iter(threads.values()))
+
+    signal = _request_thread_signal(item)
+    candidates = sorted(
+        (thread for thread in threads.values() if _signal_mentions_thread(signal, thread.name)),
+        key=lambda thread: thread.name,
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+
+    available = sorted(threads)
+    if candidates:
+        raise AmbiguousRequestRoutingError(
+            _ambiguous_thread_message(
+                item,
+                reason="multiple existing threads match the request text",
+                available_threads=available,
+                candidate_threads=[thread.name for thread in candidates],
+            )
+        )
+    raise AmbiguousRequestRoutingError(
+        _ambiguous_thread_message(
+            item,
+            reason="request text does not clearly match an existing thread",
+            available_threads=available,
+        )
+    )
 
 
 def create_thread(
@@ -114,6 +344,9 @@ def ensure_agent_layout(loom: Path) -> None:
     agents_root = agents_dir(loom)
     agents_root.mkdir(parents=True, exist_ok=True)
     worker_agents_dir(loom).mkdir(parents=True, exist_ok=True)
+    manager_dir(loom).mkdir(parents=True, exist_ok=True)
+    products_dir(loom).mkdir(parents=True, exist_ok=True)
+    products_reports_dir(loom).mkdir(parents=True, exist_ok=True)
     manager_file = manager_path(loom)
     if not manager_file.exists():
         manager = ManagerRecord(last_seen=datetime.now(UTC).isoformat(timespec="seconds"), checkpoint_summary="ready")
@@ -156,6 +389,289 @@ def _detect_git_branch(path: Path) -> str:
     if result.returncode != 0:
         return ""
     return result.stdout.strip()
+
+
+def _load_thread_metadata(loom: Path, thread_name: str) -> tuple[Path, Thread]:
+    canonical = canonical_thread_name(thread_name)
+    threads = load_all_threads(loom)
+    thread = threads.get(canonical)
+    if thread is None:
+        raise FileNotFoundError(f"thread '{canonical}' does not exist")
+    return loom / "threads" / canonical / "_thread.md", thread
+
+
+def _worktree_identity(record: WorktreeRecord) -> tuple[str, str, str]:
+    return record.worker, record.name, str(Path(record.path).resolve())
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    try:
+        left.relative_to(right)
+        return True
+    except ValueError:
+        pass
+    try:
+        right.relative_to(left)
+        return True
+    except ValueError:
+        return False
+
+
+def _ensure_unique_worktree_path(
+    records: list[WorktreeRecord],
+    *,
+    candidate: Path,
+    candidate_name: str,
+) -> None:
+    for existing in records:
+        existing_path = Path(existing.path).resolve()
+        if existing_path == candidate:
+            raise ValueError(f"path '{candidate}' is already registered as worktree '{existing.name}'")
+        if _paths_overlap(existing_path, candidate):
+            raise ValueError(
+                f"path '{candidate}' overlaps existing worktree '{existing.name}' at '{existing_path}'; "
+                "nested or overlapping worktree paths are not allowed"
+            )
+
+
+def _active_thread_worktree_index(thread: Thread, record: WorktreeRecord) -> int | None:
+    identity = _worktree_identity(record)
+    for idx in range(len(thread.worktrees) - 1, -1, -1):
+        item = thread.worktrees[idx]
+        item_identity = (item.worker, item.name, str(Path(item.path).resolve()))
+        if item.removed_at is None and item_identity == identity:
+            return idx
+    return None
+
+
+def _write_thread_worktree_entry(
+    loom: Path,
+    thread_name: str,
+    record: WorktreeRecord,
+    *,
+    removed_at: str | None = None,
+) -> Thread:
+    path, thread = _load_thread_metadata(loom, thread_name)
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    existing_idx = _active_thread_worktree_index(thread, record)
+    worktrees = list(thread.worktrees)
+    if removed_at is not None:
+        final_status = WorktreeStatus.ARCHIVED if record.status != WorktreeStatus.ARCHIVED else record.status
+        if existing_idx is None:
+            worktrees.append(
+                ThreadWorktree(
+                    name=record.name,
+                    worker=record.worker,
+                    path=str(Path(record.path).resolve()),
+                    branch=record.branch,
+                    status=final_status,
+                    created_at=record.created_at or now,
+                    removed_at=removed_at,
+                )
+            )
+        else:
+            existing = worktrees[existing_idx]
+            worktrees[existing_idx] = existing.model_copy(
+                update={
+                    "path": str(Path(record.path).resolve()),
+                    "branch": record.branch,
+                    "status": final_status,
+                    "removed_at": removed_at,
+                }
+            )
+    else:
+        entry = ThreadWorktree(
+            name=record.name,
+            worker=record.worker,
+            path=str(Path(record.path).resolve()),
+            branch=record.branch,
+            status=record.status,
+            created_at=record.created_at or now,
+        )
+        if existing_idx is None:
+            worktrees.append(entry)
+        else:
+            preserved_created_at = worktrees[existing_idx].created_at or entry.created_at
+            worktrees[existing_idx] = entry.model_copy(update={"created_at": preserved_created_at})
+
+    updated = thread.model_copy(update={"worktrees": worktrees})
+    write_model(path, updated)
+    return updated
+
+
+def _move_worktree_thread_link(
+    loom: Path,
+    previous_thread: str | None,
+    next_thread: str | None,
+    record: WorktreeRecord,
+    *,
+    removed_at: str | None = None,
+) -> None:
+    if previous_thread and previous_thread != next_thread:
+        _write_thread_worktree_entry(
+            loom,
+            previous_thread,
+            record,
+            removed_at=removed_at or datetime.now(UTC).isoformat(timespec="seconds"),
+        )
+    if next_thread:
+        _write_thread_worktree_entry(loom, next_thread, record)
+
+
+_GITHUB_PR_RE = re.compile(r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+_URL_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+
+
+def _looks_like_local_output_reference(output: str) -> bool:
+    text = output.strip()
+    if not text or "\n" in text:
+        return False
+    if any(char.isspace() for char in text):
+        return False
+    return _URL_RE.match(text) is None
+
+
+def _sanitize_product_relative_path(path: Path) -> Path:
+    parts = [part for part in path.parts if part not in ("", ".")]
+    if not parts:
+        raise ValueError("output path must not be empty")
+    if any(part == ".." for part in parts):
+        raise ValueError("output path must stay within .loom/products/")
+    if parts[:2] == [".loom", "products"]:
+        parts = parts[2:]
+    elif parts[:1] == [".loom"]:
+        parts = parts[1:]
+    if not parts:
+        raise ValueError("output path must name a file or directory under .loom/products/")
+    return Path(*parts)
+
+
+def _rewrite_legacy_worker_output_path(path: Path) -> Path:
+    parts = [part for part in path.parts if part not in ("", ".")]
+    if len(parts) < 5 or parts[:2] != [".loom", "agents"]:
+        return path
+
+    output_index: int | None = None
+    if len(parts) >= 6 and parts[2] == "workers" and parts[4] == "outputs":
+        output_index = 4
+    elif parts[3] == "outputs":
+        output_index = 3
+
+    if output_index is None or len(parts) <= output_index + 1:
+        return path
+
+    return Path("reports", *parts[output_index + 1 :])
+
+
+def normalize_task_output(loom: Path, output: str | None) -> str | None:
+    if output is None:
+        return None
+
+    text = output.strip()
+    if not text or not _looks_like_local_output_reference(text):
+        return output
+
+    workspace = workspace_root(loom).resolve()
+    candidate = Path(text).expanduser()
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        try:
+            relative = resolved.relative_to(products_dir(loom).resolve())
+        except ValueError:
+            try:
+                relative = resolved.relative_to(workspace)
+            except ValueError as exc:
+                raise ValueError(f"output path '{resolved}' must stay inside the workspace or .loom/products/") from exc
+    else:
+        relative = candidate
+
+    normalized_relative = _sanitize_product_relative_path(_rewrite_legacy_worker_output_path(relative))
+    normalized = Path(".loom") / "products" / normalized_relative
+    (workspace / normalized).parent.mkdir(parents=True, exist_ok=True)
+    return normalized.as_posix()
+
+
+def _normalize_delivery_contract(loom: Path, delivery: DeliveryContract | None) -> DeliveryContract | None:
+    if delivery is None:
+        return None
+    normalized_artifacts = [normalize_task_output(loom, artifact) or artifact for artifact in delivery.artifacts]
+    normalized_pr_urls = [url.strip() for url in delivery.pr_urls if url.strip()]
+    return delivery.model_copy(update={"artifacts": normalized_artifacts, "pr_urls": normalized_pr_urls})
+
+
+def _record_thread_pr_artifacts(
+    loom: Path,
+    task: Task,
+    *,
+    output: str | None = None,
+    delivery: DeliveryContract | None = None,
+) -> None:
+    contract = delivery if delivery is not None else task.delivery
+    pr_urls = list(dict.fromkeys(contract.pr_urls)) if contract is not None else []
+    if pr_urls:
+        matches = [(url, _GITHUB_PR_RE.fullmatch(url)) for url in pr_urls]
+        matches = [(url, match) for url, match in matches if match is not None]
+    else:
+        text = output if output is not None else (task.output or "")
+        matches = [(match.group(0), match) for match in _GITHUB_PR_RE.finditer(text)]
+    if not matches:
+        return
+
+    path, thread = _load_thread_metadata(loom, task.thread)
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    active_worktree = next((item for item in reversed(thread.worktrees) if item.removed_at is None), None)
+    artifacts = list(thread.pr_artifacts)
+    changed = False
+    for url, match in matches:
+        owner, repo, number = match.groups()
+        index = next((idx for idx, item in enumerate(artifacts) if item.url == url), None)
+        payload = {
+            "url": url,
+            "provider": "github",
+            "repository": f"{owner}/{repo}",
+            "number": int(number),
+            "branch": active_worktree.branch if active_worktree else None,
+            "worker": active_worktree.worker if active_worktree else None,
+            "worktree": active_worktree.name if active_worktree else None,
+            "updated_at": now,
+        }
+        if index is None:
+            artifacts.append(
+                ThreadPR(
+                    **payload,
+                    task_ids=[task.id],
+                    recorded_at=now,
+                )
+            )
+            changed = True
+            continue
+
+        existing = artifacts[index]
+        task_ids = list(existing.task_ids)
+        if task.id not in task_ids:
+            task_ids.append(task.id)
+        updated = existing.model_copy(update=payload | {"task_ids": task_ids})
+        if updated.model_dump(mode="python") != existing.model_dump(mode="python"):
+            artifacts[index] = updated
+            changed = True
+
+    if changed:
+        write_model(path, thread.model_copy(update={"pr_artifacts": artifacts}))
+
+
+def _worktree_has_dirty_git_state(path: Path) -> bool:
+    git_dir = path / ".git"
+    if not git_dir.exists():
+        return False
+    result = subprocess.run(
+        ["git", "-C", str(path), "status", "--porcelain"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    return bool(result.stdout.strip())
 
 
 def load_all_worktrees(loom: Path, agent_id: str) -> list[WorktreeRecord]:
@@ -212,9 +728,7 @@ def add_worktree(
     existing = load_all_worktrees(loom, agent_id)
     if any(record.name == resolved_name for record in existing):
         raise ValueError(f"worktree '{resolved_name}' already exists")
-    if any(Path(record.path) == resolved_path for record in existing):
-        duplicate = next(record.name for record in existing if Path(record.path) == resolved_path)
-        raise ValueError(f"path '{resolved_path}' is already registered as worktree '{duplicate}'")
+    _ensure_unique_worktree_path(existing, candidate=resolved_path, candidate_name=resolved_name)
     resolved_path.mkdir(parents=True, exist_ok=True)
 
     resolved_branch = branch.strip() or _detect_git_branch(resolved_path)
@@ -234,8 +748,9 @@ def add_worktree(
         created_at=now,
         updated_at=now,
         body=(
-            "Worker-local metadata only. Task state still lives under .loom/threads/, "
-            "and other workers only see worktrees inside their own agent subtree."
+            "Worker-local discovery metadata. Thread-owned linkage/history lives on "
+            ".loom/threads/<thread>/_thread.md, while other workers only see worktrees "
+            "inside their own agent subtree."
         ),
     )
     record_path = worktree_record_path(loom, agent_id, resolved_name)
@@ -268,6 +783,7 @@ def attach_worktree(
     if record.worker != agent_id:
         raise ValueError(f"worktree '{record.name}' belongs to worker '{record.worker}', not '{agent_id}'")
 
+    normalized_thread = canonical_thread_name(thread) if thread else None
     updates: dict[str, object] = {
         "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
@@ -275,12 +791,23 @@ def attach_worktree(
         updates["thread"] = None
         updates["status"] = status or WorktreeStatus.REGISTERED
     else:
-        normalized_thread = canonical_thread_name(thread) if thread else None
         if thread is not None:
             updates["thread"] = normalized_thread
         updates["status"] = status or (WorktreeStatus.ACTIVE if normalized_thread else record.status)
 
     updated = record.model_copy(update=updates)
+    previous_thread = record.thread
+    effective_thread = updated.thread
+    if previous_thread != effective_thread:
+        _move_worktree_thread_link(
+            loom,
+            previous_thread,
+            effective_thread,
+            updated,
+            removed_at=datetime.now(UTC).isoformat(timespec="seconds"),
+        )
+    elif effective_thread:
+        _write_thread_worktree_entry(loom, effective_thread, updated)
     write_model(path, updated)
     append_event(
         loom,
@@ -306,6 +833,21 @@ def remove_worktree(loom: Path, agent_id: str, name: str, *, force: bool = False
             f"worktree '{record.name}' is still attached to thread metadata; "
             "clear it first with `loom agent worktree attach <name> --clear` or pass --force"
         )
+    checkout_path = Path(record.path).resolve()
+    if checkout_path.exists() and _worktree_has_dirty_git_state(checkout_path) and not force:
+        raise ValueError(
+            f"worktree '{record.name}' at '{checkout_path}' has uncommitted changes; "
+            "clean it first or pass --force for full cleanup"
+        )
+
+    removed_at = datetime.now(UTC).isoformat(timespec="seconds")
+    if record.thread:
+        _write_thread_worktree_entry(
+            loom,
+            record.thread,
+            record.model_copy(update={"status": WorktreeStatus.ARCHIVED}),
+            removed_at=removed_at,
+        )
 
     append_event(
         loom,
@@ -314,6 +856,8 @@ def remove_worktree(loom: Path, agent_id: str, name: str, *, force: bool = False
         record.name,
         {"path": record.path, "worker": record.worker, "thread": record.thread, "forced": force},
     )
+    if checkout_path.exists():
+        shutil.rmtree(checkout_path)
     path.unlink()
     return path, record
 
@@ -441,9 +985,39 @@ def update_checkpoint(loom: Path, agent_id: str, *, phase: str, summary: str) ->
     return updated
 
 
+def update_manager_checkpoint(loom: Path, *, phase: str, summary: str) -> ManagerRecord:
+    ensure_agent_layout(loom)
+    path, manager = load_manager(loom)
+    updated_at = utc_now().isoformat(timespec="seconds")
+    updated_body = f"## Checkpoint\n\n**phase** {phase}\n**updated** {updated_at}\n\n{summary}\n\n## Notes\n\n"
+    updated = manager.model_copy(
+        update={
+            "last_seen": updated_at,
+            "status": "active",
+            "checkpoint_summary": summary[:120],
+            "body": updated_body,
+        }
+    )
+    write_model(path, updated)
+    append_event(
+        loom,
+        "manager.checkpointed",
+        "agent",
+        "manager",
+        {"phase": phase},
+    )
+    return updated
+
+
 def resume_agent(loom: Path, agent_id: str) -> AgentRecord:
     _, agent = load_agent(loom, agent_id)
     return agent
+
+
+def resume_manager(loom: Path) -> ManagerRecord:
+    ensure_agent_layout(loom)
+    _, manager = load_manager(loom)
+    return manager
 
 
 def create_message(
@@ -539,6 +1113,122 @@ def adjust_task_priority(loom: Path, task_id: str, *, priority: int) -> tuple[Pa
     return path, updated
 
 
+def create_routine(
+    loom: Path,
+    *,
+    routine_id: str,
+    title: str,
+    interval: str,
+    assigned_to: str | None = None,
+    created_from: str | list[str] | None = None,
+    responsibilities: str = "",
+) -> tuple[Routine, Path]:
+    """Create a new routine file under `.loom/routines/`."""
+    routines_root = routines_dir(loom)
+    routines_root.mkdir(parents=True, exist_ok=True)
+    path = routines_root / f"{routine_id}.md"
+    if path.exists():
+        raise FileExistsError(f"routine '{routine_id}' already exists")
+
+    routine = Routine(
+        id=routine_id,
+        title=title.strip() or routine_id,
+        status=RoutineStatus.ACTIVE,
+        interval=normalize_interval(interval),
+        assigned_to=assigned_to.strip() if assigned_to else None,
+        created_from=parse_csv_list(created_from),
+        body=routine_body(responsibilities),
+    )
+    write_model(path, routine)
+    append_event(
+        loom,
+        "routine.created",
+        "routine",
+        routine.id,
+        {
+            "status": routine.status.value,
+            "interval": routine.interval,
+            "assigned_to": routine.assigned_to,
+            "created_from": routine.created_from,
+        },
+    )
+    return routine, path
+
+
+def set_routine_status(loom: Path, routine_id: str, *, target_status: RoutineStatus) -> tuple[Path, Routine]:
+    """Update a routine lifecycle status."""
+    path, routine = load_routine(loom, routine_id)
+    validate_routine_transition(routine.status, target_status)
+    updated = routine.model_copy(update={"status": target_status})
+    write_model(path, updated)
+    append_event(
+        loom,
+        "routine.transitioned",
+        "routine",
+        routine.id,
+        {"from": routine.status.value, "to": updated.status.value},
+    )
+    return path, updated
+
+
+def record_routine_run(
+    loom: Path,
+    routine_id: str,
+    *,
+    result: RoutineResult,
+    note: str = "",
+    ran_at: str | None = None,
+) -> tuple[Path, Routine]:
+    """Persist routine run metadata and append to its markdown run log."""
+    path, routine = load_routine(loom, routine_id)
+    effective_ran_at = ran_at or datetime.now(UTC).isoformat(timespec="seconds")
+    updated = routine.model_copy(
+        update={
+            "last_run": effective_ran_at,
+            "last_result": result,
+            "body": append_routine_log(routine.body, ran_at=effective_ran_at, result=result, note=note),
+        }
+    )
+    write_model(path, updated)
+    append_event(
+        loom,
+        "routine.run_recorded",
+        "routine",
+        routine.id,
+        {"last_run": updated.last_run, "last_result": updated.last_result.value if updated.last_result else None},
+    )
+    return path, updated
+
+
+def trigger_routine(loom: Path, routine_id: str, *, forced: bool = False) -> dict[str, object]:
+    """Send a routine trigger message to the assigned worker."""
+    _path, routine = load_routine(loom, routine_id)
+    if not routine.assigned_to:
+        msg = f"routine '{routine.id}' has no assigned worker; direct manager execution is not supported"
+        raise ValueError(msg)
+
+    body_lines = [
+        f"Routine is {'force-triggered' if forced else 'due'}.",
+        f"Execute the responsibilities in .loom/routines/{routine.id}.md and reply with the run result summary.",
+    ]
+    message = create_message(
+        loom,
+        sender="manager",
+        recipient=routine.assigned_to,
+        message_type=MessageType.ROUTINE_TRIGGER,
+        body=" ".join(body_lines),
+        ref=routine.id,
+    )
+    append_event(
+        loom,
+        "routine.triggered",
+        "routine",
+        routine.id,
+        {"recipient": routine.assigned_to, "forced": forced, "message_id": message["id"]},
+    )
+    return {"routine": routine, "message": message}
+
+
 def release_claim(loom: Path, task_id: str, *, note: str) -> tuple[Path, Task]:
     """Release thread ownership and revert the task toward SCHEDULED.
 
@@ -564,6 +1254,7 @@ def create_task(
     acceptance: str = "",
     depends_on: str | list[str] | None = None,
     created_from: str | list[str] | None = None,
+    persistent: bool = False,
     background: str = "",
     implementation_direction: str = "",
 ) -> tuple[Task, Path]:
@@ -597,6 +1288,7 @@ def create_task(
         kind=kind,
         status=status,
         priority=priority,
+        persistent=True if persistent else None,
         depends_on=parsed_depends_on,
         created_from=parse_csv_list(created_from),
         acceptance=normalized_acceptance or None,
@@ -614,12 +1306,91 @@ def create_task(
     return task, path
 
 
+def create_or_merge_task(
+    loom: Path,
+    *,
+    thread_name: str,
+    title: str,
+    kind: TaskKind = TaskKind.IMPLEMENTATION,
+    priority: int = 50,
+    acceptance: str = "",
+    depends_on: str | list[str] | None = None,
+    created_from: str | list[str] | None = None,
+    persistent: bool = False,
+    background: str = "",
+    implementation_direction: str = "",
+) -> TaskMutationResult:
+    canonical_thread = canonical_thread_name(thread_name)
+    parsed_created_from = parse_csv_list(created_from)
+    merge_candidate = _find_task_merge_candidate(
+        loom,
+        thread_name=canonical_thread,
+        title=title,
+        created_from=parsed_created_from,
+        kind=kind,
+    )
+    if merge_candidate is None:
+        task, path = create_task(
+            loom,
+            thread_name=canonical_thread,
+            title=title,
+            kind=kind,
+            priority=priority,
+            acceptance=acceptance,
+            depends_on=depends_on,
+            created_from=parsed_created_from,
+            persistent=persistent,
+            background=background,
+            implementation_direction=implementation_direction,
+        )
+        return TaskMutationResult(task=task, path=path, created=True)
+
+    task, reason = merge_candidate
+    path = task_file_path(loom, task)
+    merged_created_from = _merge_unique_items(task.created_from, parsed_created_from)
+    merged_depends_on = _merge_unique_items(task.depends_on, parse_csv_list(depends_on))
+    elevated_priority = _elevated_priority(task.priority, priority)
+    updates: dict[str, object] = {
+        "priority": elevated_priority,
+        "created_from": merged_created_from,
+        "depends_on": merged_depends_on,
+        "persistent": True if task.persistent or persistent else None,
+    }
+    if not task.acceptance and acceptance.strip():
+        updates["acceptance"] = acceptance.strip()
+        updates["status"] = TaskStatus.SCHEDULED
+
+    updated = Task.model_validate(task.model_dump(mode="python") | updates)
+    write_model(path, updated)
+    append_event(
+        loom,
+        "task.merged",
+        "task",
+        task.id,
+        {
+            "thread": task.thread,
+            "reason": reason,
+            "priority_from": task.priority,
+            "priority_to": updated.priority,
+            "created_from": updated.created_from,
+        },
+    )
+    return TaskMutationResult(
+        task=updated,
+        path=path,
+        created=False,
+        merge_reason=reason,
+        priority_changed=updated.priority != task.priority,
+    )
+
+
 def transition_task(
     loom: Path,
     task_id: str,
     target_status: TaskStatus,
     *,
     output: str | None = None,
+    delivery: DeliveryContract | None = None,
     rejection_note: str | None = None,
     decision: Decision | None = None,
     review_entry: ReviewEntry | None = None,
@@ -632,7 +1403,9 @@ def transition_task(
         validate_task_scheduled(task.acceptance)
         updates["claim"] = None
     if output is not None:
-        updates["output"] = output
+        updates["output"] = normalize_task_output(loom, output)
+    if delivery is not None:
+        updates["delivery"] = _normalize_delivery_contract(loom, delivery)
     if rejection_note is not None:
         updates["rejection_note"] = rejection_note
     if decision is not None:
@@ -652,11 +1425,52 @@ def transition_task(
     return path, updated
 
 
-def complete_task(loom: Path, task_id: str, *, output: str | None = None) -> tuple[Path, Task, list[str]]:
+def complete_task(
+    loom: Path,
+    task_id: str,
+    *,
+    output: str | None = None,
+    delivery: DeliveryContract | None = None,
+) -> tuple[Path, Task, list[str]]:
     path, task = load_task(loom, task_id)
-    blockers = find_review_blockers(task, output=output)
+    normalized_delivery = _normalize_delivery_contract(loom, delivery)
+    if task.persistent:
+        updates: dict[str, object] = {}
+        normalized_output = normalize_task_output(loom, output)
+        if normalized_output is not None:
+            updates["output"] = normalized_output
+        if normalized_delivery is not None:
+            updates["delivery"] = normalized_delivery
+        updated = task.model_copy(update=updates)
+        write_model(path, updated)
+        _record_thread_pr_artifacts(loom, updated, output=normalized_output, delivery=normalized_delivery)
+        append_event(
+            loom,
+            "task.persistent_recorded",
+            "task",
+            task.id,
+            {
+                "thread": task.thread,
+                "output": normalized_output,
+                "delivery_ready": normalized_delivery.ready if normalized_delivery is not None else None,
+            },
+        )
+        return path, updated, []
+
+    blockers = (
+        []
+        if normalized_delivery is not None and normalized_delivery.ready
+        else find_review_blockers(task, output=output)
+    )
     if not blockers:
-        path, updated = transition_task(loom, task_id, TaskStatus.REVIEWING, output=output)
+        path, updated = transition_task(
+            loom,
+            task_id,
+            TaskStatus.REVIEWING,
+            output=output,
+            delivery=normalized_delivery,
+        )
+        _record_thread_pr_artifacts(loom, updated, output=output, delivery=normalized_delivery)
         return path, updated, []
 
     decision = Decision(
@@ -677,7 +1491,14 @@ def complete_task(loom: Path, task_id: str, *, output: str | None = None) -> tup
             ),
         ],
     )
-    path, updated = transition_task(loom, task_id, TaskStatus.PAUSED, output=output, decision=decision)
+    path, updated = transition_task(
+        loom,
+        task_id,
+        TaskStatus.PAUSED,
+        output=output,
+        delivery=normalized_delivery,
+        decision=decision,
+    )
     return path, updated, blockers
 
 
@@ -832,7 +1653,7 @@ def decide_task(loom: Path, task_id: str, option: str) -> tuple[Path, Task]:
     return path, updated
 
 
-def plan_request_item(loom: Path, rq_id: str) -> dict[str, object]:
+def plan_request_item(loom: Path, rq_id: str, *, thread_name: str | None = None) -> dict[str, object]:
     request_path, item = load_request_item(loom, rq_id)
     validate_request_transition(item.status, RequestStatus.PROCESSING)
 
@@ -844,7 +1665,7 @@ def plan_request_item(loom: Path, rq_id: str) -> dict[str, object]:
     created_thread_name: str | None = None
     try:
         threads = load_all_threads(loom)
-        if not threads:
+        if not threads and not thread_name:
             thread, _, _duplicates = create_thread(
                 loom,
                 name="general",
@@ -853,10 +1674,10 @@ def plan_request_item(loom: Path, rq_id: str) -> dict[str, object]:
             threads = {thread.name: thread}
             created_thread_name = thread.name
 
-        target_thread = max(threads.values(), key=lambda thread: (thread.priority, thread.name))
+        target_thread = _resolve_target_thread(item, threads, requested_thread=thread_name)
         title = derive_task_title(item)
         acceptance = "- [ ] 覆盖需求描述中的核心行为\n- [ ] 产出可供人工验收的结果"
-        task, path = create_task(
+        task_result = create_or_merge_task(
             loom,
             thread_name=target_thread.name,
             title=title,
@@ -872,13 +1693,22 @@ def plan_request_item(loom: Path, rq_id: str) -> dict[str, object]:
         append_event(loom, "request.reverted", "request", item.id, {"status": rollback_item.status.value})
         raise
 
+    task = task_result.task
+    path = task_result.path
     resolved_to = [task.id]
+    resolution = RequestResolution.TASK if task_result.created else RequestResolution.MERGED
+    resolution_note = None
+    if not task_result.created:
+        note = f"Merged into existing task {task.id} ({task_result.merge_reason or 'overlap detected'})."
+        if task_result.priority_changed:
+            note += f" Priority elevated to {task.priority}."
+        resolution_note = note
     updated_item = item.model_copy(
         update={
             "status": RequestStatus.DONE,
-            "resolved_as": RequestResolution.TASK,
+            "resolved_as": resolution,
             "resolved_to": resolved_to,
-            "resolution_note": None,
+            "resolution_note": resolution_note,
             "planned_to": None,
         }
     )
@@ -892,6 +1722,7 @@ def plan_request_item(loom: Path, rq_id: str) -> dict[str, object]:
             "resolved_as": updated_item.resolved_as.value if updated_item.resolved_as else None,
             "resolved_to": resolved_to,
             "created_thread": created_thread_name,
+            "resolution_note": resolution_note,
         },
     )
 
@@ -900,14 +1731,15 @@ def plan_request_item(loom: Path, rq_id: str) -> dict[str, object]:
         "status": updated_item.status.value,
         "resolved_as": updated_item.resolved_as.value if updated_item.resolved_as else None,
         "resolved_to": resolved_to,
+        "resolution_note": resolution_note,
         "created_thread": created_thread_name,
-        "tasks": [{"id": task.id, "file": str(path)}],
+        "tasks": [{"id": task.id, "file": str(path)}] if task_result.created else [],
     }
 
 
-def plan_inbox_item(loom: Path, rq_id: str) -> dict[str, object]:
+def plan_inbox_item(loom: Path, rq_id: str, *, thread_name: str | None = None) -> dict[str, object]:
     """Compatibility alias for request-to-task triage."""
-    return plan_request_item(loom, rq_id)
+    return plan_request_item(loom, rq_id, thread_name=thread_name)
 
 
 def derive_task_title(item: RequestItem) -> str:
@@ -939,7 +1771,7 @@ def accept_task(loom: Path, task_id: str, *, note: str = "") -> tuple[Path, Task
     return transition_task(loom, task_id, TaskStatus.DONE, review_entry=entry)
 
 
-def format_review_summary(task: Task) -> list[str]:
+def format_review_summary(task: Task, *, thread: Thread | None = None) -> list[str]:
     """Format a task for review display, emphasizing outcomes first.
 
     Order: title/status → acceptance criteria → output/results →
@@ -956,6 +1788,30 @@ def format_review_summary(task: Task) -> list[str]:
     # -- Output / results --
     if task.output:
         lines.append(f"  output: {task.output}")
+    if task.delivery is not None:
+        lines.append("  delivery:")
+        lines.append(f"    ready: {'yes' if task.delivery.ready else 'no'}")
+        if task.delivery.summary:
+            lines.append(f"    summary: {task.delivery.summary}")
+        if task.delivery.artifacts:
+            lines.append("    artifacts:")
+            lines.extend(f"      - {artifact}" for artifact in task.delivery.artifacts)
+        if task.delivery.pr_urls:
+            lines.append("    pr_urls:")
+            lines.extend(f"      - {url}" for url in task.delivery.pr_urls)
+    if thread and thread.pr_artifacts:
+        lines.append("  thread_prs:")
+        for artifact in thread.pr_artifacts:
+            pr_line = f"    - {artifact.url}"
+            if artifact.branch:
+                pr_line += f" (branch: {artifact.branch})"
+            lines.append(pr_line)
+    if thread and thread.worktrees:
+        active_worktrees = [item for item in thread.worktrees if item.removed_at is None]
+        if active_worktrees:
+            lines.append("  thread_worktrees:")
+            for item in active_worktrees:
+                lines.append(f"    - {item.name} [{item.status.value}] {item.path}")
 
     # -- Review history (append-only) --
     if task.review_history:

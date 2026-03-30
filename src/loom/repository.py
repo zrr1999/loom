@@ -7,7 +7,7 @@ from pathlib import Path
 from .config import config_path, load_settings
 from .frontmatter import read_model, read_raw
 from .ids import canonical_thread_name, split_task_id, task_filename
-from .models import AgentRecord, ManagerRecord, Message, RequestItem, Task, WorktreeRecord
+from .models import AgentRecord, ManagerRecord, Message, RequestItem, Routine, Task, WorktreeRecord
 from .runtime import resolve_root
 
 
@@ -79,6 +79,18 @@ def requests_dir(loom: Path) -> Path:
     return loom / "inbox"
 
 
+def routines_dir(loom: Path) -> Path:
+    return loom / "routines"
+
+
+def products_dir(loom: Path) -> Path:
+    return loom / "products"
+
+
+def products_reports_dir(loom: Path) -> Path:
+    return products_dir(loom) / "reports"
+
+
 def find_request_path(loom: Path, rq_id: str) -> Path:
     path = requests_dir(loom) / f"{rq_id}.md"
     if not path.exists():
@@ -102,6 +114,18 @@ def load_inbox_item(loom: Path, rq_id: str) -> tuple[Path, RequestItem]:
     return load_request_item(loom, rq_id)
 
 
+def find_routine_path(loom: Path, routine_id: str) -> Path:
+    path = routines_dir(loom) / f"{routine_id}.md"
+    if not path.exists():
+        raise FileNotFoundError(f"routine '{routine_id}' not found")
+    return path
+
+
+def load_routine(loom: Path, routine_id: str) -> tuple[Path, Routine]:
+    path = find_routine_path(loom, routine_id)
+    return path, read_model(path, Routine)
+
+
 def agents_dir(loom: Path) -> Path:
     return loom / "agents"
 
@@ -110,8 +134,20 @@ def worker_agents_dir(loom: Path) -> Path:
     return agents_dir(loom) / "workers"
 
 
-def manager_path(loom: Path) -> Path:
+def manager_dir(loom: Path) -> Path:
+    return agents_dir(loom) / "manager"
+
+
+def legacy_manager_path(loom: Path) -> Path:
     return agents_dir(loom) / "_manager.md"
+
+
+def manager_path(loom: Path) -> Path:
+    preferred = manager_dir(loom) / "_agent.md"
+    legacy = legacy_manager_path(loom)
+    if preferred.exists() or not legacy.exists():
+        return preferred
+    return legacy
 
 
 def legacy_agent_dir(loom: Path, agent_id: str) -> Path:

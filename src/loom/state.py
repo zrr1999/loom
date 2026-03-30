@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING
 
 from .models import (
     REQUEST_TRANSITIONS,
+    ROUTINE_TRANSITIONS,
     TASK_TRANSITIONS,
     RequestStatus,
+    RoutineStatus,
     TaskStatus,
 )
 
@@ -39,6 +41,13 @@ def validate_request_transition(current: RequestStatus, target: RequestStatus) -
 def validate_inbox_transition(current: RequestStatus, target: RequestStatus) -> None:
     """Backward-compatible alias for request transition validation."""
     validate_request_transition(current, target)
+
+
+def validate_routine_transition(current: RoutineStatus, target: RoutineStatus) -> None:
+    """Raise if the routine transition is not allowed."""
+    allowed = ROUTINE_TRANSITIONS.get(current, set())
+    if target not in allowed:
+        raise InvalidTransitionError("routine", current.value, target.value)
 
 
 def validate_task_scheduled(acceptance: str | None) -> None:

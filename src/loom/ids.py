@@ -97,7 +97,7 @@ def next_agent_id(agents_dir: Path) -> str:
         if workers_dir.exists():
             existing.update(entry.name for entry in workers_dir.iterdir() if entry.is_dir())
         for entry in agents_dir.iterdir():
-            if not entry.is_dir() or entry.name == "workers":
+            if not entry.is_dir() or entry.name in {"workers", "manager"}:
                 continue
             existing.add(entry.name)
     alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"

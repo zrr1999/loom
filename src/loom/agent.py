@@ -8,58 +8,73 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal, cast
 
 import typer
 
 from .agent_command_catalog import (
     manager_assign_command,
-    manager_done_command,
     manager_new_task_command,
     manager_new_thread_command,
     manager_next_command,
-    manager_pause_command,
     manager_plan_command,
     manager_propose_command,
     manager_send_command,
     manager_spawn_command,
 )
 from .config import LoomSettings, load_settings
+from .lease import is_thread_stale
 from .migration import (
+    ensure_manager_agent_subtree,
     ensure_name_based_threads,
     ensure_request_storage,
+    ensure_routine_storage,
     ensure_thread_ownership_metadata,
+    ensure_thread_worktree_metadata,
     ensure_worker_agent_subtree,
 )
-from .models import AgentRole, AgentStatus, MessageType, Task, TaskKind, WorktreeStatus
+from .models import AgentRole, AgentStatus, DeliveryContract, MessageType, Task, TaskKind, TaskStatus, WorktreeStatus
 from .repository import agent_pending_dir, load_message, load_task, require_loom, task_file_path, workspace_root
 from .runtime import global_root, is_global_mode_active, set_root
-from .scheduler import get_next_tasks, get_pending_inbox_items, get_status_summary
+from .scheduler import (
+    get_due_routines,
+    get_next_tasks,
+    get_pending_inbox_items,
+    get_ready_tasks,
+    get_status_summary,
+    load_all_threads,
+    validate_thread_worktree_references,
+)
 from .services import (
+    AmbiguousRequestRoutingError,
+    _worktree_has_dirty_git_state,
     add_worktree,
     attach_worktree,
     claim_thread,
     complete_task,
     create_message,
-    create_task,
+    create_or_merge_task,
     create_thread,
     list_pending_messages,
     load_all_worktrees,
     pause_task,
+    plan_inbox_item,
     remove_worktree,
     reply_to_message,
     resolve_actor_workspace_root,
     resolve_current_worktree,
     resume_agent,
+    resume_manager,
     spawn_agent,
     touch_agent,
     update_checkpoint,
+    update_manager_checkpoint,
 )
-from .soft_hooks import render_done_hook_lines, render_next_hook_lines
+from .soft_hooks import render_hook_phase_lines
 from .state import InvalidTransitionError
 
 app = typer.Typer(invoke_without_command=True)
-worktree_app = typer.Typer(help="Worker-local worktree commands.")
+worktree_app = typer.Typer(help="Worker worktree commands with thread-owned linkage.")
 app.add_typer(worktree_app, name="worktree")
 _SINGLETON_ACTORS = {
     AgentRole.MANAGER.value,
@@ -67,11 +82,14 @@ _SINGLETON_ACTORS = {
     AgentRole.REVIEWER.value,
 }
 _ROLE_HELP = "Run as worker, manager, director, or reviewer. Defaults to worker."
-_START_ROLE_HELP = "Show bootstrap guidance for worker, manager, director, or reviewer."
+_START_ROLE_HELP = (
+    "Show bootstrap guidance for worker, manager, director, or reviewer. Required outside a worker shell."
+)
 WorkerRoleOption = Annotated[AgentRole, typer.Option("--role", help=_ROLE_HELP)]
-StartRoleOption = Annotated[AgentRole, typer.Option("--role", help=_START_ROLE_HELP)]
+StartRoleOption = Annotated[AgentRole | None, typer.Option("--role", help=_START_ROLE_HELP)]
 GlobalModeOption = Annotated[bool, typer.Option("-g", help="Use the home-level loom directory.")]
 _WORKER_SAFE_COMMANDS = (
+    "new-task",
     "next",
     "done",
     "pause",
@@ -109,16 +127,23 @@ def _resolve_loom() -> Path:
     try:
         loom = require_loom()
         ensure_request_storage(loom)
+        ensure_routine_storage(loom)
+        ensure_manager_agent_subtree(loom)
         ensure_worker_agent_subtree(loom)
         ensure_name_based_threads(loom)
         ensure_thread_ownership_metadata(loom)
+        ensure_thread_worktree_metadata(loom)
         return loom
     except FileNotFoundError as exc:
         _emit_error(str(exc), code="loom_not_found")
         raise  # unreachable; satisfies type checker
 
 
-def _resolve_actor(*, role: AgentRole) -> str:
+def _resolve_actor(
+    *,
+    role: AgentRole,
+    missing_worker_message: str | None = None,
+) -> str:
     if role != AgentRole.WORKER:
         return role.value
 
@@ -128,16 +153,40 @@ def _resolve_actor(*, role: AgentRole) -> str:
         migration_note = ""
         if legacy_agent_id:
             migration_note = " LOOM_AGENT_ID is no longer used; rename it to LOOM_WORKER_ID."
+        message = missing_worker_message or (
+            "LOOM_WORKER_ID is required for worker commands. "
+            "Use --role manager / --role director / --role reviewer, or set LOOM_WORKER_ID."
+        )
         _emit_error(
-            (
-                "LOOM_WORKER_ID is required for worker commands. "
-                "Use --role manager / --role director / --role reviewer, or set LOOM_WORKER_ID."
-                f"{migration_note}"
-            ),
+            f"{message}{migration_note}",
             code="missing_worker_id",
         )
         raise  # unreachable
     return worker_id
+
+
+def _resolve_start_role(role: AgentRole | None) -> AgentRole:
+    if role is not None:
+        return role
+
+    worker_id = os.environ.get("LOOM_WORKER_ID", "").strip()
+    if worker_id:
+        return AgentRole.WORKER
+
+    legacy_agent_id = os.environ.get("LOOM_AGENT_ID", "").strip()
+    migration_note = ""
+    if legacy_agent_id:
+        migration_note = " LOOM_AGENT_ID is no longer used; rename it to LOOM_WORKER_ID."
+    _emit_error(
+        (
+            "loom agent start requires --role outside a worker shell. "
+            "Use --role manager / --role director / --role reviewer, or set LOOM_WORKER_ID "
+            "to use the worker bootstrap."
+            f"{migration_note}"
+        ),
+        code="start_role_required",
+    )
+    raise  # unreachable
 
 
 def _require_manager_context(command_name: str) -> None:
@@ -182,11 +231,36 @@ def _resolve_actor_for_command(command_name: str, *, role: AgentRole) -> str:
     raise  # unreachable
 
 
-def _format_worktree_line(record) -> list[str]:
+def _worktree_problem_labels(loom: Path, record) -> list[str]:
+    labels: list[str] = []
     path = Path(record.path)
-    effective_status = record.status.value
     if not path.exists():
-        effective_status = f"{effective_status} (missing path)"
+        labels.append("missing path")
+    elif _worktree_has_dirty_git_state(path):
+        labels.append("dirty")
+
+    if record.thread:
+        thread = load_all_threads(loom).get(record.thread)
+        if thread is None:
+            labels.append("missing thread")
+        else:
+            issues = validate_thread_worktree_references(loom, {record.thread: thread}).get(record.thread, [])
+            for issue in issues:
+                if f"worktree '{record.name}'" in issue:
+                    if "cross-worker-invalid" in issue:
+                        labels.append("cross-worker-invalid")
+                    elif "stale:" in issue:
+                        labels.append("stale")
+                    elif "missing its checkout path" in issue and "missing path" not in labels:
+                        labels.append("missing path")
+    return labels
+
+
+def _format_worktree_line(loom: Path, record) -> list[str]:
+    effective_status = record.status.value
+    labels = _worktree_problem_labels(loom, record)
+    if labels:
+        effective_status = f"{effective_status} ({', '.join(dict.fromkeys(labels))})"
     lines = [f"{record.name}  {effective_status}"]
     lines.append(f"  path    : {record.path}")
     lines.append(f"  branch  : {record.branch}")
@@ -195,9 +269,12 @@ def _format_worktree_line(record) -> list[str]:
     return lines
 
 
+def _settings_root_for_actor(loom: Path, actor: str) -> Path:
+    return resolve_actor_workspace_root(loom, actor if actor not in _SINGLETON_ACTORS else "")
+
+
 def _load_settings_for_actor(loom: Path, actor: str) -> LoomSettings:
-    base_dir = resolve_actor_workspace_root(loom, actor if actor not in _SINGLETON_ACTORS else "")
-    return load_settings(base_dir)
+    return load_settings(_settings_root_for_actor(loom, actor))
 
 
 def _current_worker_context_lines(loom: Path, worker_id: str) -> list[str]:
@@ -214,6 +291,9 @@ def _current_worker_context_lines(loom: Path, worker_id: str) -> list[str]:
     lines.append(f"  status        : {record.status.value}")
     if record.thread:
         lines.append(f"  thread        : {record.thread}")
+    labels = _worktree_problem_labels(loom, record)
+    if labels:
+        lines.append(f"  warnings      : {', '.join(dict.fromkeys(labels))}")
     return lines
 
 
@@ -222,13 +302,19 @@ def _current_worker_context_lines(loom: Path, worker_id: str) -> list[str]:
 def worktree_list() -> None:
     """List worktrees registered under the current worker only."""
     loom = _resolve_loom()
-    worker_id = _resolve_actor(role=AgentRole.WORKER)
+    worker_id = _resolve_actor(
+        role=AgentRole.WORKER,
+        missing_worker_message=(
+            "LOOM_WORKER_ID is required for `loom agent worktree ...` commands. "
+            "Run them from a worker shell with LOOM_WORKER_ID set."
+        ),
+    )
     records = load_all_worktrees(loom, worker_id)
     if not records:
         typer.echo("No worker-local worktrees.")
         return
     for record in records:
-        for line in _format_worktree_line(record):
+        for line in _format_worktree_line(loom, record):
             typer.echo(line)
 
 
@@ -247,7 +333,13 @@ def worktree_add(
 ) -> None:
     """Register a worker-local worktree directory."""
     loom = _resolve_loom()
-    worker_id = _resolve_actor(role=AgentRole.WORKER)
+    worker_id = _resolve_actor(
+        role=AgentRole.WORKER,
+        missing_worker_message=(
+            "LOOM_WORKER_ID is required for `loom agent worktree ...` commands. "
+            "Run them from a worker shell with LOOM_WORKER_ID set."
+        ),
+    )
     try:
         record, record_path = add_worktree(loom, worker_id, name=name, path=path, branch=branch, status=status)
     except (FileNotFoundError, ValueError) as exc:
@@ -260,7 +352,9 @@ def worktree_add(
     typer.echo(f"  branch : {record.branch}")
     typer.echo(f"  worker : {record.worker}")
     typer.echo(f"  status : {record.status.value}")
-    typer.echo("  note   : worker-local metadata only; other workers do not see this worktree.")
+    typer.echo(
+        "  note   : thread linkage/history is stored on the owning thread; this record is local discovery state."
+    )
 
 
 @worktree_app.command("attach")
@@ -273,9 +367,15 @@ def worktree_attach(
     ] = None,
     clear: bool = typer.Option(False, "--clear", help="Clear thread metadata for this worktree."),
 ) -> None:
-    """Update worker-local thread metadata for one worktree."""
+    """Link or unlink a worker-local worktree to thread-owned metadata."""
     loom = _resolve_loom()
-    worker_id = _resolve_actor(role=AgentRole.WORKER)
+    worker_id = _resolve_actor(
+        role=AgentRole.WORKER,
+        missing_worker_message=(
+            "LOOM_WORKER_ID is required for `loom agent worktree ...` commands. "
+            "Run them from a worker shell with LOOM_WORKER_ID set."
+        ),
+    )
     try:
         path, record = attach_worktree(
             loom,
@@ -296,7 +396,9 @@ def worktree_attach(
     typer.echo(f"  thread : {record.thread or '-'}")
     typer.echo(f"  status : {record.status.value}")
     if not clear:
-        typer.echo("  note   : worktree visibility is scoped to this worker agent.")
+        typer.echo(
+            "  note   : thread metadata is now authoritative; this worker-local record mirrors it for local discovery."
+        )
 
 
 @worktree_app.command("remove")
@@ -304,9 +406,15 @@ def worktree_remove(
     name: str = typer.Argument(..., help="Registered worker-local worktree name."),
     force: bool = typer.Option(False, "--force", help="Remove even if thread metadata is still attached."),
 ) -> None:
-    """Remove a worker-local worktree record without deleting the checkout directory."""
+    """Remove a worktree record and delete the worker-local checkout directory."""
     loom = _resolve_loom()
-    worker_id = _resolve_actor(role=AgentRole.WORKER)
+    worker_id = _resolve_actor(
+        role=AgentRole.WORKER,
+        missing_worker_message=(
+            "LOOM_WORKER_ID is required for `loom agent worktree ...` commands. "
+            "Run them from a worker shell with LOOM_WORKER_ID set."
+        ),
+    )
     try:
         _path, record = remove_worktree(loom, worker_id, name, force=force)
     except (FileNotFoundError, ValueError) as exc:
@@ -315,7 +423,7 @@ def worktree_remove(
 
     typer.echo(f"REMOVED worktree {record.name}")
     typer.echo(f"  path   : {record.path}")
-    typer.echo("  note   : record removed only; clean up the worker-local checkout separately when safe.")
+    typer.echo("  note   : worker-local record and checkout directory were removed; thread history is preserved.")
 
 
 def _format_executor_command(template: str, *, agent_id: str, loom_dir: Path, threads: list[str], env_path: str) -> str:
@@ -347,7 +455,8 @@ def _manager_mailbox_steps(settings: object) -> list[str]:
             (f"  3. Prefer mailbox-first delegation: {manager_propose_command()}"),
             (f"  4. Follow up with {manager_send_command()} when needed."),
             "  5. Tell the worker to run `loom agent next` in its own executor environment.",
-            "  6. Keep using `loom agent status` to monitor ready / paused / reviewing work.",
+            "  6. Re-run `loom agent next --role manager` after each assignment or queue change.",
+            "  7. Keep using `loom agent status` to monitor ready / paused / reviewing work.",
             "",
         ]
     )
@@ -378,6 +487,23 @@ def _interactive_wait_feedback_enabled() -> bool:
     stdout_isatty = getattr(sys.stdout, "isatty", None)
     stderr_isatty = getattr(sys.stderr, "isatty", None)
     return bool(callable(stdout_isatty) and stdout_isatty() and callable(stderr_isatty) and stderr_isatty())
+
+
+def _emit_with_hook_phases(
+    lines: list[str],
+    *,
+    settings: LoomSettings,
+    config_root: Path,
+    actor: str,
+    point: Literal["next", "done"],
+) -> None:
+    before = render_hook_phase_lines(
+        settings, actor, config_root=config_root, point=point, when="before", leading_blank=False
+    )
+    after = render_hook_phase_lines(
+        settings, actor, config_root=config_root, point=point, when="after", leading_blank=bool(before or lines)
+    )
+    typer.echo("\n".join([*before, *lines, *after]))
 
 
 def _emit_wait_feedback(*, attempt: int, retries: int, wait_seconds: float) -> None:
@@ -456,11 +582,12 @@ def _worker_spawn_counts(agents: object, *, offline_after_minutes: int) -> tuple
     for item in agents:
         if not isinstance(item, dict):
             continue
-        last_seen = item.get("last_seen")
+        item_map = cast("dict[str, object]", item)
+        last_seen = item_map.get("last_seen")
         last_seen_text = last_seen if isinstance(last_seen, str) else None
         if _agent_is_offline(last_seen_text, offline_after_minutes=offline_after_minutes):
             continue
-        status = item.get("status")
+        status = item_map.get("status")
         if status == AgentStatus.ACTIVE.value:
             active_count += 1
         elif status == AgentStatus.IDLE.value:
@@ -504,6 +631,47 @@ def _touch_if_agent(loom: Path, actor: str) -> None:
     touch_agent(loom, actor, status=AgentStatus.ACTIVE)
 
 
+def _pending_manager_handoffs(
+    loom: Path,
+    actor: str,
+    *,
+    thread_filter: str | None = None,
+) -> list[dict[str, str]]:
+    ready_task_ids = {task.id for task in get_ready_tasks(loom, thread_filter=thread_filter)}
+    if not ready_task_ids:
+        return []
+
+    threads = load_all_threads(loom)
+    handoffs: list[dict[str, str]] = []
+    seen_task_ids: set[str] = set()
+    for message in list_pending_messages(loom, actor):
+        if message.from_ != AgentRole.MANAGER.value or not message.ref:
+            continue
+        try:
+            _, task = load_task(loom, message.ref)
+        except FileNotFoundError:
+            continue
+        if task.id not in ready_task_ids or task.id in seen_task_ids:
+            continue
+        thread = threads.get(task.thread)
+        if thread is None:
+            continue
+        owner = thread.owner or ""
+        if not owner or owner == actor or is_thread_stale(thread):
+            continue
+        handoffs.append(
+            {
+                "message_id": message.id,
+                "task_id": task.id,
+                "thread": task.thread,
+                "title": task.title,
+                "owner": owner,
+            }
+        )
+        seen_task_ids.add(task.id)
+    return handoffs
+
+
 @app.command("new-thread", hidden=True)
 def new_thread(
     name: Annotated[str, typer.Option(help="Thread name.")] = "",
@@ -543,6 +711,9 @@ def new_task(
         typer.Option("--after", help="Sugar for --depends-on: single task ID this task comes after."),
     ] = "",
     created_from: Annotated[str, typer.Option(help="Comma-separated source inbox RQ IDs.")] = "",
+    persistent: Annotated[bool, typer.Option("--persistent", help="Keep the task scheduled after each completion.")] = (
+        False
+    ),
     background: Annotated[str, typer.Option(help="Task background section content.")] = "",
     implementation_direction: Annotated[str, typer.Option(help="Implementation direction section content.")] = "",
     role: WorkerRoleOption = AgentRole.WORKER,
@@ -557,7 +728,7 @@ def new_task(
         merged_deps = ",".join(filter(None, [depends_on, after]))
 
     try:
-        task, path = create_task(
+        result = create_or_merge_task(
             loom,
             thread_name=thread,
             title=title,
@@ -566,6 +737,7 @@ def new_task(
             acceptance=acceptance,
             depends_on=merged_deps,
             created_from=created_from,
+            persistent=persistent,
             background=background,
             implementation_direction=implementation_direction,
         )
@@ -573,13 +745,22 @@ def new_task(
         _emit_error(str(exc))
         raise  # unreachable
 
+    task = result.task
+    path = result.path
+    heading = "CREATED" if result.created else "MERGED"
     lines = [
-        f"CREATED task {task.id}",
+        f"{heading} task {task.id}",
         f"  kind   : {task.kind.value}",
         f"  status : {task.status.value}",
         f"  thread : {task.thread}",
         f"  file   : {path}",
     ]
+    if task.persistent:
+        lines.append("  persistent : true")
+    if not result.created and result.merge_reason:
+        lines.append(f"  merged  : {result.merge_reason}")
+        if result.priority_changed:
+            lines.append(f"  priority: elevated to {task.priority}")
     typer.echo("\n".join(lines))
 
 
@@ -605,7 +786,8 @@ def next_task(
     loom = _resolve_loom()
     actor = _resolve_actor_for_command("next", role=role)
     _touch_if_agent(loom, actor)
-    settings = _load_settings_for_actor(loom, actor)
+    config_root = _settings_root_for_actor(loom, actor)
+    settings = load_settings(config_root)
     effective_wait_seconds = settings.agent.next_wait_seconds if wait_seconds is None else wait_seconds
     effective_retries = settings.agent.next_retries if retries is None else retries
 
@@ -653,14 +835,17 @@ def next_task(
                 inbox_pending=0,
             )
         )
-        lines.extend(render_next_hook_lines(settings, actor))
-        typer.echo("\n".join(lines))
+        _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
         return
 
+    summary = get_status_summary(loom)
+    effective_plan_limit = plan_limit or settings.agent.inbox_plan_batch
+    auto_planned_lines: list[str] = []
     pending_inbox: list[dict[str, object]] = []
     tasks: list[Task] = []
+    due_routines = []
     for attempt in range(effective_retries + 1):
-        pending_inbox = get_pending_inbox_items(loom, limit=plan_limit or settings.agent.inbox_plan_batch)
+        pending_inbox = get_pending_inbox_items(loom, limit=effective_plan_limit)
         if pending_inbox:
             break
 
@@ -673,6 +858,11 @@ def next_task(
         if tasks:
             break
 
+        if actor == AgentRole.MANAGER.value:
+            due_routines = get_due_routines(loom, limit=task_limit or 1)
+            if due_routines:
+                break
+
         if attempt < effective_retries and effective_wait_seconds > 0:
             if _interactive_wait_feedback_enabled():
                 _emit_wait_feedback(
@@ -681,32 +871,82 @@ def next_task(
                     wait_seconds=effective_wait_seconds,
                 )
             time.sleep(effective_wait_seconds)
+        summary = get_status_summary(loom)
+
+    if pending_inbox and actor == AgentRole.MANAGER.value:
+        while pending_inbox:
+            for item in pending_inbox:
+                try:
+                    planned = plan_inbox_item(loom, cast("str", item["id"]))
+                except (FileNotFoundError, ValueError, InvalidTransitionError, AmbiguousRequestRoutingError) as exc:
+                    lines = ["ACTION  plan", f"COUNT   {len(pending_inbox)}", ""]
+                    if auto_planned_lines:
+                        lines.extend(["AUTO-PLANNED REQUESTS", *auto_planned_lines, ""])
+                    lines.extend(
+                        [
+                            "AUTO-PLANNING STOPPED",
+                            f"  failed_on : {item['id']}",
+                        ]
+                    )
+                    reason_lines = str(exc).splitlines() or [str(exc)]
+                    lines.append(f"  reason    : {reason_lines[0]}")
+                    for extra_line in reason_lines[1:]:
+                        lines.append(f"              {extra_line}")
+                    lines.extend(
+                        [
+                            "",
+                            "Manager next steps:",
+                            "  1. Resolve the routing choice for the failed request.",
+                            f"  2. Retry the specific item with {manager_plan_command()}.",
+                            "  3. If the request needs a brand-new thread first, use:",
+                            f"     {manager_new_thread_command()}",
+                            "  4. If you need to shape the first task manually, use:",
+                            f"     {manager_new_task_command()}",
+                            f"  5. Re-run `{manager_next_command()}` after the routing choice is recorded.",
+                            "",
+                        ]
+                    )
+                    _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
+                    return
+
+                resolved_to = ", ".join(cast("list[str]", planned.get("resolved_to", [])))
+                resolution = cast("str | None", planned.get("resolved_as"))
+                suffix = f" ({resolution})" if resolution else ""
+                auto_planned_lines.append(f"  {planned['rq_id']} -> {resolved_to}{suffix}")
+                created_thread = cast("str | None", planned.get("created_thread"))
+                if created_thread:
+                    auto_planned_lines.append(f"    created_thread : {created_thread}")
+
+            summary = get_status_summary(loom)
+            pending_inbox = get_pending_inbox_items(loom, limit=effective_plan_limit)
+
+        tasks = get_next_tasks(
+            loom,
+            limit=task_limit or settings.agent.task_batch,
+            thread_filter=thread or None,
+            for_agent=None,
+        )
+        if not tasks:
+            due_routines = get_due_routines(loom, limit=task_limit or 1)
 
     if pending_inbox:
         item_lines = []
         for item in pending_inbox:
             item_lines.append(f"  {item['id']}  {item.get('title', item.get('body', ''))}")
             item_lines.append(f"    file   : {item.get('file', '')}")
-        lines = [
-            "ACTION  plan",
-            f"COUNT   {len(pending_inbox)}",
-            "",
-            "These requests have not been arranged into threads/tasks yet.",
-            (
-                "Manager action is required before worker execution can continue."
-                if actor == AgentRole.MANAGER.value
-                else "Planning work is blocking normal execution until a manager clears it."
-            ),
-            "",
-            "UNPLANNED REQUESTS",
-            *item_lines,
-            "",
-        ]
+        action = (
+            "plan"
+            if actor == AgentRole.MANAGER.value
+            else "coordinate"
+            if actor == AgentRole.DIRECTOR.value
+            else "escalate"
+        )
+        lines = [f"ACTION  {action}", f"COUNT   {len(pending_inbox)}", "", "UNPLANNED REQUESTS", *item_lines, ""]
         if actor == AgentRole.MANAGER.value:
             lines.extend(
                 [
                     "Manager next steps:",
-                    "  1. Prefer planning each request directly from the manager CLI.",
+                    "  1. Turn each pending request into threads/tasks from the manager surface.",
                     f"  2. Run: {manager_plan_command()}",
                     "  3. If the request needs a brand-new thread first, use:",
                     f"     {manager_new_thread_command()}",
@@ -730,21 +970,171 @@ def next_task(
                     "",
                 ]
             )
-        lines.extend(render_next_hook_lines(settings, actor))
-        typer.echo("\n".join(lines))
+        _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
+        return
+
+    if actor == AgentRole.MANAGER.value and not tasks and due_routines:
+        routine_lines: list[str] = []
+        for routine in due_routines:
+            routine_lines.extend(
+                [
+                    f"  {routine.id}  {routine.title}",
+                    f"    status      : {routine.status.value}",
+                    f"    interval    : {routine.interval}",
+                    f"    assigned_to : {routine.assigned_to or '-'}",
+                    f"    last_run    : {routine.last_run or '-'}",
+                    f"    last_result : {routine.last_result.value if routine.last_result else '-'}",
+                ]
+            )
+
+        lines = [
+            "ACTION  trigger",
+            f"COUNT   {len(due_routines)}",
+            "",
+            *(["AUTO-PLANNED REQUESTS", *auto_planned_lines, ""] if auto_planned_lines else []),
+            "DUE ROUTINES",
+            *routine_lines,
+            "",
+            "Manager next steps:",
+            "  1. Trigger the next due routine with `loom routine run <id>`.",
+            "  2. Keep ready-task ordering intact by re-running `loom agent next --role manager` after each trigger.",
+            "",
+        ]
+        _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
         return
 
     if not tasks:
-        summary = get_status_summary(loom)
         queue = summary.get("queue", [])
         reviewing_count = sum(1 for item in queue if item.get("kind") == "reviewing")
         paused_count = sum(1 for item in queue if item.get("kind") == "paused")
         inbox_pending = summary.get("inbox_pending", 0)
-        lines = [
-            "ACTION  idle",
-            "",
-            "No ready tasks or planning actions available.",
-        ]
+        stale_owned_threads = list(summary.get("stale_owned_threads", []))
+
+        if actor == AgentRole.DIRECTOR.value:
+            worker_count = len(summary.get("agents", []))
+            if reviewing_count or paused_count:
+                lines = [
+                    "ACTION  review",
+                    "",
+                    "Human queue work is now the main bottleneck.",
+                    "",
+                    "WAITING ON",
+                ]
+                if reviewing_count:
+                    lines.append(f"  reviewing : {reviewing_count} (human must accept or reject)")
+                if paused_count:
+                    lines.append(f"  paused    : {paused_count} (human must decide)")
+                lines.extend(
+                    [
+                        "",
+                        "Director next steps:",
+                        "  1. Use `loom review` or plain `loom` to inspect the queue.",
+                        "  2. Ask the human for accept/reject/decide input immediately.",
+                        "  3. Re-run `loom agent next --role director` after each review decision.",
+                    ]
+                )
+                _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
+                return
+            if (inbox_pending or stale_owned_threads) and worker_count == 0:
+                lines = [
+                    "ACTION  bootstrap",
+                    "",
+                    "Work exists, but no worker runtime is visible yet.",
+                    "",
+                    "Director next steps:",
+                    "  1. Launch the manager, reviewer, and the needed worker runtimes now.",
+                    "  2. Prefer resuming existing worker checkpoints before creating fresh workers.",
+                    "  3. Re-run `loom agent next --role director` once the round is bootstrapped.",
+                ]
+                _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
+                return
+            if inbox_pending or stale_owned_threads:
+                lines = [
+                    "ACTION  coordinate",
+                    "",
+                    "Coordination is needed before execution can move.",
+                ]
+                if stale_owned_threads:
+                    lines.extend(["", "WAITING ON", f"  stale-owned-threads : {', '.join(stale_owned_threads)}"])
+                lines.extend(
+                    _singleton_role_idle_steps(actor, reviewing_count=0, paused_count=0, inbox_pending=inbox_pending)
+                )
+                _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
+                return
+            lines = ["ACTION  wait", "", "No immediate orchestration action is waiting."]
+            lines.extend(_singleton_role_idle_steps(actor, reviewing_count=0, paused_count=0, inbox_pending=0))
+            _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
+            return
+
+        if actor == AgentRole.MANAGER.value:
+            if paused_count or reviewing_count or stale_owned_threads:
+                lines = ["ACTION  unblock", ""]
+                if auto_planned_lines:
+                    lines.extend(["AUTO-PLANNED REQUESTS", *auto_planned_lines, ""])
+                if paused_count or reviewing_count or stale_owned_threads:
+                    lines.append("WAITING ON")
+                    if stale_owned_threads:
+                        lines.append(f"  stale-owned-threads : {', '.join(stale_owned_threads)}")
+                    if reviewing_count:
+                        lines.append(f"  reviewing           : {reviewing_count}")
+                    if paused_count:
+                        lines.append(f"  paused              : {paused_count}")
+                    lines.append("")
+                lines.extend(
+                    _manager_unblock_steps(
+                        paused_count=paused_count,
+                        reviewing_count=reviewing_count,
+                        stale_threads=stale_owned_threads,
+                    )
+                )
+                _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
+                return
+            lines = ["ACTION  wait", ""]
+            if auto_planned_lines:
+                lines.extend(["AUTO-PLANNED REQUESTS", *auto_planned_lines, ""])
+            lines.append("No planning, assignment, or unblock action is ready.")
+            lines.extend(
+                [
+                    "Manager next steps:",
+                    "  1. Monitor `loom agent status` and mailbox traffic.",
+                    "  2. Re-run `loom agent next --role manager` after state changes.",
+                    "",
+                ]
+            )
+            _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
+            return
+
+        pending_handoffs = _pending_manager_handoffs(loom, actor, thread_filter=thread or None)
+        if pending_handoffs:
+            handoff_lines: list[str] = []
+            for handoff in pending_handoffs:
+                handoff_lines.extend(
+                    [
+                        f"  {handoff['task_id']}  {handoff['title']}",
+                        f"    thread : {handoff['thread']}",
+                        f"    owner  : {handoff['owner']}",
+                        f"    msg    : {handoff['message_id']}",
+                    ]
+                )
+            lines = [
+                "ACTION  escalate",
+                "",
+                "A manager handoff is waiting on explicit thread assignment before this worker can claim it.",
+                "",
+                "PENDING HANDOFFS",
+                *handoff_lines,
+                "",
+                "Worker next steps:",
+                "  1. Read the handoff details with `loom agent mailbox` / `loom agent mailbox-read <msg-id>`.",
+                "  2. Ask the manager to assign or reassign the thread explicitly.",
+                f"     Manager command: {manager_assign_command()}",
+                "  3. After the assignment lands, run `loom agent next` again (optionally with `--thread <name>`).",
+            ]
+            _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
+            return
+
+        worker_action = "escalate" if (reviewing_count or paused_count or inbox_pending) else "wait"
+        lines = [f"ACTION  {worker_action}", "", "No ready task is available for this worker right now."]
         if reviewing_count or paused_count or inbox_pending:
             lines.append("")
             lines.append("WAITING ON")
@@ -754,34 +1144,14 @@ def next_task(
                 lines.append(f"  paused    : {paused_count} (human must decide)")
             if inbox_pending:
                 lines.append(f"  inbox     : {inbox_pending} pending items")
-        if actor in _SINGLETON_ACTORS:
-            lines.extend(
-                _singleton_role_idle_steps(
-                    actor,
-                    reviewing_count=reviewing_count,
-                    paused_count=paused_count,
-                    inbox_pending=inbox_pending,
-                )
-            )
-            lines.extend(render_next_hook_lines(settings, actor))
-            typer.echo("\n".join(lines))
-            return
-
         lines.extend(
-            [
-                "",
-                "Worker next steps:",
-                "  1. Check `loom agent mailbox` for pending manager handoffs.",
-                "  2. If you want more work, proactively ask to claim a thread or task.",
-                "     Example: `loom agent ask manager 'Can I take thread <thread> or task <task-id>?'`",
-                (
-                    "  3. If you already know the work, propose the handoff yourself with "
-                    "`loom agent propose manager '<thread/task handoff>' --ref <thread-or-task-id>`."
-                ),
-            ]
+            _worker_wait_or_escalate_steps(
+                reviewing_count=reviewing_count,
+                paused_count=paused_count,
+                inbox_pending=inbox_pending,
+            )
         )
-        lines.extend(render_next_hook_lines(settings, actor))
-        typer.echo("\n".join(lines))
+        _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
         return
 
     if actor in _SINGLETON_ACTORS:
@@ -789,11 +1159,17 @@ def next_task(
         for task in tasks:
             task_lines.extend(_format_task_block(loom, task))
 
+        action = "assign" if actor == AgentRole.MANAGER.value else "wake"
         lines = [
-            "ACTION  task",
+            f"ACTION  {action}",
             f"COUNT   {len(tasks)}",
             f"ACTOR   {actor}",
             "",
+            *(
+                ["AUTO-PLANNED REQUESTS", *auto_planned_lines, ""]
+                if actor == AgentRole.MANAGER.value and auto_planned_lines
+                else []
+            ),
             "READY TASKS",
             *task_lines,
             *(
@@ -802,12 +1178,13 @@ def next_task(
                 else _singleton_role_next_steps(actor)
             ),
         ]
-        lines.extend(render_next_hook_lines(settings, actor))
-        typer.echo("\n".join(lines))
+        _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
         return
 
     # Claim thread(s) for the tasks about to be dispatched.
     claimed_threads: set[str] = set()
+    owned_threads = summary.get("owned_threads", {})
+    already_owned_threads = {task.thread for task in tasks if owned_threads.get(task.thread, {}).get("owner") == actor}
     for task in tasks:
         if task.thread not in claimed_threads:
             claim_thread(loom, task.thread, agent_id=actor)
@@ -818,8 +1195,9 @@ def next_task(
         task_lines.extend(_format_task_block(loom, task))
 
     thread_text = ", ".join(sorted(claimed_threads))
+    action = "execute" if claimed_threads and claimed_threads.issubset(already_owned_threads) else "pickup"
     lines = [
-        "ACTION  task",
+        f"ACTION  {action}",
         f"COUNT   {len(tasks)}",
         f"ACTOR   {actor}",
         f"THREAD  {thread_text}",
@@ -827,13 +1205,12 @@ def next_task(
         "ASSIGNED TASKS",
         *task_lines,
         "When finished with each task:",
-        "  loom agent done <task-id> [--output <path-or-url>]",
+        "  loom agent done <task-id> [--output <.loom/products/...|url>]",
         "",
         "If blocked and need a decision:",
         "  loom agent pause <task-id> --question '<question>'",
     ]
-    lines.extend(render_next_hook_lines(settings, actor))
-    typer.echo("\n".join(lines))
+    _emit_with_hook_phases(lines, settings=settings, config_root=config_root, actor=actor, point="next")
 
 
 def _render_manager_bootstrap(loom: Path) -> list[str]:
@@ -858,10 +1235,9 @@ def _render_manager_bootstrap(loom: Path) -> list[str]:
         "LOOM AGENT BOOTSTRAP",
         "====================",
         "",
-        "DO THIS NOW",
-        "  You are the manager bootstrap process.",
-        "  Immediately enter the main loop below and keep repeating it until work is exhausted.",
-        "  Do not stop after reading this guide.",
+        "ROLE",
+        "  You are the Manager.",
+        "  Turn pending requests into threads/tasks, assign ready threads to workers, and unblock the flow.",
         "",
         "IDENTITY",
         "  role           : manager",
@@ -870,41 +1246,33 @@ def _render_manager_bootstrap(loom: Path) -> list[str]:
         *state_summary,
         "",
         "MAIN LOOP",
-        "  Repeat this loop immediately:",
+        "  1. Run: loom agent next --role manager",
+        "  2. Complete the single action it returns.",
+        "  3. Re-run `loom agent next --role manager` after each state change.",
         "",
-        "    STEP 1 — fetch the next action",
-        f"      Run: {manager_next_command()}",
+        "MANAGER ACTIONS",
+        "  ACTION  plan",
+        "    Auto-planning stopped because Loom needs an explicit manager routing choice.",
+        f"    Use {manager_plan_command()}, {manager_new_thread_command()}, and {manager_new_task_command()}.",
         "",
-        "      If output starts with ACTION  plan:",
-        "        Arrange the listed human requirements into threads/tasks with:",
-        f"          {manager_new_thread_command()}",
-        f"          {manager_new_task_command()}",
-        f"        Then run {manager_next_command()} again.",
+        "  ACTION  assign",
+        "    Ready work exists; wake workers, assign the thread, and hand off context mailbox-first.",
+        f"    Use {manager_assign_command()}, {manager_propose_command()}, and {manager_send_command()}.",
         "",
-        "      If output starts with ACTION  task:",
-        "        Execute every task returned from the claimed thread(s).",
-        f"        Finish each completed task with `{manager_done_command()}`.",
-        f"        If blocked on a human decision, use `{manager_pause_command()}`.",
-        f"        After handling all returned tasks, run {manager_next_command()} again.",
+        "  ACTION  unblock",
+        "    Clear stale ownership or route paused/reviewing blockers to the right human flow.",
         "",
-        "      If output starts with ACTION  idle:",
-        "        No executable work is ready right now.",
-        "        Inspect the waiting-on section, then wait or exit.",
+        "  ACTION  wait",
+        "    No immediate manager action is ready; monitor status and loop again later.",
         "",
         "ESSENTIAL COMMANDS",
         "",
         f"  {manager_next_command()}",
-        "    Fetch planning work or the next ready task batch.",
+        "    Fetch the next planning / assignment / unblock step.",
         f"    Planning batch : {settings.agent.inbox_plan_batch} inbox items",
         f"    Task batch     : {settings.agent.task_batch} tasks",
         f"    Idle wait      : {settings.agent.next_wait_seconds}s between retries",
         f"    Idle retries   : {settings.agent.next_retries}",
-        "",
-        f"  {manager_done_command()}",
-        "    Mark a finished task as reviewing, or pause it if incomplete markers remain.",
-        "",
-        f"  {manager_pause_command()}",
-        "    Release the claim and ask the human for a decision.",
         "",
         *_manager_launch_guidance(settings),
         "  Mailbox-first delegation once a worker exists",
@@ -938,9 +1306,9 @@ def _render_worker_bootstrap(loom: Path) -> list[str]:
         "LOOM WORKER BOOTSTRAP",
         "=====================",
         "",
-        "DO THIS NOW",
-        "  Work under one concrete `LOOM_WORKER_ID` and keep changes task-scoped.",
-        "  Use only worker-safe `loom agent` commands from this process.",
+        "ROLE",
+        "  You are the Worker.",
+        "  Pick up assigned work, execute it inside your thread/worktree, and escalate blockers fast.",
         "",
         "IDENTITY",
         "  role           : worker",
@@ -953,17 +1321,25 @@ def _render_worker_bootstrap(loom: Path) -> list[str]:
         "",
         "WORKER LOOP",
         "  1. Run: loom agent next",
-        "  2. Read pending manager handoffs: loom agent mailbox / loom agent mailbox-read <msg-id>",
-        (
-            "  3. Implement the assigned task inside your claimed thread "
-            "or ask for clarification with loom agent ask / propose / reply"
-        ),
-        "  4. Finish with loom agent done <task-id> [--output <path-or-url>]",
-        "  5. If blocked on a decision, use loom agent pause <task-id> --question '<question>'",
+        "  2. Follow the single action it returns.",
+        "  3. Re-run `loom agent next` after each state change or manager handoff.",
+        "",
+        "WORKER ACTIONS",
+        "  ACTION  pickup",
+        "    A new task batch has been assigned to this worker; read the task block and start implementation.",
+        "",
+        "  ACTION  execute",
+        "    Continue work already assigned to this worker and finish with `loom agent done` or `loom agent pause`.",
+        "",
+        "  ACTION  escalate",
+        "    A manager/human-side dependency is blocking execution; escalate immediately with mailbox commands.",
+        "",
+        "  ACTION  wait",
+        "    No task is ready for this worker right now; monitor mailbox and loop later.",
         "",
         "WORKER-SAFE COMMANDS",
         "  loom agent next",
-        "  loom agent done <task-id> [--output <path-or-url>]",
+        "  loom agent done <task-id> [--output <.loom/products/...|url>]",
         "  loom agent pause <task-id> --question '<question>'",
         "  loom agent checkpoint '<summary>'",
         "  loom agent resume",
@@ -978,6 +1354,8 @@ def _render_worker_bootstrap(loom: Path) -> list[str]:
         "NOTES",
         "  - `loom agent send` requires a singleton role override.",
         "  - Canonical manager planning commands now live under `loom manage`.",
+        f"  - Mailbox handoffs become claimable after manager assignment/reassignment: {manager_assign_command()}.",
+        "    Once assigned, re-run `loom agent next` to claim the task batch.",
         "  - `loom spawn` is a director/human top-level worker launch entrypoint; workers should not call it.",
     ]
     if paused_count or reviewing_count:
@@ -1053,12 +1431,10 @@ def _singleton_role_next_steps(actor: str) -> list[str]:
     if actor == AgentRole.DIRECTOR.value:
         return [
             "Director next steps:",
-            "  1. Decide which role should act next on the ready work.",
-            "  2. Launch or wake the manager with `loom manage` when planning,",
-            "     assignment, or mailbox coordination is needed.",
-            "  3. Launch or wake workers via `loom spawn` when execution should start now.",
-            "  4. Launch reviewer work with `loom review` when human review or queue triage is needed.",
-            "  5. After each orchestration step or state change, run",
+            "  1. Decide whether to wake workers, coordinate the manager, or route the queue to review.",
+            "  2. Use `loom spawn` to wake execution, `loom manage` to coordinate planning/assignment,",
+            "     and `loom review` when human review or decisions are the bottleneck.",
+            "  3. After each orchestration step or state change, run",
             "     `loom agent next --role director` again.",
             "",
         ]
@@ -1082,8 +1458,8 @@ def _singleton_role_plan_steps(actor: str) -> list[str]:
     if actor == AgentRole.DIRECTOR.value:
         return [
             "Director next steps:",
-            "  1. Pending requests need planning now; start or wake the manager with `loom manage`.",
-            "  2. Let the manager arrange the listed requests into threads/tasks.",
+            "  1. Pending requests need coordination now; wake the manager with `loom manage`.",
+            "  2. Let the manager arrange the listed requests into threads/tasks and ownership handoffs.",
             "  3. After planning lands, run `loom agent next --role director` again.",
             "",
         ]
@@ -1117,7 +1493,7 @@ def _singleton_role_idle_steps(
         lines = ["", "Director next steps:"]
         step = 1
         if inbox_pending:
-            lines.append(f"  {step}. Pending requests exist; start or wake the manager with `loom manage`.")
+            lines.append(f"  {step}. Pending requests exist; coordinate the manager with `loom manage`.")
             step += 1
         if reviewing_count or paused_count:
             lines.append(f"  {step}. Human/reviewer queue work exists; inspect with `loom review` or plain `loom`.")
@@ -1130,6 +1506,54 @@ def _singleton_role_idle_steps(
         return lines
 
     return []
+
+
+def _worker_wait_or_escalate_steps(*, reviewing_count: int, paused_count: int, inbox_pending: int) -> list[str]:
+    lines = ["", "Worker next steps:"]
+    if inbox_pending:
+        lines.append("  1. Planning is still pending; escalate to the manager or director immediately.")
+        lines.append(
+            "  2. Use `loom agent ask manager 'Please clear pending request planning.'` or "
+            "`loom agent propose manager '<planning handoff>' --ref <rq-id>`."
+        )
+        lines.append("  3. After planning clears, run `loom agent next` again.")
+        return lines
+    if paused_count or reviewing_count:
+        lines.append("  1. No executable task is ready for this worker right now.")
+        lines.append("  2. A human-side queue is blocking progress; surface concrete context to the manager if needed.")
+        lines.append("  3. Re-run `loom agent next` after the queue changes or a new assignment arrives.")
+        return lines
+    lines.append("  1. Check `loom agent mailbox` for pending manager handoffs.")
+    lines.append("  2. If you want more work, proactively ask to claim a thread or task.")
+    lines.append("     Example: `loom agent ask manager 'Can I take thread <thread> or task <task-id>?'`")
+    lines.append(
+        "  3. If you already know the work, propose the handoff yourself with "
+        "`loom agent propose manager '<thread/task handoff>' --ref <thread-or-task-id>`."
+    )
+    return lines
+
+
+def _manager_unblock_steps(*, paused_count: int, reviewing_count: int, stale_threads: list[str]) -> list[str]:
+    lines = ["Manager next steps:"]
+    step = 1
+    if stale_threads:
+        lines.append(
+            "  "
+            f"{step}. Reassign or refresh stale owned threads: {', '.join(stale_threads)} "
+            f"via {manager_assign_command()}."
+        )
+        step += 1
+    if paused_count:
+        lines.append(
+            f"  {step}. A paused task needs a human decision; coordinate through `loom review` or plain `loom`."
+        )
+        step += 1
+    if reviewing_count:
+        lines.append(f"  {step}. Review work is waiting; alert the reviewer/human to clear `loom review`.")
+        step += 1
+    lines.append(f"  {step}. Re-run `loom agent next --role manager` after the blocker changes.")
+    lines.append("")
+    return lines
 
 
 def _render_director_bootstrap(loom: Path) -> list[str]:
@@ -1187,31 +1611,49 @@ def _render_director_bootstrap(loom: Path) -> list[str]:
         "  3. After each orchestration step or state change, run",
         "     `loom agent next --role director` again.",
         "",
-        "DIRECTOR NEXT",
-        "  `loom agent next --role director` points to the most important orchestration step right now,",
-        "  but it does not replace the manager, reviewer, or worker roles.",
+        "DIRECTOR ACTIONS",
+        "  ACTION  bootstrap",
+        "    Bring up the round: one manager, one reviewer, and the needed workers.",
+        "",
+        "  ACTION  wake",
+        "    Execution is ready; wake the right worker set or start `loom spawn` from the director surface.",
+        "",
+        "  ACTION  coordinate",
+        "    Planning, assignment, or stale ownership needs manager-side coordination.",
+        "",
+        "  ACTION  review",
+        "    Human/reviewer queue work is now the bottleneck; move it through `loom review` or plain `loom`.",
+        "",
+        "  ACTION  wait",
+        "    No immediate orchestration action is waiting; keep monitoring state.",
         "",
         "GUARDRAILS",
         "  - Do not silently collapse into manager, reviewer, or worker behavior.",
         "  - Keep orchestration explicit and preserve `.loom/` as the only runtime source of truth.",
+        "  - Read agent state, but do not create or own a director AgentStatus lifecycle.",
+        (
+            "  - Workers update their own AgentStatus via `loom agent checkpoint`; "
+            "manager tracking stays on `agents/manager/_agent.md`."
+        ),
     ]
     return lines
 
 
 @app.command("start")
 def start(
-    role: StartRoleOption = AgentRole.MANAGER,
+    role: StartRoleOption = None,
 ) -> None:
     """Print bootstrap guidance for the requested role."""
     loom = _resolve_loom()
-    if role == AgentRole.MANAGER:
+    resolved_role = _resolve_start_role(role)
+    if resolved_role == AgentRole.MANAGER:
         _require_manager_context("start")
         typer.echo("\n".join(_render_manager_bootstrap(loom)))
         return
-    if role == AgentRole.WORKER:
+    if resolved_role == AgentRole.WORKER:
         typer.echo("\n".join(_render_worker_bootstrap(loom)))
         return
-    if role == AgentRole.REVIEWER:
+    if resolved_role == AgentRole.REVIEWER:
         typer.echo("\n".join(_render_reviewer_bootstrap(loom)))
         return
     typer.echo("\n".join(_render_director_bootstrap(loom)))
@@ -1220,35 +1662,100 @@ def start(
 @app.command("done")
 def done(
     task_id: str = typer.Argument(..., help="Task ID to mark done."),
-    output: Annotated[str, typer.Option("--output", help="Output path or link.")] = "",
+    output: Annotated[
+        str,
+        typer.Option(
+            "--output",
+            help=(
+                "Output path or link. Relative local paths are stored under .loom/products/; "
+                "legacy worker outputs are rewritten into .loom/products/reports/."
+            ),
+        ),
+    ] = "",
+    ready: Annotated[
+        bool,
+        typer.Option(
+            "--ready",
+            "--review-ready",
+            help="Declare the task explicitly ready for review, bypassing TODO/proposal heuristics.",
+        ),
+    ] = False,
+    summary: Annotated[
+        str,
+        typer.Option(
+            "--summary",
+            help="Short delivery summary recorded in the task delivery contract.",
+        ),
+    ] = "",
+    pr_url: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--pr-url",
+            "--pr",
+            help="GitHub PR URL to record as a delivery artifact (repeatable).",
+        ),
+    ] = None,
+    artifact: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--artifact",
+            help=(
+                "Structured delivery artifact reference. Repeatable; relative local paths "
+                "are normalized under .loom/products/."
+            ),
+        ),
+    ] = None,
     role: WorkerRoleOption = AgentRole.WORKER,
 ) -> None:
     """Mark a task as reviewing when it is ready for human review."""
     loom = _resolve_loom()
     actor = _resolve_actor_for_command("done", role=role)
     _touch_if_agent(loom, actor)
-    settings = _load_settings_for_actor(loom, actor)
-
-    before_hook_lines = render_done_hook_lines(settings, actor, when="before", leading_blank=False)
+    config_root = _settings_root_for_actor(loom, actor)
+    settings = load_settings(config_root)
+    before_hook_lines = render_hook_phase_lines(
+        settings, actor, config_root=config_root, point="done", when="before", leading_blank=False
+    )
     if before_hook_lines:
         typer.echo("\n".join(before_hook_lines))
 
+    pr_list = pr_url or []
+    artifact_list = artifact or []
+    delivery: DeliveryContract | None = None
+    if ready or pr_list or artifact_list or summary:
+        delivery = DeliveryContract(
+            ready=ready,
+            summary=summary or None,
+            pr_urls=pr_list,
+            artifacts=artifact_list,
+        )
+
     try:
-        _, task, blockers = complete_task(loom, task_id, output=output or None)
+        _, task, blockers = complete_task(loom, task_id, output=output or None, delivery=delivery)
     except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
         _emit_error(str(exc))
         raise  # unreachable
 
     lines = [f"DONE task {task.id}", f"  status : {task.status.value}"]
-    if output:
-        lines.append(f"  output : {output}")
+    if task.output:
+        lines.append(f"  output : {task.output}")
+    if task.delivery is not None:
+        if task.delivery.summary:
+            lines.append(f"  delivery_summary: {task.delivery.summary}")
+        if task.delivery.artifacts:
+            lines.append(f"  artifacts : {', '.join(task.delivery.artifacts)}")
+        if task.delivery.pr_urls:
+            lines.append(f"  pr_urls : {', '.join(task.delivery.pr_urls)}")
     if blockers:
         lines.append(f"  blocked: {', '.join(blockers)}")
         lines.append("  Waiting for human decision. Run: loom")
+    elif task.persistent and task.status == TaskStatus.SCHEDULED:
+        lines.append("  persistent : remains scheduled for future sessions")
+        lines.append("  No human review was queued.")
     else:
         lines.append("  Waiting for human review. Run: loom review")
-    lines.extend(render_done_hook_lines(settings, actor, when="after"))
-    typer.echo("\n".join(lines))
+    after_hook_lines = render_hook_phase_lines(settings, actor, config_root=config_root, point="done", when="after")
+    typer.echo("\n".join([*lines, *after_hook_lines]))
 
 
 @app.command("pause")
@@ -1296,6 +1803,7 @@ def agent_status() -> None:
     queue = summary.get("queue", [])
     ready_ids = tasks.get("ready_ids", [])
     capabilities = summary.get("capabilities", [])
+    worktree_issues = summary.get("worktree_issues", {})
 
     ready_task_map = {task.id: task for task in get_next_tasks(loom, limit=max(len(ready_ids), 50))}
 
@@ -1334,16 +1842,10 @@ def agent_status() -> None:
             summary_val = agent.get("checkpoint_summary", "")
             last_seen = agent.get("last_seen")
             age_text = _format_minutes_ago(last_seen)
-            is_offline = False
-            if isinstance(last_seen, str):
-                try:
-                    parsed = datetime.fromisoformat(last_seen)
-                    if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=UTC)
-                    age_minutes = max(int((datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds() // 60), 0)
-                    is_offline = age_minutes >= settings.agent.offline_after_minutes
-                except ValueError:
-                    is_offline = False
+            is_offline = isinstance(last_seen, str) and _agent_is_offline(
+                last_seen,
+                offline_after_minutes=settings.agent.offline_after_minutes,
+            )
 
             line = f"  {agent_id:<12} {status_val}  last_seen:{age_text}"
             if summary_val:
@@ -1370,6 +1872,13 @@ def agent_status() -> None:
     if worker_id:
         lines += ["", "CURRENT WORKER CONTEXT", *_current_worker_context_lines(loom, worker_id)]
 
+    if worktree_issues:
+        lines += ["", "WORKTREE ISSUES"]
+        for thread_name, issues in sorted(worktree_issues.items()):
+            lines.append(f"  {thread_name}")
+            for issue in issues:
+                lines.append(f"    - {issue}")
+
     if queue:
         lines += ["", "QUEUE (needs attention)"]
         for item in queue:
@@ -1388,6 +1897,12 @@ def agent_status() -> None:
             follow_up = capability.get("implementation_follow_up")
             if isinstance(follow_up, dict):
                 lines.append(f"    implementation follow-up: {follow_up.get('id')} [{follow_up.get('status')}]")
+            latest_pr = capability.get("latest_pr")
+            if isinstance(latest_pr, dict):
+                pr_line = f"    latest pr: {latest_pr.get('url')}"
+                if latest_pr.get("branch"):
+                    pr_line += f" [{latest_pr.get('branch')}]"
+                lines.append(pr_line)
 
     typer.echo("\n".join(lines))
 
@@ -1517,6 +2032,12 @@ def checkpoint(
     """Update the current agent checkpoint."""
     loom = _resolve_loom()
     actor = _resolve_actor_for_command("checkpoint", role=role)
+    if actor == AgentRole.MANAGER.value:
+        record = update_manager_checkpoint(loom, phase=phase, summary=summary)
+        typer.echo(
+            f"CHECKPOINT recorded\n  agent : {actor}\n  phase : {phase}\n  summary : {record.checkpoint_summary}"
+        )
+        return
     if actor in _SINGLETON_ACTORS:
         _emit_error(f"{actor} checkpoint updates are not implemented via this command.", code="not_supported")
     record = update_checkpoint(loom, actor, phase=phase, summary=summary)
@@ -1530,6 +2051,10 @@ def resume(role: WorkerRoleOption = AgentRole.WORKER) -> None:
     """Show the current agent checkpoint body."""
     loom = _resolve_loom()
     actor = _resolve_actor_for_command("resume", role=role)
+    if actor == AgentRole.MANAGER.value:
+        record = resume_manager(loom)
+        typer.echo(f"CHECKPOINT body for {actor}\n\n{record.body}")
+        return
     if actor in _SINGLETON_ACTORS:
         _emit_error(f"{actor} resume is not implemented via this command.", code="not_supported")
     record = resume_agent(loom, actor)

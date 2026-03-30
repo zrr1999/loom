@@ -12,8 +12,8 @@ def _write_spawn_config(path: Path, *, active_limit: int, idle_limit: int) -> No
             "[agent]\n"
             "inbox_plan_batch = 10\n"
             "task_batch = 1\n"
-            "next_wait_seconds = 0.0\n"
-            "next_retries = 0\n"
+            "next_wait_seconds = 60.0\n"
+            "next_retries = 5\n"
             'executor_command = ""\n'
             "offline_after_minutes = 30\n"
             f"spawn_limit_active_workers = {active_limit}\n"
@@ -27,7 +27,7 @@ def _write_spawn_config(path: Path, *, active_limit: int, idle_limit: int) -> No
 
 def test_spawn_rejects_when_idle_worker_limit_is_reached(runner, isolated_project):
     assert runner.invoke(app, ["init"]).exit_code == 0
-    _write_spawn_config(isolated_project / "loom.toml", active_limit=8, idle_limit=1)
+    _write_spawn_config(isolated_project / "loom.toml", active_limit=4, idle_limit=1)
 
     first = runner.invoke(app, ["spawn"])
     assert first.exit_code == 0, first.output

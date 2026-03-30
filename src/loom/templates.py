@@ -31,5 +31,12 @@ def task_body(background: str = "", implementation_direction: str = "") -> str:
     return f"## 背景\n\n{background_text}\n\n## 实现方向\n\n{implementation_text}"
 
 
+def routine_body(responsibilities: str = "") -> str:
+    responsibilities_text = responsibilities.strip()
+    if not responsibilities_text:
+        responsibilities_text = "- describe the recurring work"
+    return f"## Responsibilities\n\n{responsibilities_text}\n\n## Run Log\n\n<!-- append-only notes -->"
+
+
 def agent_body() -> str:
     return "## Checkpoint\n\n未记录。\n\n## Notes\n\n"

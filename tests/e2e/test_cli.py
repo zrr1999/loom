@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import yaml
 
 from loom.cli import app
-from loom.models import AgentRole, Task, TaskKind, TaskStatus
+from loom.models import AgentRole, Decision, Task, TaskKind, TaskStatus
 
 
 def _create_assigned_task(runner) -> str:
@@ -118,6 +120,109 @@ def _read_frontmatter(path) -> dict[str, object]:
     return yaml.safe_load("\n".join(lines[1:end])) or {}
 
 
+def _read_markdown_body(path) -> str:
+    text = path.read_text(encoding="utf-8")
+    parts = text.split("---", 2)
+    assert len(parts) == 3
+    return parts[2].lstrip("\n")
+
+
+def _read_task(path) -> Task:
+    return Task.model_validate(_read_frontmatter(path) | {"body": _read_markdown_body(path)})
+
+
+def _extract_created_name(output: str, expected_kind: str) -> str:
+    first_line = output.splitlines()[0]
+    parts = first_line.split()
+    assert parts[:2] == ["CREATED", expected_kind]
+    return parts[-1]
+
+
+def _extract_done_task_id(output: str) -> str:
+    first_line = output.splitlines()[0]
+    parts = first_line.split()
+    assert parts[:2] == ["DONE", "task"]
+    return parts[-1]
+
+
+def _extract_action(output: str) -> str:
+    for line in output.splitlines():
+        if line.startswith("ACTION"):
+            return line.split()[-1]
+    raise AssertionError(f"missing ACTION line in output: {output!r}")
+
+
+def _parse_cli_fields(output: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in output.splitlines()[1:]:
+        if not line.startswith("  "):
+            continue
+        stripped = line.strip()
+        if ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def _parse_task_blocks(output: str) -> list[dict[str, str]]:
+    blocks: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("TASK "):
+            if current is not None:
+                blocks.append(current)
+            current = {"id": stripped.split()[-1]}
+            continue
+        if current is None or not line.startswith("    "):
+            continue
+        if ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        current[key.strip()] = value.strip()
+    if current is not None:
+        blocks.append(current)
+    return blocks
+
+
+def _write_hook_config(project, loom_config: str, hook_registry: str) -> None:
+    (project / "loom.toml").write_text(loom_config, encoding="utf-8")
+    (project / "loom-hooks.toml").write_text(hook_registry, encoding="utf-8")
+
+
+def _write_routine(
+    project,
+    *,
+    routine_id: str,
+    title: str,
+    status: str = "active",
+    interval: str = "6h",
+    assigned_to: str | None = "worker-123",
+    last_run: str | None = None,
+    last_result: str | None = None,
+    run_log: str = "<!-- append-only notes -->",
+) -> None:
+    metadata_lines = [
+        "---",
+        f"id: {routine_id}",
+        f"title: {title}",
+        f"status: {status}",
+        f"interval: {interval}",
+    ]
+    if assigned_to is None:
+        metadata_lines.append("assigned_to: null")
+    else:
+        metadata_lines.append(f"assigned_to: {assigned_to}")
+    metadata_lines.append(f"last_run: '{last_run}'" if last_run is not None else "last_run: null")
+    metadata_lines.append(f"last_result: {last_result}" if last_result is not None else "last_result: null")
+    metadata_lines.append("---")
+    body = f"## Responsibilities\n\n- inspect issues and PRs\n\n## Run Log\n\n{run_log}\n"
+    routines_dir = project / ".loom" / "routines"
+    routines_dir.mkdir(parents=True, exist_ok=True)
+    (routines_dir / f"{routine_id}.md").write_text("\n".join(metadata_lines) + "\n\n" + body, encoding="utf-8")
+
+
 def test_init_creates_default_structure(runner, isolated_project):
     result = runner.invoke(app, ["init", "--project", "demo"])
 
@@ -127,25 +232,27 @@ def test_init_creates_default_structure(runner, isolated_project):
     assert (loom_dir / "inbox").is_dir()
     assert (loom_dir / "threads").is_dir()
     assert not (loom_dir / "worktrees").exists()
-    assert (loom_dir / "agents" / "_manager.md").exists()
+    assert (loom_dir / "agents" / "manager" / "_agent.md").exists()
     assert (loom_dir / "agents" / "workers").is_dir()
+    assert (isolated_project / "loom-hooks.toml").exists()
     config = (isolated_project / "loom.toml").read_text(encoding="utf-8")
+    hook_registry = (isolated_project / "loom-hooks.toml").read_text(encoding="utf-8")
     assert 'name = "demo"' in config
     assert "inbox_plan_batch = 10" in config
     assert "task_batch = 1" in config
-    assert "next_wait_seconds = 0.0" in config
-    assert "next_retries = 0" in config
+    assert "next_wait_seconds = 60.0" in config
+    assert "next_retries = 5" in config
     assert 'executor_command = ""' in config
     assert "offline_after_minutes = 30" in config
     assert "spawn_limit_active_workers = 8" in config
     assert "spawn_limit_idle_workers = 2" in config
-    assert "[hooks.next]" in config
-    assert '# examples = ["commit-message-policy"]' in config
-    assert "[hooks.done.before]" in config
-    assert "Before `loom agent done`, refresh your checkpoint and re-scan the diff." in config
-    assert '# examples = ["worker-done-review"]' in config
-    assert "[hooks.done.after]" in config
-    assert "After `loom agent done`, make sure the review handoff names tests, output, and blockers." in config
+    assert "# [[hooks]]" in config
+    assert '# builtin = "commit-message-policy"' in config
+    assert '# builtin = "worker-done-review"' in config
+    assert '# points = ["done"]' in config
+    assert "Hook definitions live in `loom-hooks.toml`." in config
+    assert "# Repo-local Loom hook definitions." in hook_registry
+    assert '# points = ["next"]' in hook_registry
 
 
 def test_init_is_idempotent_and_preserves_existing_config(runner, isolated_project):
@@ -178,9 +285,10 @@ def test_happy_path_lifecycle_and_status_summary(runner, isolated_project):
         app, ["agent", "new-thread", "--name", "backend", "--priority", "90", "--role", "manager"], env=env
     )
     assert thread_result.exit_code == 0, thread_result.output
-    assert "CREATED thread backend" in thread_result.output
-    assert "priority : 90" in thread_result.output
-    assert "id       :" not in thread_result.output
+    assert _extract_created_name(thread_result.output, "thread") == "backend"
+    thread_fields = _parse_cli_fields(thread_result.output)
+    assert thread_fields["priority"] == "90"
+    assert "id" not in thread_fields
 
     task_result = runner.invoke(
         app,
@@ -201,47 +309,89 @@ def test_happy_path_lifecycle_and_status_summary(runner, isolated_project):
         env=env,
     )
     assert task_result.exit_code == 0, task_result.output
-    assert "CREATED task" in task_result.output
-    assert "status : scheduled" in task_result.output
-    # extract task_id from output: "CREATED task backend-001"
-    task_id = task_result.output.splitlines()[0].split()[-1]
+    task_id = _extract_created_name(task_result.output, "task")
+    task_fields = _parse_cli_fields(task_result.output)
+    assert task_fields["status"] == "scheduled"
     assert task_id == "backend-001"
 
     task_file = isolated_project / ".loom" / "threads" / "backend" / "001.md"
-    task_content = task_file.read_text(encoding="utf-8")
-    assert "id: backend-001" in task_content
-    assert "status: scheduled" in task_content
-    assert "created_from:" in task_content
-    assert "- RQ-001" in task_content
-    assert "## 背景" in task_content
-    assert "## 实现方向" in task_content
-    assert "补充任务背景。" not in task_content
-    assert "补充实现方向。" not in task_content
+    task = _read_task(task_file)
+    assert task.id == "backend-001"
+    assert task.status == TaskStatus.SCHEDULED
+    assert task.created_from == ["RQ-001", "RQ-002"]
+    assert "## 背景" in task.body
+    assert "## 实现方向" in task.body
+    assert "补充任务背景。" not in task.body
+    assert "补充实现方向。" not in task.body
 
     next_result = runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=env)
     assert next_result.exit_code == 0, next_result.output
-    assert "ACTION  task" in next_result.output
-    assert task_id in next_result.output
-    assert "none:" not in next_result.output
+    assert _extract_action(next_result.output) == "pickup"
+    assigned_tasks = _parse_task_blocks(next_result.output)
+    assert [block["id"] for block in assigned_tasks] == [task_id]
+    assert all("none:" not in value for block in assigned_tasks for value in block.values())
 
     done_result = runner.invoke(app, ["agent", "done", task_id, "--output", "./output/demo"], env=env)
     assert done_result.exit_code == 0, done_result.output
-    assert f"DONE task {task_id}" in done_result.output
-    assert "reviewing" in done_result.output
+    assert _extract_done_task_id(done_result.output) == task_id
+    done_fields = _parse_cli_fields(done_result.output)
+    assert done_fields["status"] == "reviewing"
 
     review_result = runner.invoke(app, ["review"])
     assert review_result.exit_code == 0, review_result.output
     assert task_id in review_result.output
-    assert "output: ./output/demo" in review_result.output
+    assert ".loom/products/output/demo" in review_result.output
     assert "loom review accept <id>" in review_result.output
 
     accept_result = runner.invoke(app, ["review", "accept", task_id])
     assert accept_result.exit_code == 0, accept_result.output
+    assert _read_task(task_file).status == TaskStatus.DONE
 
     status_result = runner.invoke(app, ["agent", "status"])
     assert status_result.exit_code == 0, status_result.output
     assert "PROJECT STATUS" in status_result.output
-    assert "done" in status_result.output
+    assert "backend" in status_result.output
+    assert task_id in status_result.output
+
+
+def test_agent_done_rewrites_legacy_worker_output_paths_into_products_reports(runner, isolated_project):
+    assert runner.invoke(app, ["init", "--project", "demo"]).exit_code == 0
+    env = {"LOOM_WORKER_ID": "x7k2"}
+
+    assert runner.invoke(app, ["agent", "new-thread", "--name", "backend", "--role", "manager"]).exit_code == 0
+
+    task_result = runner.invoke(
+        app,
+        [
+            "agent",
+            "new-task",
+            "--thread",
+            "backend",
+            "--title",
+            "Ship product report handoff",
+            "--acceptance",
+            "- [ ] output path normalized",
+            "--role",
+            "manager",
+        ],
+    )
+    assert task_result.exit_code == 0, task_result.output
+    task_id = task_result.output.splitlines()[0].split()[-1]
+
+    claim_result = runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=env)
+    assert claim_result.exit_code == 0, claim_result.output
+    assert task_id in claim_result.output
+
+    done_result = runner.invoke(
+        app,
+        ["agent", "done", task_id, "--output", ".loom/agents/workers/x7k2/outputs/backend-001.md"],
+        env=env,
+    )
+    assert done_result.exit_code == 0, done_result.output
+    assert "output : .loom/products/reports/backend-001.md" in done_result.output
+
+    task_meta = _read_frontmatter(isolated_project / ".loom" / "threads" / "backend" / "001.md")
+    assert task_meta["output"] == ".loom/products/reports/backend-001.md"
 
 
 def test_status_and_review_show_design_only_capability_lines(runner, isolated_project):
@@ -287,12 +437,19 @@ def test_status_and_review_show_design_only_capability_lines(runner, isolated_pr
         ],
     )
     assert implementation_result.exit_code == 0, implementation_result.output
-    implementation_task_id = implementation_result.output.splitlines()[0].split()[-1]
+    implementation_task_id = _extract_created_name(implementation_result.output, "task")
 
     claim_result = runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=env)
     assert claim_result.exit_code == 0, claim_result.output
-    assert design_task_id in claim_result.output
-    assert "kind       : design" in claim_result.output
+    assert _extract_action(claim_result.output) == "pickup"
+    assigned_tasks = _parse_task_blocks(claim_result.output)
+    assert len(assigned_tasks) == 1
+    assert assigned_tasks[0]["id"] == design_task_id
+    assert assigned_tasks[0]["title"] == "Design auth flow"
+    assert assigned_tasks[0]["kind"] == "design"
+    assert assigned_tasks[0]["thread"] == "backend"
+    assert assigned_tasks[0]["status"] == "scheduled"
+    assert assigned_tasks[0]["file"] == str(isolated_project / ".loom" / "threads" / "backend" / "001.md")
 
     done_result = runner.invoke(app, ["agent", "done", design_task_id, "--output", "design/auth-flow.md"], env=env)
     assert done_result.exit_code == 0, done_result.output
@@ -308,21 +465,23 @@ def test_status_and_review_show_design_only_capability_lines(runner, isolated_pr
     status_result = runner.invoke(app, ["status"])
     assert status_result.exit_code == 0, status_result.output
     assert "Capabilities:" in status_result.output
-    assert "backend: design-only" in status_result.output
-    assert f"latest {design_task_id} [design done]" in status_result.output
-    assert f"implementation follow-up: {implementation_task_id} [scheduled]" in status_result.output
+    assert "backend" in status_result.output
+    assert "design-only" in status_result.output
+    assert design_task_id in status_result.output
+    assert "[design done]" in status_result.output
+    assert implementation_task_id in status_result.output
+    assert "[scheduled]" in status_result.output
 
     agent_status_result = runner.invoke(app, ["agent", "status"])
     assert agent_status_result.exit_code == 0, agent_status_result.output
     assert "CAPABILITIES" in agent_status_result.output
     assert "design-only" in agent_status_result.output
-    assert f"latest:{design_task_id} [design done]" in agent_status_result.output
-    assert f"implementation follow-up: {implementation_task_id} [scheduled]" in agent_status_result.output
+    assert design_task_id in agent_status_result.output
+    assert "[design done]" in agent_status_result.output
+    assert implementation_task_id in agent_status_result.output
+    assert "[scheduled]" in agent_status_result.output
 
-    metadata = yaml.safe_load(
-        (isolated_project / ".loom" / "threads" / "backend" / "001.md").read_text(encoding="utf-8").split("---", 2)[1]
-    )
-    task = Task.model_validate(metadata | {"body": ""})
+    task = _read_task(isolated_project / ".loom" / "threads" / "backend" / "001.md")
     assert task.kind == TaskKind.DESIGN
 
 
@@ -332,10 +491,14 @@ def test_agent_worktree_commands_require_worker_id(runner, isolated_project):
     result = runner.invoke(app, ["agent", "worktree", "list"])
     assert result.exit_code == 1
     assert "ERROR [missing_worker_id]" in result.output
+    assert "LOOM_WORKER_ID is required for `loom agent worktree ...` commands." in result.output
+    assert "Run them from a worker shell with LOOM_WORKER_ID set." in result.output
+    assert "--role manager / --role director / --role reviewer" not in result.output
 
 
 def test_agent_worktree_cli_flow_is_worker_local(runner, isolated_project):
     assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["agent", "new-thread", "--name", "worktree-flow", "--role", "manager"]).exit_code == 0
 
     env = {"LOOM_WORKER_ID": "aaap"}
     other_env = {"LOOM_WORKER_ID": "aaar"}
@@ -397,14 +560,55 @@ def test_agent_worktree_cli_flow_is_worker_local(runner, isolated_project):
     remove_result = runner.invoke(app, ["agent", "worktree", "remove", "feature-a"], env=env)
     assert remove_result.exit_code == 0, remove_result.output
     assert "REMOVED worktree feature-a" in remove_result.output
-    assert "record removed only" in remove_result.output
+    assert "thread history is preserved" in remove_result.output
+    assert not checkout.exists()
+
+    thread_meta = yaml.safe_load(
+        (isolated_project / ".loom" / "threads" / "worktree-flow" / "_thread.md")
+        .read_text(encoding="utf-8")
+        .split("---", 2)[1]
+    )
+    assert thread_meta["worktrees"][0]["name"] == "feature-a"
+    assert thread_meta["worktrees"][0]["removed_at"]
 
     legacy_surface = runner.invoke(app, ["worktree", "list"])
     assert legacy_surface.exit_code != 0
 
 
+def test_agent_worktree_add_rejects_overlapping_paths(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    env = {"LOOM_WORKER_ID": "aaap"}
+    assert (
+        runner.invoke(
+            app,
+            ["agent", "worktree", "add", "feature-a", "--branch", "feat/worktree-a"],
+            env=env,
+        ).exit_code
+        == 0
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "worktree",
+            "add",
+            "feature-a-nested",
+            "--path",
+            "feature-a/nested",
+            "--branch",
+            "feat/worktree-a-nested",
+        ],
+        env=env,
+    )
+    assert result.exit_code == 1
+    assert "nested or overlapping worktree paths are not allowed" in result.output
+
+
 def test_worker_secondary_checkout_surfaces_worktree_context(runner, isolated_project, monkeypatch):
     assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["agent", "new-thread", "--name", "worktree-flow", "--role", "manager"]).exit_code == 0
 
     env = {"LOOM_WORKER_ID": "aaap", "LOOM_DIR": str(isolated_project / ".loom")}
     checkout = isolated_project / ".loom" / "agents" / "workers" / "aaap" / "worktrees" / "feature-a"
@@ -442,6 +646,104 @@ def test_worker_secondary_checkout_surfaces_worktree_context(runner, isolated_pr
     assert "worktree      : feature-a" in status_result.output
 
 
+def test_worker_can_complete_task_from_secondary_checkout(runner, isolated_project, monkeypatch):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["agent", "new-thread", "--name", "worktree-flow", "--role", "manager"]).exit_code == 0
+
+    task_result = runner.invoke(
+        app,
+        [
+            "agent",
+            "new-task",
+            "--thread",
+            "worktree-flow",
+            "--title",
+            "Finish from checkout",
+            "--acceptance",
+            "- [ ] reviewed",
+            "--role",
+            "manager",
+        ],
+    )
+    assert task_result.exit_code == 0, task_result.output
+    task_id = task_result.output.splitlines()[0].split()[-1]
+
+    env = {"LOOM_WORKER_ID": "aaap", "LOOM_DIR": str(isolated_project / ".loom")}
+    checkout = isolated_project / ".loom" / "agents" / "workers" / "aaap" / "worktrees" / "feature-a"
+
+    add_result = runner.invoke(
+        app,
+        ["agent", "worktree", "add", "feature-a", "--branch", "feat/worktree-a"],
+        env={"LOOM_WORKER_ID": "aaap"},
+    )
+    assert add_result.exit_code == 0, add_result.output
+    attach_result = runner.invoke(
+        app,
+        ["agent", "worktree", "attach", "feature-a", "--thread", "worktree-flow"],
+        env={"LOOM_WORKER_ID": "aaap"},
+    )
+    assert attach_result.exit_code == 0, attach_result.output
+
+    monkeypatch.chdir(checkout)
+
+    done_result = runner.invoke(
+        app,
+        ["agent", "done", task_id, "--output", "https://github.com/acme/loom/pull/42"],
+        env=env,
+    )
+    assert done_result.exit_code == 0, done_result.output
+    assert f"DONE task {task_id}" in done_result.output
+    assert "Waiting for human review" in done_result.output
+
+    task_meta = _read_frontmatter(isolated_project / ".loom" / "threads" / "worktree-flow" / "001.md")
+    assert task_meta["status"] == TaskStatus.REVIEWING.value
+
+    thread_meta = _read_frontmatter(isolated_project / ".loom" / "threads" / "worktree-flow" / "_thread.md")
+    pr_artifacts = cast("list[dict[str, object]]", thread_meta["pr_artifacts"])
+    assert pr_artifacts[0]["url"] == "https://github.com/acme/loom/pull/42"
+    assert pr_artifacts[0]["worker"] == "aaap"
+    assert pr_artifacts[0]["worktree"] == "feature-a"
+    assert pr_artifacts[0]["branch"] == "feat/worktree-a"
+
+
+def test_agent_status_and_worktree_list_surface_invalid_references(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["agent", "new-thread", "--name", "worktree-flow", "--role", "manager"]).exit_code == 0
+
+    env = {"LOOM_WORKER_ID": "aaap"}
+    checkout = isolated_project / ".loom" / "agents" / "workers" / "aaap" / "worktrees" / "feature-a"
+
+    add_result = runner.invoke(
+        app,
+        ["agent", "worktree", "add", "feature-a", "--branch", "feat/worktree-a"],
+        env=env,
+    )
+    assert add_result.exit_code == 0, add_result.output
+    attach_result = runner.invoke(
+        app,
+        ["agent", "worktree", "attach", "feature-a", "--thread", "worktree-flow"],
+        env=env,
+    )
+    assert attach_result.exit_code == 0, attach_result.output
+
+    checkout.rmdir()
+
+    list_result = runner.invoke(app, ["agent", "worktree", "list"], env=env)
+    assert list_result.exit_code == 0, list_result.output
+    assert "feature-a  active (missing path)" in list_result.output
+
+    status_result = runner.invoke(app, ["agent", "status"], env=env)
+    assert status_result.exit_code == 0, status_result.output
+    assert "WORKTREE ISSUES" in status_result.output
+    assert "feature-a" in status_result.output
+    assert "missing its checkout path" in status_result.output
+
+    loom_status_result = runner.invoke(app, ["status"])
+    assert loom_status_result.exit_code == 0, loom_status_result.output
+    assert "Worktree issues:" in loom_status_result.output
+    assert "feature-a" in loom_status_result.output
+
+
 def test_agent_next_uses_secondary_checkout_config_for_worker_hooks(runner, isolated_project, monkeypatch):
     assert runner.invoke(app, ["init"]).exit_code == 0
 
@@ -457,21 +759,36 @@ def test_agent_next_uses_secondary_checkout_config_for_worker_hooks(runner, isol
 
     primary_config = isolated_project / "loom.toml"
     updated_primary = primary_config.read_text(encoding="utf-8").replace(
-        '# worker = "Run tests before `loom agent done`."\n',
-        'worker = "primary worker hook"\n',
+        '# [[hooks]]\n# builtin = "commit-message-policy"\n# points = ["next"]',
+        '[[hooks]]\nid = "secondary-worker"\npoints = ["next"]',
     )
     primary_config.write_text(updated_primary, encoding="utf-8")
-    (checkout / "loom.toml").write_text(
-        updated_primary.replace("primary worker hook", "secondary worker hook"),
+    (isolated_project / "loom-hooks.toml").write_text(
+        (
+            "[hooks.secondary-worker]\n"
+            'points = ["next"]\n\n'
+            "[hooks.secondary-worker.before]\n"
+            'worker = "primary worker hook"\n'
+        ),
+        encoding="utf-8",
+    )
+    (checkout / "loom.toml").write_text(updated_primary, encoding="utf-8")
+    (checkout / "loom-hooks.toml").write_text(
+        (
+            "[hooks.secondary-worker]\n"
+            'points = ["next"]\n\n'
+            "[hooks.secondary-worker.before]\n"
+            'worker = "secondary worker hook"\n'
+        ),
         encoding="utf-8",
     )
 
     monkeypatch.chdir(checkout)
 
-    result = runner.invoke(app, ["agent", "next"], env=env)
+    result = runner.invoke(app, ["agent", "next", "--wait-seconds", "0", "--retries", "0"], env=env)
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  idle" in result.output
+    assert "ACTION  wait" in result.output
     assert "secondary worker hook" in result.output
     assert "primary worker hook" not in result.output
 
@@ -510,21 +827,94 @@ def test_agent_done_pauses_incomplete_work_with_decision_request(runner, isolate
         env=env,
     )
     assert done_result.exit_code == 0, done_result.output
-    assert f"DONE task {task_id}" in done_result.output
-    assert "paused" in done_result.output
-    assert "blocked: TODOs, proposal-only output" in done_result.output
+    assert _extract_done_task_id(done_result.output) == task_id
+    done_fields = _parse_cli_fields(done_result.output)
+    assert done_fields["status"] == "paused"
+    assert done_fields["blocked"] == "TODOs, proposal-only output"
     assert "Waiting for human decision" in done_result.output
 
     review_result = runner.invoke(app, ["review"])
     assert review_result.exit_code == 0, review_result.output
     assert "No tasks in reviewing status." in review_result.output
 
+    task = _read_task(isolated_project / ".loom" / "threads" / "backend" / "001.md")
+    assert task.status == TaskStatus.PAUSED
+    assert task.output == "proposal-only summary\nTODO: finish tests"
+    assert task.decision is not None
+    assert isinstance(task.decision, Decision)
+    assert task.decision.question == (
+        "This task still looks incomplete (TODOs, proposal-only output). "
+        "Should it return to scheduled for more work before review?"
+    )
+    assert [option.id for option in task.decision.options] == ["resume", "split"]
+
+
+def test_agent_done_ready_contract_overrides_legacy_blockers(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    env = {"LOOM_WORKER_ID": "x7k2"}
+    assert runner.invoke(app, ["agent", "new-thread", "--name", "backend", "--role", "manager"], env=env).exit_code == 0
+
+    task_result = runner.invoke(
+        app,
+        [
+            "agent",
+            "new-task",
+            "--thread",
+            "backend",
+            "--title",
+            "Explicit handoff",
+            "--acceptance",
+            "- [ ] ready",
+            "--role",
+            "manager",
+        ],
+        env=env,
+    )
+    assert task_result.exit_code == 0, task_result.output
+    task_id = task_result.output.splitlines()[0].split()[-1]
+
+    claim_result = runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=env)
+    assert claim_result.exit_code == 0, claim_result.output
+    assert task_id in claim_result.output
+
+    done_result = runner.invoke(
+        app,
+        [
+            "agent",
+            "done",
+            task_id,
+            "--output",
+            "proposal-only summary\nTODO: finish tests",
+            "--ready",
+            "--artifact",
+            "reports/review.txt",
+            "--pr-url",
+            "https://github.com/acme/loom/pull/42",
+        ],
+        env=env,
+    )
+    assert done_result.exit_code == 0, done_result.output
+    assert f"DONE task {task_id}" in done_result.output
+    assert "status : reviewing" in done_result.output
+    assert "blocked:" not in done_result.output
+    assert "artifacts : .loom/products/reports/review.txt" in done_result.output
+    assert "pr_urls : https://github.com/acme/loom/pull/42" in done_result.output
+    assert "Waiting for human review" in done_result.output
+
     task_content = (isolated_project / ".loom" / "threads" / "backend" / "001.md").read_text(encoding="utf-8")
-    assert "status: paused" in task_content
-    assert "output: 'proposal-only summary" in task_content
-    assert "This task still looks incomplete (TODOs, proposal-only output)." in task_content
-    assert "id: resume" in task_content
-    assert "id: split" in task_content
+    assert "status: reviewing" in task_content
+    assert "ready: true" in task_content
+    assert ".loom/products/reports/review.txt" in task_content
+    assert "https://github.com/acme/loom/pull/42" in task_content
+    thread_meta = _read_frontmatter(isolated_project / ".loom" / "threads" / "backend" / "_thread.md")
+    pr_artifacts = cast("list[dict[str, object]]", thread_meta["pr_artifacts"])
+    assert pr_artifacts[0]["url"] == "https://github.com/acme/loom/pull/42"
+
+    review_result = runner.invoke(app, ["review"])
+    assert review_result.exit_code == 0, review_result.output
+    assert "delivery:" in review_result.output
+    assert "ready: yes" in review_result.output
+    assert ".loom/products/reports/review.txt" in review_result.output
 
 
 def test_pause_decide_and_queue_listing(runner, isolated_project):
@@ -620,10 +1010,10 @@ def test_next_returns_plan_action_when_inbox_pending(runner, isolated_project):
     result = runner.invoke(app, ["agent", "next"], env=env)
     assert result.exit_code == 0, result.output
 
-    assert "ACTION  plan" in result.output
+    assert "ACTION  escalate" in result.output
     assert "RQ-001" in result.output
     assert "Worker next steps:" in result.output
-    assert "notify the manager or director immediately" in result.output
+    assert "Planning work is blocking execution; notify the manager or director immediately." in result.output
     assert "After planning clears, run `loom agent next` again." in result.output
     assert "none:" not in result.output
 
@@ -654,7 +1044,7 @@ def test_next_returns_plan_action_when_inbox_pending(runner, isolated_project):
         ),
         (
             "reviewer",
-            ["agent", "next", "--plan-limit", "0", "--role", "reviewer"],
+            ["agent", "next", "--plan-limit", "0", "--wait-seconds", "0", "--retries", "0", "--role", "reviewer"],
             None,
             "Reviewer reminder: compare the diff against each acceptance checkbox.",
         ),
@@ -662,27 +1052,41 @@ def test_next_returns_plan_action_when_inbox_pending(runner, isolated_project):
 )
 def test_next_appends_role_specific_soft_hooks(runner, isolated_project, role, args, env, expected):
     assert runner.invoke(app, ["init", "--project", "demo"]).exit_code == 0
-    (isolated_project / "loom.toml").write_text(
+    _write_hook_config(
+        isolated_project,
         (
             '[project]\nname = "demo"\n\n'
             "[agent]\n"
             "inbox_plan_batch = 10\n"
             "task_batch = 1\n"
-            "next_wait_seconds = 0.0\n"
-            "next_retries = 0\n"
+            "next_wait_seconds = 60.0\n"
+            "next_retries = 5\n"
             'executor_command = ""\n'
             "offline_after_minutes = 30\n\n"
             "[threads]\n"
             "default_priority = 50\n\n"
-            "[hooks.next]\n"
+            "[[hooks]]\n"
+            'id = "reminders"\n'
+            'points = ["next"]\n\n'
+            "[[hooks]]\n"
+            'id = "follow-up"\n'
+            'points = ["next"]\n\n'
+            "[[hooks]]\n"
+            'builtin = "commit-message-policy"\n'
+            'points = ["next"]\n'
+        ),
+        (
+            '[hooks.reminders]\npoints = ["next"]\n\n'
+            "[hooks.reminders.before]\n"
             'all = "Shared reminder: soft hooks stay advisory."\n'
             'manager = "Manager reminder: keep handoffs mailbox-first."\n'
             'worker = "Worker reminder: run the focused test slice before `loom agent done`."\n'
             'director = "Director reminder: wake only the roles needed for the next step."\n'
-            'reviewer = "Reviewer reminder: compare the diff against each acceptance checkbox."\n'
-            'examples = ["commit-message-policy"]\n'
+            'reviewer = "Reviewer reminder: compare the diff against each acceptance checkbox."\n\n'
+            '[hooks.follow-up]\npoints = ["next"]\n\n'
+            "[hooks.follow-up.after]\n"
+            'all = "Follow-up reminder: keep the next handoff crisp."\n'
         ),
-        encoding="utf-8",
     )
     assert runner.invoke(app, ["agent", "new-thread", "--name", "backend", "--role", "manager"]).exit_code == 0
     task_result = runner.invoke(
@@ -707,98 +1111,124 @@ def test_next_appends_role_specific_soft_hooks(runner, isolated_project, role, a
     assert result.exit_code == 0, result.output
     if role == "reviewer":
         assert "ACTION  idle" in result.output
+    elif role == "director":
+        assert "ACTION  wake" in result.output
+    elif role == "manager":
+        assert "ACTION  assign" in result.output
     else:
-        assert "ACTION  task" in result.output
-    assert "SOFT HOOKS" in result.output
+        assert "ACTION  pickup" in result.output
+    assert "SOFT HOOKS  next/before" in result.output
+    assert "SOFT HOOKS  next/after" in result.output
     assert "Shared reminder: soft hooks stay advisory." in result.output
+    assert "Follow-up reminder: keep the next handoff crisp." in result.output
     assert expected in result.output
+    assert result.output.index("SOFT HOOKS  next/before") < result.output.index("ACTION")
+    assert result.output.index("ACTION") < result.output.index("SOFT HOOKS  next/after")
     if role == "worker":
-        assert "Built-in example: commit-message-policy" in result.output
+        assert "Built-in hook: commit-message-policy" in result.output
         assert "commit-msg hook format" in result.output
     else:
-        assert "Built-in example: commit-message-policy" not in result.output
+        assert "Built-in hook: commit-message-policy" not in result.output
 
 
 def test_next_appends_soft_hooks_to_plan_output(runner, isolated_project):
     assert runner.invoke(app, ["init", "--project", "demo"]).exit_code == 0
-    (isolated_project / "loom.toml").write_text(
+    _write_hook_config(
+        isolated_project,
         (
             '[project]\nname = "demo"\n\n'
             "[agent]\n"
             "inbox_plan_batch = 10\n"
             "task_batch = 1\n"
-            "next_wait_seconds = 0.0\n"
-            "next_retries = 0\n"
+            "next_wait_seconds = 60.0\n"
+            "next_retries = 5\n"
             'executor_command = ""\n'
             "offline_after_minutes = 30\n\n"
             "[threads]\n"
             "default_priority = 50\n\n"
-            "[hooks.next]\n"
+            "[[hooks]]\n"
+            'id = "planning"\n'
+            'points = ["next"]\n'
+        ),
+        (
+            "[hooks.planning]\n"
+            'points = ["next"]\n\n'
+            "[hooks.planning.before]\n"
             'worker = "Escalate the planning blocker immediately."\n'
         ),
-        encoding="utf-8",
     )
     assert runner.invoke(app, ["inbox", "add", "Need planning"]).exit_code == 0
 
     result = runner.invoke(app, ["agent", "next"], env={"LOOM_WORKER_ID": "planner1"})
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  plan" in result.output
-    assert "SOFT HOOKS" in result.output
+    assert "ACTION  escalate" in result.output
+    assert "SOFT HOOKS  next/before" in result.output
     assert "Escalate the planning blocker immediately." in result.output
 
 
 def test_next_appends_soft_hooks_to_idle_output(runner, isolated_project):
     assert runner.invoke(app, ["init", "--project", "demo"]).exit_code == 0
-    (isolated_project / "loom.toml").write_text(
+    _write_hook_config(
+        isolated_project,
         (
             '[project]\nname = "demo"\n\n'
             "[agent]\n"
             "inbox_plan_batch = 10\n"
             "task_batch = 1\n"
-            "next_wait_seconds = 0.0\n"
-            "next_retries = 0\n"
+            "next_wait_seconds = 60.0\n"
+            "next_retries = 5\n"
             'executor_command = ""\n'
             "offline_after_minutes = 30\n\n"
             "[threads]\n"
             "default_priority = 50\n\n"
-            "[hooks.next]\n"
+            "[[hooks]]\n"
+            'id = "idle"\n'
+            'points = ["next"]\n'
+        ),
+        (
+            "[hooks.idle]\n"
+            'points = ["next"]\n\n'
+            "[hooks.idle.before]\n"
             'director = "Idle reminder: re-check queue state before waking more workers."\n'
         ),
-        encoding="utf-8",
     )
 
-    result = runner.invoke(app, ["agent", "next", "--role", "director"])
+    result = runner.invoke(app, ["agent", "next", "--wait-seconds", "0", "--retries", "0", "--role", "director"])
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  idle" in result.output
-    assert "SOFT HOOKS" in result.output
+    assert "ACTION  wait" in result.output
+    assert "SOFT HOOKS  next/before" in result.output
     assert "Idle reminder: re-check queue state before waking more workers." in result.output
 
 
 def test_done_appends_soft_hooks_before_and_after_result(runner, isolated_project):
     assert runner.invoke(app, ["init", "--project", "demo"]).exit_code == 0
-    (isolated_project / "loom.toml").write_text(
+    _write_hook_config(
+        isolated_project,
         (
             '[project]\nname = "demo"\n\n'
             "[agent]\n"
             "inbox_plan_batch = 10\n"
             "task_batch = 1\n"
-            "next_wait_seconds = 0.0\n"
-            "next_retries = 0\n"
+            "next_wait_seconds = 60.0\n"
+            "next_retries = 5\n"
             'executor_command = ""\n'
             "offline_after_minutes = 30\n\n"
             "[threads]\n"
             "default_priority = 50\n\n"
-            "[hooks.next]\n"
-            'all = "Shared reminder: soft hooks stay advisory."\n\n'
-            "[hooks.done.before]\n"
+            "[[hooks]]\n"
+            'id = "review-pass"\n'
+            'points = ["done"]\n'
+        ),
+        (
+            '[hooks.review-pass]\npoints = ["done"]\n\n'
+            "[hooks.review-pass.before]\n"
             'all = "Before done: treat this as an advisory checklist, not a gate."\n'
             'worker = "Before done: refresh your checkpoint and re-scan the diff for surprises."\n\n'
-            "[hooks.done.after]\n"
+            "[hooks.review-pass.after]\n"
             'worker = "After done: double-check that the handoff names the output, tests, and any blocker state."\n'
         ),
-        encoding="utf-8",
     )
     task_id = _create_assigned_task(runner)
 
@@ -817,23 +1247,24 @@ def test_done_appends_soft_hooks_before_and_after_result(runner, isolated_projec
 
 def test_done_appends_built_in_worker_done_review_example(runner, isolated_project):
     assert runner.invoke(app, ["init", "--project", "demo"]).exit_code == 0
-    (isolated_project / "loom.toml").write_text(
+    _write_hook_config(
+        isolated_project,
         (
             '[project]\nname = "demo"\n\n'
             "[agent]\n"
             "inbox_plan_batch = 10\n"
             "task_batch = 1\n"
-            "next_wait_seconds = 0.0\n"
-            "next_retries = 0\n"
+            "next_wait_seconds = 60.0\n"
+            "next_retries = 5\n"
             'executor_command = ""\n'
             "offline_after_minutes = 30\n\n"
             "[threads]\n"
             "default_priority = 50\n\n"
-            "[hooks.next]\n\n"
-            "[hooks.done.before]\n"
-            'examples = ["worker-done-review"]\n'
+            "[[hooks]]\n"
+            'builtin = "worker-done-review"\n'
+            'points = ["done"]\n'
         ),
-        encoding="utf-8",
+        "# Repo-local Loom hook definitions.\n",
     )
     task_id = _create_assigned_task(runner)
 
@@ -842,12 +1273,54 @@ def test_done_appends_built_in_worker_done_review_example(runner, isolated_proje
     assert result.exit_code == 0, result.output
     assert "SOFT HOOKS  done/before" in result.output
     assert "Advisory only; these reminders do not block execution." in result.output
-    assert "Built-in example: worker-done-review" in result.output
+    assert "Built-in hook: worker-done-review" in result.output
     assert "Inspect the diff before finishing." in result.output
     assert "Did this change grow the code? If so, does that growth earn its keep?" in result.output
     assert "Can you simplify the result further without losing value?" in result.output
     assert "Refresh your checkpoint summary and confirm the focused tests/validations you ran." in result.output
     assert f"DONE task {task_id}" in result.output
+
+
+def test_done_runs_before_in_order_and_after_in_reverse_order(runner, isolated_project):
+    assert runner.invoke(app, ["init", "--project", "demo"]).exit_code == 0
+    _write_hook_config(
+        isolated_project,
+        (
+            '[project]\nname = "demo"\n\n'
+            "[agent]\n"
+            "inbox_plan_batch = 10\n"
+            "task_batch = 1\n"
+            "next_wait_seconds = 60.0\n"
+            "next_retries = 5\n"
+            'executor_command = ""\n'
+            "offline_after_minutes = 30\n\n"
+            "[threads]\n"
+            "default_priority = 50\n\n"
+            "[[hooks]]\n"
+            'id = "first"\n'
+            'points = ["done"]\n\n'
+            "[[hooks]]\n"
+            'id = "second"\n'
+            'points = ["done"]\n'
+        ),
+        (
+            '[hooks.first]\npoints = ["done"]\n\n'
+            '[hooks.first.before]\nworker = "Before first"\n\n'
+            '[hooks.first.after]\nworker = "After first"\n\n'
+            '[hooks.second]\npoints = ["done"]\n\n'
+            '[hooks.second.before]\nworker = "Before second"\n\n'
+            '[hooks.second.after]\nworker = "After second"\n'
+        ),
+    )
+    task_id = _create_assigned_task(runner)
+
+    result = runner.invoke(app, ["agent", "done", task_id], env={"LOOM_WORKER_ID": "x7k2"})
+
+    assert result.exit_code == 0, result.output
+    assert result.output.index("Before first") < result.output.index("Before second")
+    assert result.output.index("Before second") < result.output.index(f"DONE task {task_id}")
+    assert result.output.index(f"DONE task {task_id}") < result.output.index("After second")
+    assert result.output.index("After second") < result.output.index("After first")
 
 
 def test_done_omits_soft_hooks_when_unconfigured(runner, isolated_project):
@@ -1357,6 +1830,69 @@ def test_request_list_shows_resolution_visibility(runner, isolated_project):
     assert "Out of scope for this repo." in result.output
 
 
+def test_routine_commands_and_status_show_due_summary(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    _write_routine(
+        isolated_project,
+        routine_id="scan-github-issues",
+        title="Scan GitHub issues and PRs",
+        interval="6h",
+        assigned_to="worker-123",
+    )
+    _write_routine(
+        isolated_project,
+        routine_id="review-reminder",
+        title="Remind humans about stale reviews",
+        status="paused",
+        interval="1d",
+        assigned_to="worker-456",
+    )
+
+    list_result = runner.invoke(app, ["routine", "ls"])
+
+    assert list_result.exit_code == 0, list_result.output
+    assert "scan-github-issues  active" in list_result.output
+    assert "due           : now" in list_result.output
+    assert "last_result   : -" in list_result.output
+
+    pause_result = runner.invoke(app, ["routine", "pause", "scan-github-issues"])
+    assert pause_result.exit_code == 0, pause_result.output
+    assert "PAUSED routine scan-github-issues" in pause_result.output
+
+    resume_result = runner.invoke(app, ["routine", "resume", "scan-github-issues"])
+    assert resume_result.exit_code == 0, resume_result.output
+    assert "RESUMED routine scan-github-issues" in resume_result.output
+
+    status_result = runner.invoke(app, ["status"])
+    assert status_result.exit_code == 0, status_result.output
+    assert "Routines: 1 active · 1 paused · 0 disabled · next due now (scan-github-issues)" in status_result.output
+
+    log_result = runner.invoke(app, ["routine", "log", "scan-github-issues"])
+    assert log_result.exit_code == 0, log_result.output
+    assert "RUN LOG scan-github-issues" in log_result.output
+    assert "(empty)" in log_result.output
+
+
+def test_routine_run_sends_routine_trigger_message(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    _write_routine(
+        isolated_project,
+        routine_id="scan-github-issues",
+        title="Scan GitHub issues and PRs",
+        interval="6h",
+        assigned_to="worker-123",
+    )
+
+    result = runner.invoke(app, ["routine", "run", "scan-github-issues"])
+
+    assert result.exit_code == 0, result.output
+    assert "TRIGGERED routine scan-github-issues" in result.output
+    assert "type          : routine_trigger" in result.output
+    pending_dir = isolated_project / ".loom" / "agents" / "workers" / "worker-123" / "inbox" / "pending"
+    message_path = next(pending_dir.glob("MSG-*.md"))
+    assert "type: routine_trigger" in message_path.read_text(encoding="utf-8")
+
+
 def test_scheduler_respects_dependencies_and_thread_priority(runner, isolated_project):
     assert runner.invoke(app, ["init"]).exit_code == 0
     env = {"LOOM_WORKER_ID": "x7k2"}
@@ -1458,11 +1994,11 @@ def test_agent_next_prioritizes_planning_pending_inbox_items(runner, isolated_pr
     result = runner.invoke(app, ["agent", "next"], env=env)
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  plan" in result.output
+    assert "ACTION  escalate" in result.output
     assert "RQ-001" in result.output
     assert "RQ-002" in result.output
     assert "Worker next steps:" in result.output
-    assert "notify the manager or director immediately" in result.output
+    assert "Planning work is blocking execution; notify the manager or director immediately." in result.output
     assert "After planning clears, run `loom agent next` again." in result.output
     assert "none:" not in result.output
     inbox_content = (isolated_project / ".loom" / "inbox" / "RQ-001.md").read_text(encoding="utf-8")
@@ -1487,7 +2023,7 @@ def test_agent_next_respects_configured_inbox_plan_batch(runner, isolated_projec
     result = runner.invoke(app, ["agent", "next"], env=env)
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  plan" in result.output
+    assert "ACTION  escalate" in result.output
     assert "COUNT   1" in result.output
     assert "RQ-001" in result.output
     # Only 1 item in the batch — RQ-002 should not appear
@@ -1550,38 +2086,39 @@ def test_agent_next_returns_multiple_ready_tasks_when_configured(runner, isolate
 
     out = runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=env).output
 
-    assert "ACTION  task" in out
+    assert "ACTION  pickup" in out
     assert "COUNT   2" in out
     assert first_task in out
     assert second_task in out
 
 
-def test_agent_next_idle_default_does_not_sleep(runner, isolated_project, monkeypatch):
+def test_agent_next_idle_default_uses_retry_defaults(runner, isolated_project, monkeypatch):
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    called = {"sleep": 0}
+    sleeps: list[float] = []
 
-    def fail_sleep(_seconds: float) -> None:
-        called["sleep"] += 1
-        raise AssertionError("sleep should not be called with default next settings")
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
 
-    monkeypatch.setattr("loom.agent.time.sleep", fail_sleep)
+    monkeypatch.setattr("loom.agent.time.sleep", fake_sleep)
 
     result = runner.invoke(app, ["agent", "next", "--role", "manager"])
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  idle" in result.output
-    assert called["sleep"] == 0
+    assert "ACTION  wait" in result.output
+    assert sleeps == [60.0] * 5
     assert "none:" not in result.output
 
 
 def test_agent_next_idle_worker_suggests_proactive_claims(runner, isolated_project):
     assert runner.invoke(app, ["init"]).exit_code == 0
 
-    result = runner.invoke(app, ["agent", "next"], env={"LOOM_WORKER_ID": "x7k2"})
+    result = runner.invoke(
+        app, ["agent", "next", "--wait-seconds", "0", "--retries", "0"], env={"LOOM_WORKER_ID": "x7k2"}
+    )
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  idle" in result.output
+    assert "ACTION  wait" in result.output
     assert "Worker next steps:" in result.output
     assert "proactively ask to claim a thread or task" in result.output
     assert "loom agent propose manager '<thread/task handoff>' --ref <thread-or-task-id>" in result.output
@@ -1603,7 +2140,7 @@ def test_agent_next_wait_retries_cli_overrides(runner, isolated_project, monkeyp
     )
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  idle" in result.output
+    assert "ACTION  wait" in result.output
     assert sleeps == [0.25, 0.25]
     assert "none:" not in result.output
 
@@ -1644,11 +2181,11 @@ def test_agent_next_wait_retries_stop_when_work_appears(runner, isolated_project
     )
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  task" in result.output
+    assert "ACTION  assign" in result.output
     assert "backend-001-late-work" in result.output
     assert attempts["tasks"] == 3
     assert sleeps == [0.25, 0.25]
-    assert "ACTION  idle" not in result.output
+    assert "ACTION  wait" not in result.output
     assert "none:" not in result.output
 
 
@@ -1676,7 +2213,7 @@ def test_agent_next_wait_retries_uses_config_defaults(runner, isolated_project, 
     result = runner.invoke(app, ["agent", "next", "--role", "manager"])
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  idle" in result.output
+    assert "ACTION  wait" in result.output
     assert sleeps == [0.1, 0.1, 0.1]
     assert "none:" not in result.output
 
@@ -1696,7 +2233,7 @@ def test_agent_next_wait_retries_tty_feedback_uses_stderr(runner, isolated_proje
     agent_module.next_task(plan_limit=0, task_limit=0, thread="", wait_seconds=0.25, retries=2, role=AgentRole.MANAGER)
     captured = capsys.readouterr()
 
-    assert "ACTION  idle" in captured.out
+    assert "ACTION  wait" in captured.out
     assert "WAITING  attempt 1/3  retries:2  wait_seconds:0.25  remaining:2" in captured.err
     assert "WAITING  attempt 2/3  retries:2  wait_seconds:0.25  remaining:1" in captured.err
     assert "WAITING" not in captured.out
@@ -1745,12 +2282,12 @@ def test_manage_returns_loop_prompt(runner, isolated_project):
     result = runner.invoke(app, ["manage"])
 
     assert result.exit_code == 0, result.output
-    assert "DO THIS NOW" in result.output
+    assert "ROLE" in result.output
     assert "RIGHT NOW" not in result.output
     assert "CURRENT STATE" in result.output
     assert "loom agent next" in result.output
-    assert "loom agent done <task-id> --output <path-or-url> --role manager" in result.output
-    assert "loom agent pause <task-id> --question '<question>' --role manager" in result.output
+    assert "ACTION  assign" in result.output
+    assert "ACTION  unblock" in result.output
     assert "ESSENTIAL COMMANDS" in result.output
     assert "COMMAND REFERENCE" not in result.output
     assert "WORKSPACE" not in result.output
@@ -2061,6 +2598,233 @@ def test_manage_new_thread_new_task_assign_and_plan_commands(runner, isolated_pr
     assert "resolved_as : task" in plan_result.output
 
 
+def test_agent_next_manager_auto_plans_pending_requests_before_assigning(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["inbox", "add", "Need OAuth login"]).exit_code == 0
+
+    result = runner.invoke(app, ["agent", "next", "--role", "manager"])
+
+    assert result.exit_code == 0, result.output
+    assert "ACTION  assign" in result.output
+    assert "AUTO-PLANNED REQUESTS" in result.output
+    assert "RQ-001 ->" in result.output
+    assert _read_frontmatter(isolated_project / ".loom" / "requests" / "RQ-001.md")["status"] == "done"
+    assert (isolated_project / ".loom" / "threads" / "general" / "001.md").exists()
+
+
+def test_agent_next_manager_surfaces_due_routines_after_ready_tasks(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["manage", "new-thread", "--name", "backend", "--priority", "80"]).exit_code == 0
+    assert (
+        runner.invoke(
+            app,
+            [
+                "manage",
+                "new-task",
+                "--thread",
+                "backend",
+                "--title",
+                "Manager scheduled task",
+                "--acceptance",
+                "- [ ] ready",
+            ],
+        ).exit_code
+        == 0
+    )
+    _write_routine(
+        isolated_project,
+        routine_id="scan-github-issues",
+        title="Scan GitHub issues and PRs",
+        interval="6h",
+        assigned_to="worker-123",
+    )
+
+    ready_first = runner.invoke(app, ["agent", "next", "--role", "manager"])
+    assert ready_first.exit_code == 0, ready_first.output
+    assert "ACTION  assign" in ready_first.output
+    assert "backend-001" in ready_first.output
+    assert "ACTION  trigger" not in ready_first.output
+
+    task_path = isolated_project / ".loom" / "threads" / "backend" / "001.md"
+    task_text = task_path.read_text(encoding="utf-8")
+    task_path.write_text(
+        task_text.replace("status: scheduled\n", "status: done\n", 1),
+        encoding="utf-8",
+    )
+
+    routine_next = runner.invoke(app, ["agent", "next", "--role", "manager"])
+    assert routine_next.exit_code == 0, routine_next.output
+    assert "ACTION  trigger" in routine_next.output
+    assert "DUE ROUTINES" in routine_next.output
+    assert "scan-github-issues" in routine_next.output
+
+
+def test_agent_next_manager_stops_with_action_plan_when_auto_routing_is_ambiguous(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["manage", "new-thread", "--name", "soft-hooks", "--priority", "95"]).exit_code == 0
+    assert runner.invoke(app, ["manage", "new-thread", "--name", "backend", "--priority", "80"]).exit_code == 0
+    assert runner.invoke(app, ["inbox", "add", "Need OAuth login"]).exit_code == 0
+
+    result = runner.invoke(app, ["agent", "next", "--role", "manager"])
+
+    assert result.exit_code == 0, result.output
+    assert "ACTION  plan" in result.output
+    assert "AUTO-PLANNING STOPPED" in result.output
+    assert "failed_on : RQ-001" in result.output
+    assert "request text does not clearly match an existing thread" in result.output
+    assert "loom manage plan RQ-001 --thread <name>" in result.output
+    assert "loom manage new-thread --name <name>" in result.output
+    assert _read_frontmatter(isolated_project / ".loom" / "requests" / "RQ-001.md")["status"] == "pending"
+    assert not (isolated_project / ".loom" / "threads" / "soft-hooks" / "001.md").exists()
+    assert not (isolated_project / ".loom" / "threads" / "backend" / "001.md").exists()
+
+
+def test_manage_plan_requires_explicit_thread_when_inference_is_ambiguous(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["manage", "new-thread", "--name", "soft-hooks", "--priority", "95"]).exit_code == 0
+    assert runner.invoke(app, ["manage", "new-thread", "--name", "backend", "--priority", "80"]).exit_code == 0
+    assert runner.invoke(app, ["inbox", "add", "Need OAuth login"]).exit_code == 0
+
+    ambiguous_result = runner.invoke(app, ["manage", "plan", "RQ-001"])
+
+    assert ambiguous_result.exit_code == 1, ambiguous_result.output
+    assert "could not infer a target thread for RQ-001" in ambiguous_result.output
+    assert "request text does not clearly match an existing thread" in ambiguous_result.output
+    assert "available threads: backend, soft-hooks" in ambiguous_result.output
+    assert "loom manage plan RQ-001 --thread <name>" in ambiguous_result.output
+    assert "loom manage new-thread --name <name>" in ambiguous_result.output
+    assert _read_frontmatter(isolated_project / ".loom" / "requests" / "RQ-001.md")["status"] == "pending"
+    assert not (isolated_project / ".loom" / "threads" / "soft-hooks" / "001.md").exists()
+    assert not (isolated_project / ".loom" / "threads" / "backend" / "001.md").exists()
+
+    explicit_result = runner.invoke(app, ["manage", "plan", "RQ-001", "--thread", "backend"])
+
+    assert explicit_result.exit_code == 0, explicit_result.output
+    assert "PLANNED RQ-001" in explicit_result.output
+    assert "resolved_to : backend-001" in explicit_result.output
+    assert "task       : backend-001" in explicit_result.output
+    assert _read_frontmatter(isolated_project / ".loom" / "requests" / "RQ-001.md")["status"] == "done"
+
+
+def test_manage_plan_merges_overlapping_request_into_existing_task(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["manage", "new-thread", "--name", "backend", "--priority", "80"]).exit_code == 0
+    assert (
+        runner.invoke(
+            app,
+            [
+                "manage",
+                "new-task",
+                "--thread",
+                "backend",
+                "--title",
+                "Need OAuth login",
+                "--acceptance",
+                "- [ ] ready",
+                "--priority",
+                "40",
+            ],
+        ).exit_code
+        == 0
+    )
+    assert runner.invoke(app, ["inbox", "add", "Need OAuth login"]).exit_code == 0
+
+    result = runner.invoke(app, ["manage", "plan", "RQ-001", "--thread", "backend"])
+
+    assert result.exit_code == 0, result.output
+    assert "PLANNED RQ-001" in result.output
+    assert "resolved_as : merged" in result.output
+    assert "resolved_to : backend-001" in result.output
+    request_meta = _read_frontmatter(isolated_project / ".loom" / "requests" / "RQ-001.md")
+    assert request_meta["resolved_as"] == "merged"
+    assert request_meta["resolved_to"] == ["backend-001"]
+    task_meta = _read_frontmatter(isolated_project / ".loom" / "threads" / "backend" / "001.md")
+    assert task_meta["priority"] == 90
+    assert task_meta["created_from"] == ["RQ-001"]
+
+
+def test_manage_plan_does_not_merge_into_reviewing_overlap(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["manage", "new-thread", "--name", "backend", "--priority", "80"]).exit_code == 0
+    assert (
+        runner.invoke(
+            app,
+            [
+                "manage",
+                "new-task",
+                "--thread",
+                "backend",
+                "--title",
+                "Need OAuth login",
+                "--acceptance",
+                "- [ ] ready",
+                "--priority",
+                "40",
+            ],
+        ).exit_code
+        == 0
+    )
+    task_path = isolated_project / ".loom" / "threads" / "backend" / "001.md"
+    task_text = task_path.read_text(encoding="utf-8")
+    task_path.write_text(task_text.replace("status: scheduled\n", "status: reviewing\n", 1), encoding="utf-8")
+    assert runner.invoke(app, ["inbox", "add", "Need OAuth login"]).exit_code == 0
+
+    result = runner.invoke(app, ["manage", "plan", "RQ-001", "--thread", "backend"])
+
+    assert result.exit_code == 0, result.output
+    assert "PLANNED RQ-001" in result.output
+    assert "resolved_as : task" in result.output
+    assert "resolved_to : backend-002" in result.output
+    assert "task       : backend-002" in result.output
+    request_meta = _read_frontmatter(isolated_project / ".loom" / "requests" / "RQ-001.md")
+    assert request_meta["resolved_as"] == "task"
+    assert request_meta["resolved_to"] == ["backend-002"]
+    original_task_meta = _read_frontmatter(task_path)
+    assert original_task_meta["status"] == "reviewing"
+    assert original_task_meta["priority"] == 40
+    assert original_task_meta["created_from"] == []
+    new_task_meta = _read_frontmatter(isolated_project / ".loom" / "threads" / "backend" / "002.md")
+    assert new_task_meta["status"] == "scheduled"
+    assert new_task_meta["priority"] == 80
+    assert new_task_meta["created_from"] == ["RQ-001"]
+
+
+def test_agent_done_keeps_persistent_task_scheduled(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["manage", "new-thread", "--name", "backend", "--priority", "80"]).exit_code == 0
+    assert (
+        runner.invoke(
+            app,
+            [
+                "manage",
+                "new-task",
+                "--thread",
+                "backend",
+                "--title",
+                "Monitor CI health",
+                "--acceptance",
+                "- [ ] latest scan recorded",
+                "--persistent",
+            ],
+        ).exit_code
+        == 0
+    )
+
+    result = runner.invoke(
+        app,
+        ["agent", "done", "backend-001", "--output", "https://github.com/acme/loom/pull/42"],
+        env={"LOOM_WORKER_ID": "x7k2"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "DONE task backend-001" in result.output
+    assert "status : scheduled" in result.output
+    assert "persistent : remains scheduled for future sessions" in result.output
+    task_meta = _read_frontmatter(isolated_project / ".loom" / "threads" / "backend" / "001.md")
+    assert task_meta["persistent"] is True
+    assert task_meta["status"] == "scheduled"
+
+
 def test_global_flag_uses_home_directory(runner, isolated_project, monkeypatch):
     home = isolated_project / "home"
     home.mkdir()
@@ -2130,6 +2894,30 @@ def test_spawn_whoami_checkpoint_resume_and_inbox_flow(runner, isolated_project)
     assert log_result.exit_code == 0, log_result.output
     assert "message.sent message:" in log_result.output
     assert "message.replied message:" in log_result.output
+
+
+def test_manager_checkpoint_and_resume_use_singleton_record(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    checkpoint_result = runner.invoke(
+        app,
+        ["agent", "checkpoint", "routing follow-up queued", "--phase", "planning", "--role", "manager"],
+    )
+
+    assert checkpoint_result.exit_code == 0, checkpoint_result.output
+    assert "CHECKPOINT recorded" in checkpoint_result.output
+    assert "agent : manager" in checkpoint_result.output
+    assert "phase : planning" in checkpoint_result.output
+
+    metadata = _read_frontmatter(isolated_project / ".loom" / "agents" / "manager" / "_agent.md")
+    assert metadata["checkpoint_summary"] == "routing follow-up queued"
+    assert metadata["status"] == "active"
+
+    resume_result = runner.invoke(app, ["agent", "resume", "--role", "manager"])
+    assert resume_result.exit_code == 0, resume_result.output
+    assert "CHECKPOINT body for manager" in resume_result.output
+    assert "**phase** planning" in resume_result.output
+    assert "routing follow-up queued" in resume_result.output
 
 
 def test_spawn_rejects_worker_context(runner, isolated_project):
@@ -2202,7 +2990,23 @@ def test_status_migrates_legacy_worker_runtime_layout(runner, isolated_project):
     assert not legacy_root.exists()
     assert (migrated_root / "_agent.md").exists()
     assert (migrated_root / "abcd.env").exists()
-    assert (isolated_project / ".loom" / "agents" / "_manager.md").exists()
+    assert (isolated_project / ".loom" / "agents" / "manager" / "_agent.md").exists()
+
+
+def test_status_migrates_legacy_manager_runtime_layout(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    manager_root = isolated_project / ".loom" / "agents" / "manager"
+    current_path = manager_root / "_agent.md"
+    legacy_path = isolated_project / ".loom" / "agents" / "_manager.md"
+    legacy_path.write_text(current_path.read_text(encoding="utf-8"), encoding="utf-8")
+    current_path.unlink()
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert current_path.exists()
+    assert not legacy_path.exists()
 
 
 def test_agent_commands_require_worker_id_by_default(runner, isolated_project):
@@ -2224,16 +3028,13 @@ def test_agent_commands_allow_manager_override(runner, isolated_project):
     assert "CREATED thread backend" in result.output
 
 
-@pytest.mark.parametrize("command_name", ["new-thread", "new-task", "send"])
+@pytest.mark.parametrize("command_name", ["new-thread", "send"])
 def test_worker_default_rejects_singleton_only_commands(runner, isolated_project, command_name):
     assert runner.invoke(app, ["init"]).exit_code == 0
     env = {"LOOM_WORKER_ID": "x7k2"}
 
     if command_name == "new-thread":
         args = ["agent", "new-thread", "--name", "backend"]
-    elif command_name == "new-task":
-        assert runner.invoke(app, ["agent", "new-thread", "--name", "backend", "--role", "manager"]).exit_code == 0
-        args = ["agent", "new-task", "--thread", "backend", "--title", "Demo", "--acceptance", "- [ ] ready"]
     else:
         args = ["agent", "send", "manager", "raw message"]
 
@@ -2242,6 +3043,34 @@ def test_worker_default_rejects_singleton_only_commands(runner, isolated_project
     assert result.exit_code == 1, result.output
     assert "worker_command_not_allowed" in result.output
     assert "worker role" in result.output
+
+
+def test_worker_can_create_persistent_task_via_agent_new_task(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["agent", "new-thread", "--name", "backend", "--role", "manager"]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "new-task",
+            "--thread",
+            "backend",
+            "--title",
+            "Monitor CI health",
+            "--acceptance",
+            "- [ ] latest scan recorded",
+            "--persistent",
+        ],
+        env={"LOOM_WORKER_ID": "x7k2"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "CREATED task backend-001" in result.output
+    assert "persistent : true" in result.output
+    assert "persistent: true" in (isolated_project / ".loom" / "threads" / "backend" / "001.md").read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.parametrize(
@@ -2261,18 +3090,51 @@ def test_agent_start_supports_role_specific_bootstrap_guides(runner, isolated_pr
     assert expected in result.output
 
 
+def test_agent_start_requires_explicit_role_outside_worker_context(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(app, ["agent", "start"])
+
+    assert result.exit_code == 1
+    assert "requires --role outside a worker shell" in result.output
+    assert "set LOOM_WORKER_ID to use the worker bootstrap" in result.output
+
+
+def test_agent_start_without_role_defaults_to_worker_inside_worker_context(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(app, ["agent", "start"], env={"LOOM_WORKER_ID": "worker-2"})
+
+    assert result.exit_code == 0, result.output
+    assert "LOOM WORKER BOOTSTRAP" in result.output
+    assert "worker id      : worker-2" in result.output
+
+
+def test_agent_start_worker_bootstrap_mentions_manager_assign_for_mailbox_handoffs(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+
+    result = runner.invoke(app, ["agent", "start", "--role", "worker"], env={"LOOM_WORKER_ID": "worker-2"})
+
+    assert result.exit_code == 0, result.output
+    assert "loom manage assign --thread <name> --worker <agent-id>" in result.output
+    assert "re-run `loom agent next` to claim the task batch" in result.output
+
+
 def test_agent_start_director_uses_round_orchestration_guidance(runner, isolated_project):
     assert runner.invoke(app, ["init"]).exit_code == 0
 
     result = runner.invoke(app, ["agent", "start", "--role", "director"])
 
     assert result.exit_code == 0, result.output
+    assert result.output.isascii()
     assert "BEFORE STARTING" in result.output
     assert "STARTUP" in result.output
     assert "DURING THE ROUND" in result.output
     assert "ROUND CHECK" in result.output
     assert "loom agent next --role director" in result.output
     assert "loom agent next --role director` again" in result.output
+    assert "do not create or own a director AgentStatus lifecycle" in result.output
+    assert "Workers update their own AgentStatus" in result.output
 
 
 def test_agent_start_reviewer_explicitly_loops_on_agent_next(runner, isolated_project):
@@ -2306,7 +3168,7 @@ def test_agent_next_director_shows_role_specific_guidance(runner, isolated_proje
     result = runner.invoke(app, ["agent", "next", "--plan-limit", "0", "--role", "director"])
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  task" in result.output
+    assert "ACTION  wake" in result.output
     assert "Director next steps:" in result.output
     assert "Re-run with `--role manager`" not in result.output
 
@@ -2332,7 +3194,10 @@ def test_agent_next_reviewer_idle_points_to_review_and_repeat(runner, isolated_p
     assert runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=worker_env).exit_code == 0
     assert runner.invoke(app, ["agent", "done", task_id, "--output", "./out"], env=worker_env).exit_code == 0
 
-    result = runner.invoke(app, ["agent", "next", "--plan-limit", "0", "--role", "reviewer"])
+    result = runner.invoke(
+        app,
+        ["agent", "next", "--plan-limit", "0", "--wait-seconds", "0", "--retries", "0", "--role", "reviewer"],
+    )
 
     assert result.exit_code == 0, result.output
     assert "ACTION  idle" in result.output
@@ -2360,7 +3225,10 @@ def test_agent_next_reviewer_ignores_execution_backlog(runner, isolated_project)
 
     assert task_result.exit_code == 0, task_result.output
 
-    result = runner.invoke(app, ["agent", "next", "--plan-limit", "0", "--role", "reviewer"])
+    result = runner.invoke(
+        app,
+        ["agent", "next", "--plan-limit", "0", "--wait-seconds", "0", "--retries", "0", "--role", "reviewer"],
+    )
 
     assert result.exit_code == 0, result.output
     assert "ACTION  idle" in result.output
@@ -2374,7 +3242,7 @@ def test_agent_next_reviewer_ignores_planning_backlog(runner, isolated_project):
     assert runner.invoke(app, ["init"]).exit_code == 0
     assert runner.invoke(app, ["inbox", "add", "Need OAuth login"]).exit_code == 0
 
-    result = runner.invoke(app, ["agent", "next", "--role", "reviewer"])
+    result = runner.invoke(app, ["agent", "next", "--wait-seconds", "0", "--retries", "0", "--role", "reviewer"])
 
     assert result.exit_code == 0, result.output
     assert "ACTION  idle" in result.output
@@ -2390,9 +3258,9 @@ def test_agent_next_director_plan_points_to_manager_and_repeat(runner, isolated_
     result = runner.invoke(app, ["agent", "next", "--role", "director"])
 
     assert result.exit_code == 0, result.output
-    assert "ACTION  plan" in result.output
+    assert "ACTION  coordinate" in result.output
     assert "Director next steps:" in result.output
-    assert "start or wake the manager with `loom manage`" in result.output
+    assert "wake the manager with `loom manage`" in result.output
     assert "loom agent next --role director` again" in result.output
 
 
@@ -2513,7 +3381,7 @@ def test_agent_next_shows_ready_tasks_for_manager_without_claiming(runner, isola
 
     out = runner.invoke(app, ["agent", "next", "--plan-limit", "0", "--role", "manager"]).output
 
-    assert "ACTION  task" in out
+    assert "ACTION  assign" in out
     assert "ACTOR   manager" in out
     assert "READY TASKS" in out
     assert "Ask the director or host system to start or wake a worker runtime with LOOM_WORKER_ID + LOOM_DIR." in out
@@ -2610,7 +3478,7 @@ def test_rejected_mailbox_handoff_task_can_be_reclaimed_by_another_worker(runner
 
     manager_next = runner.invoke(app, ["agent", "next", "--plan-limit", "0", "--role", "manager"])
     assert manager_next.exit_code == 0, manager_next.output
-    assert "ACTION  task" in manager_next.output
+    assert "ACTION  assign" in manager_next.output
     assert task_id in manager_next.output
 
     worker_inbox = runner.invoke(app, ["agent", "mailbox"], env=reused_worker)
@@ -2620,11 +3488,70 @@ def test_rejected_mailbox_handoff_task_can_be_reclaimed_by_another_worker(runner
 
     retry_claim = runner.invoke(app, ["agent", "next", "--plan-limit", "0", "--thread", "backend"], env=reused_worker)
     assert retry_claim.exit_code == 0, retry_claim.output
-    assert "ACTION  task" in retry_claim.output
+    assert "ACTION  execute" in retry_claim.output
     assert task_id in retry_claim.output
 
     thread_meta = _read_frontmatter(isolated_project / ".loom" / "threads" / "backend" / "_thread.md")
     assert thread_meta["owner"] == "worker-2"
+
+
+def test_blocked_mailbox_handoff_surfaces_explicit_manager_assign_step(runner, isolated_project):
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert runner.invoke(app, ["agent", "new-thread", "--name", "backend", "--role", "manager"]).exit_code == 0
+    task_result = runner.invoke(
+        app,
+        [
+            "agent",
+            "new-task",
+            "--thread",
+            "backend",
+            "--title",
+            "Retry delegated work",
+            "--acceptance",
+            "- [ ] ready",
+            "--role",
+            "manager",
+        ],
+    )
+    assert task_result.exit_code == 0, task_result.output
+    task_id = task_result.output.splitlines()[0].split()[-1]
+
+    first_worker = {"LOOM_WORKER_ID": "worker-1"}
+    reused_worker = {"LOOM_WORKER_ID": "worker-2"}
+
+    claim_result = runner.invoke(app, ["agent", "next", "--plan-limit", "0", "--thread", "backend"], env=first_worker)
+    assert claim_result.exit_code == 0, claim_result.output
+    assert task_id in claim_result.output
+
+    done_result = runner.invoke(app, ["agent", "done", task_id, "--output", "./output/retry"], env=first_worker)
+    assert done_result.exit_code == 0, done_result.output
+    reject_result = runner.invoke(app, ["review", "reject", task_id, "Needs retry"])
+    assert reject_result.exit_code == 0, reject_result.output
+
+    handoff_result = runner.invoke(
+        app,
+        ["agent", "propose", "worker-2", "Please retry the rejected task", "--ref", task_id, "--role", "manager"],
+    )
+    assert handoff_result.exit_code == 0, handoff_result.output
+
+    blocked_next = runner.invoke(app, ["agent", "next", "--plan-limit", "0", "--thread", "backend"], env=reused_worker)
+
+    assert blocked_next.exit_code == 0, blocked_next.output
+    assert "ACTION  escalate" in blocked_next.output
+    assert "PENDING HANDOFFS" in blocked_next.output
+    assert task_id in blocked_next.output
+    assert "owner  : worker-1" in blocked_next.output
+    assert "msg    : MSG-001" in blocked_next.output
+    assert "loom agent mailbox-read <msg-id>" in blocked_next.output
+    assert "loom manage assign --thread <name> --worker <agent-id>" in blocked_next.output
+
+    assign_result = runner.invoke(app, ["manage", "assign", "--thread", "backend", "--worker", "worker-2"])
+    assert assign_result.exit_code == 0, assign_result.output
+
+    retry_claim = runner.invoke(app, ["agent", "next", "--plan-limit", "0", "--thread", "backend"], env=reused_worker)
+    assert retry_claim.exit_code == 0, retry_claim.output
+    assert "ACTION  execute" in retry_claim.output
+    assert task_id in retry_claim.output
 
 
 def test_manager_mailbox_commands_can_read_and_reply(runner, isolated_project):
@@ -2687,3 +3614,174 @@ def test_empty_default_queue_shows_add_requirement_hint(runner, isolated_project
     assert result.exit_code == 0, result.output
     assert "No pending approvals." in result.output
     assert "loom inbox add" in result.output
+
+
+# ---------------------------------------------------------------------------
+# review-workflow-005: explicit delivery contract on `loom agent done`
+# ---------------------------------------------------------------------------
+
+
+def _setup_claimable_task(runner, env: dict) -> str:
+    """Create and claim a scheduled task, returning its ID."""
+    assert runner.invoke(app, ["init"]).exit_code == 0
+    assert (
+        runner.invoke(app, ["agent", "new-thread", "--name", "delivery", "--role", "manager"], env=env).exit_code == 0
+    )
+    task_result = runner.invoke(
+        app,
+        [
+            "agent",
+            "new-task",
+            "--thread",
+            "delivery",
+            "--title",
+            "Delivery test task",
+            "--acceptance",
+            "- [ ] done",
+            "--role",
+            "manager",
+        ],
+        env=env,
+    )
+    assert task_result.exit_code == 0, task_result.output
+    task_id = task_result.output.splitlines()[0].split()[-1]
+
+    claim_result = runner.invoke(app, ["agent", "next", "--plan-limit", "0"], env=env)
+    assert claim_result.exit_code == 0, claim_result.output
+    assert task_id in claim_result.output
+    return task_id
+
+
+def test_done_review_ready_bypasses_todo_heuristics(runner, isolated_project):
+    """--review-ready should let task reach reviewing even when output contains TODOs."""
+    env = {"LOOM_WORKER_ID": "w001"}
+    task_id = _setup_claimable_task(runner, env)
+
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "done",
+            task_id,
+            "--output",
+            "TODO: non-blocking follow-up",
+            "--review-ready",
+        ],
+        env=env,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"DONE task {task_id}" in result.output
+    assert "reviewing" in result.output
+    assert "blocked" not in result.output
+    assert "Waiting for human review" in result.output
+
+    task_content = (isolated_project / ".loom" / "threads" / "delivery" / "001.md").read_text(encoding="utf-8")
+    assert "status: reviewing" in task_content
+    assert "ready: true" in task_content
+
+
+def test_done_with_summary_records_delivery_contract(runner, isolated_project):
+    """--summary should be stored in the task delivery contract frontmatter."""
+    env = {"LOOM_WORKER_ID": "w002"}
+    task_id = _setup_claimable_task(runner, env)
+
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "done",
+            task_id,
+            "--review-ready",
+            "--summary",
+            "Auth endpoint complete, all tests pass",
+        ],
+        env=env,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "delivery_summary: Auth endpoint complete, all tests pass" in result.output
+
+    task_content = (isolated_project / ".loom" / "threads" / "delivery" / "001.md").read_text(encoding="utf-8")
+    assert "summary: Auth endpoint complete, all tests pass" in task_content
+
+
+def test_done_pr_records_thread_pr_artifact(runner, isolated_project):
+    """--pr URL should record a structured ThreadPR artifact on the thread."""
+    import yaml
+
+    env = {"LOOM_WORKER_ID": "w003"}
+    task_id = _setup_claimable_task(runner, env)
+
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "done",
+            task_id,
+            "--review-ready",
+            "--pr",
+            "https://github.com/acme/loom/pull/42",
+        ],
+        env=env,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "pr_urls : https://github.com/acme/loom/pull/42" in result.output
+    assert "reviewing" in result.output
+
+    thread_content = (isolated_project / ".loom" / "threads" / "delivery" / "_thread.md").read_text(encoding="utf-8")
+    assert "https://github.com/acme/loom/pull/42" in thread_content
+    # Parse YAML frontmatter to check structured data
+    fm_text = thread_content.split("---")[1]
+    fm = yaml.safe_load(fm_text)
+    assert len(fm["pr_artifacts"]) == 1
+    assert fm["pr_artifacts"][0]["url"] == "https://github.com/acme/loom/pull/42"
+    assert fm["pr_artifacts"][0]["number"] == 42
+    assert fm["pr_artifacts"][0]["repository"] == "acme/loom"
+
+
+def test_done_review_ready_surfaces_delivery_in_review_output(runner, isolated_project):
+    """loom review should show delivery contract info for tasks with explicit handoff."""
+    env = {"LOOM_WORKER_ID": "w004"}
+    task_id = _setup_claimable_task(runner, env)
+
+    done_result = runner.invoke(
+        app,
+        [
+            "agent",
+            "done",
+            task_id,
+            "--review-ready",
+            "--summary",
+            "Feature shipped",
+            "--pr",
+            "https://github.com/acme/loom/pull/10",
+        ],
+        env=env,
+    )
+    assert done_result.exit_code == 0, done_result.output
+
+    review_result = runner.invoke(app, ["review"])
+    assert review_result.exit_code == 0, review_result.output
+    assert "delivery:" in review_result.output
+    assert "ready: yes" in review_result.output
+    assert "summary: Feature shipped" in review_result.output
+    assert "https://github.com/acme/loom/pull/10" in review_result.output
+
+
+def test_done_legacy_output_without_flags_still_pauses_on_todos(runner, isolated_project):
+    """Backward compat: without --review-ready, TODO in output still triggers pause."""
+    env = {"LOOM_WORKER_ID": "w005"}
+    task_id = _setup_claimable_task(runner, env)
+
+    result = runner.invoke(
+        app,
+        ["agent", "done", task_id, "--output", "TODO: left to do"],
+        env=env,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "paused" in result.output
+    assert "blocked: TODOs" in result.output
+    assert "Waiting for human decision" in result.output

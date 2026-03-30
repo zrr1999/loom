@@ -3,23 +3,29 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .duration import format_compact_duration, parse_interval
 from .frontmatter import read_model
-from .lease import is_thread_stale
-from .models import AgentRecord, RequestItem, RequestStatus, Task, TaskKind, TaskStatus, Thread
+from .lease import is_thread_stale, parse_timestamp
+from .models import AgentRecord, RequestItem, RequestStatus, Routine, RoutineStatus, Task, TaskKind, TaskStatus, Thread
 from .repository import (
     agent_pending_dir,
     agent_replied_dir,
+    agent_worktrees_dir,
     agents_dir,
+    load_worktree,
     requests_dir,
     root_config_path,
+    routines_dir,
     task_file_path,
     worker_agents_dir,
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    pass
 
 
 def load_all_threads(loom_dir: Path) -> dict[str, Thread]:
@@ -131,6 +137,73 @@ def load_all_inbox_items(loom_dir: Path) -> list[RequestItem]:
     return items
 
 
+def load_all_routines(loom_dir: Path) -> list[Routine]:
+    """Load all routine files from `.loom/routines/`."""
+    routines_root = routines_dir(loom_dir)
+    if not routines_root.exists():
+        return []
+    return [read_model(path, Routine) for path in sorted(routines_root.glob("*.md"))]
+
+
+def routine_due_at(routine: Routine) -> datetime | None:
+    """Return the next due timestamp for an active routine."""
+    if routine.status != RoutineStatus.ACTIVE:
+        return None
+    last_run = parse_timestamp(routine.last_run)
+    if last_run is None:
+        return datetime.min.replace(tzinfo=UTC)
+    return last_run + parse_interval(routine.interval)
+
+
+def is_routine_due(routine: Routine, *, now: datetime | None = None) -> bool:
+    """Check whether a routine is due to be triggered."""
+    due_at = routine_due_at(routine)
+    if due_at is None:
+        return False
+    observed_at = now or datetime.now(UTC)
+    return due_at <= observed_at
+
+
+def get_due_routines(loom_dir: Path, *, limit: int | None = None) -> list[Routine]:
+    """Return due routines in trigger order."""
+    observed_at = datetime.now(UTC)
+    due_routines = [routine for routine in load_all_routines(loom_dir) if is_routine_due(routine, now=observed_at)]
+    due_routines.sort(
+        key=lambda routine: (
+            routine_due_at(routine) or datetime.max.replace(tzinfo=UTC),
+            0 if routine.assigned_to else 1,
+            routine.id,
+        )
+    )
+    if limit is not None and limit > 0:
+        return due_routines[:limit]
+    return due_routines
+
+
+def next_routine_due(routines: list[Routine], *, now: datetime | None = None) -> dict[str, str] | None:
+    """Describe the next active routine due time for status surfaces."""
+    observed_at = now or datetime.now(UTC)
+    next_due_at: datetime | None = None
+    next_routine: Routine | None = None
+    for routine in routines:
+        due_at = routine_due_at(routine)
+        if due_at is None:
+            continue
+        if (
+            next_due_at is None
+            or due_at < next_due_at
+            or (due_at == next_due_at and next_routine is not None and routine.id < next_routine.id)
+        ):
+            next_due_at = due_at
+            next_routine = routine
+    if next_due_at is None or next_routine is None:
+        return None
+
+    if next_due_at <= observed_at:
+        return {"id": next_routine.id, "when": "now"}
+    return {"id": next_routine.id, "when": format_compact_duration(next_due_at - observed_at)}
+
+
 def get_pending_inbox_items(loom_dir: Path, limit: int | None = None) -> list[dict[str, Any]]:
     """Return pending inbox items in planning order without mutating files."""
     request_dir = requests_dir(loom_dir)
@@ -222,9 +295,87 @@ def summarize_capabilities(threads: dict[str, Thread], tasks: list[Task]) -> lis
                     if implementation_follow_up is not None
                     else None
                 ),
+                "latest_pr": (
+                    {
+                        "url": _thread.pr_artifacts[-1].url,
+                        "branch": _thread.pr_artifacts[-1].branch,
+                    }
+                    if _thread.pr_artifacts
+                    else None
+                ),
             }
         )
     return summaries
+
+
+def _path_is_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_thread_worktree_references(loom_dir: Path, threads: dict[str, Thread]) -> dict[str, list[str]]:
+    """Describe stale or invalid active thread worktree references."""
+
+    issues: dict[str, list[str]] = {}
+    for thread_name, thread in threads.items():
+        thread_issues: list[str] = []
+        for item in thread.worktrees:
+            if item.removed_at is not None:
+                continue
+
+            worktree_path = Path(item.path).resolve()
+            worker_root = agent_worktrees_dir(loom_dir, item.worker).resolve()
+            if not _path_is_within_root(worktree_path, worker_root):
+                thread_issues.append(
+                    f"worktree '{item.name}' is cross-worker-invalid: path '{worktree_path}' is outside "
+                    f"worker '{item.worker}' root '{worker_root}'"
+                )
+                continue
+
+            if not worktree_path.exists():
+                thread_issues.append(
+                    f"worktree '{item.name}' is missing its checkout path '{worktree_path}' for worker '{item.worker}'"
+                )
+
+            try:
+                _record_path, record = load_worktree(loom_dir, item.worker, item.name)
+            except FileNotFoundError:
+                thread_issues.append(
+                    f"worktree '{item.name}' is stale: thread '{thread_name}' points to a missing "
+                    f"worker-local record for worker '{item.worker}'"
+                )
+                continue
+
+            record_path = Path(record.path).resolve()
+            if record.worker != item.worker:
+                thread_issues.append(
+                    f"worktree '{item.name}' is cross-worker-invalid: thread metadata says worker "
+                    f"'{item.worker}' but local record says '{record.worker}'"
+                )
+            if record.thread != thread_name:
+                if record.thread:
+                    thread_issues.append(
+                        f"worktree '{item.name}' is stale: thread '{thread_name}' references it, but the "
+                        f"worker-local record is attached to thread '{record.thread}'"
+                    )
+                else:
+                    thread_issues.append(
+                        f"worktree '{item.name}' is stale: thread '{thread_name}' references it, but the "
+                        "worker-local record is no longer attached to any thread"
+                    )
+            if record_path != worktree_path:
+                thread_issues.append(
+                    f"worktree '{item.name}' is stale: thread metadata path '{worktree_path}' does not match "
+                    f"worker-local record path '{record_path}'"
+                )
+
+        if thread_issues:
+            issues[thread_name] = thread_issues
+
+    return issues
 
 
 def get_status_summary(loom_dir: Path) -> dict[str, Any]:
@@ -233,6 +384,9 @@ def get_status_summary(loom_dir: Path) -> dict[str, Any]:
     all_tasks = load_all_tasks(loom_dir)
     ready_tasks = [task for task in all_tasks if is_ready(task, all_tasks, threads)]
     inbox_items = load_all_inbox_items(loom_dir)
+    routines = load_all_routines(loom_dir)
+    due_routines = get_due_routines(loom_dir)
+    next_due = next_routine_due(routines)
     agents: list[dict[str, Any]] = []
 
     agent_root = worker_agents_dir(loom_dir)
@@ -260,7 +414,7 @@ def get_status_summary(loom_dir: Path) -> dict[str, Any]:
             )
     if not agents and legacy_root.exists():
         for entry in sorted(legacy_root.iterdir()):
-            if not entry.is_dir() or entry.name == "workers":
+            if not entry.is_dir() or entry.name in {"workers", "manager"}:
                 continue
             record_path = entry / "_agent.md"
             if not record_path.exists():
@@ -288,6 +442,10 @@ def get_status_summary(loom_dir: Path) -> dict[str, Any]:
     for item in inbox_items:
         inbox_by_status[item.status.value] = inbox_by_status.get(item.status.value, 0) + 1
 
+    routines_by_status: dict[str, int] = {}
+    for routine in routines:
+        routines_by_status[routine.status.value] = routines_by_status.get(routine.status.value, 0) + 1
+
     owned_threads = {
         name: {
             "owner": thread.owner,
@@ -299,11 +457,13 @@ def get_status_summary(loom_dir: Path) -> dict[str, Any]:
         for name, thread in threads.items()
         if thread.owner
     }
+    worktree_issues = validate_thread_worktree_references(loom_dir, threads)
 
     return {
         "config_present": root_config_path(loom_dir).exists(),
         "threads": len(threads),
         "owned_threads": owned_threads,
+        "worktree_issues": worktree_issues,
         "tasks": {
             "total": len(all_tasks),
             "by_status": by_status,
@@ -314,6 +474,13 @@ def get_status_summary(loom_dir: Path) -> dict[str, Any]:
             "total": len(inbox_items),
             "pending": inbox_by_status.get(RequestStatus.PENDING.value, 0),
             "by_status": inbox_by_status,
+        },
+        "routines": {
+            "total": len(routines),
+            "by_status": routines_by_status,
+            "due": len(due_routines),
+            "due_ids": [routine.id for routine in due_routines],
+            "next_due": next_due,
         },
         "inbox_pending": inbox_by_status.get(RequestStatus.PENDING.value, 0),
         "agents": agents,

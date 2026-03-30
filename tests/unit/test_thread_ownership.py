@@ -287,6 +287,93 @@ def test_update_checkpoint_refreshes_owned_thread_lease(loom: Path) -> None:
     assert updated_thread.owner_lease_expires_at != stale_thread.owner_lease_expires_at
 
 
+def test_complete_task_keeps_persistent_task_scheduled(loom: Path) -> None:
+    from loom.services import complete_task, create_task
+
+    task, _ = create_task(
+        loom,
+        thread_name="backend",
+        title="Monitor CI health",
+        acceptance="- [ ] latest scan recorded",
+        persistent=True,
+    )
+
+    _path, updated, blockers = complete_task(loom, task.id, output="https://github.com/acme/loom/pull/42")
+
+    assert blockers == []
+    assert updated.status == TaskStatus.SCHEDULED
+    assert updated.persistent is True
+    assert updated.output == "https://github.com/acme/loom/pull/42"
+
+
+def test_plan_request_item_merges_overlapping_request_and_elevates_priority(loom: Path) -> None:
+    from loom.repository import load_request_item, load_task
+    from loom.services import create_request_item, create_task, plan_request_item
+
+    existing_task, _ = create_task(
+        loom,
+        thread_name="backend",
+        title="Need OAuth login",
+        acceptance="- [ ] ready",
+        priority=40,
+    )
+    create_request_item(loom, "Need OAuth login")
+
+    planned = plan_request_item(loom, "RQ-001", thread_name="backend")
+
+    assert planned["resolved_as"] == "merged"
+    assert planned["resolved_to"] == [existing_task.id]
+    assert planned["tasks"] == []
+
+    _request_path, request_item = load_request_item(loom, "RQ-001")
+    assert request_item.resolved_as is not None
+    assert request_item.resolved_as.value == "merged"
+    assert request_item.resolution_note
+    assert existing_task.id in request_item.resolution_note
+
+    _task_path, merged_task = load_task(loom, existing_task.id)
+    assert merged_task.priority == 90
+    assert merged_task.created_from == ["RQ-001"]
+
+
+@pytest.mark.parametrize("target_status", [TaskStatus.REVIEWING, TaskStatus.PAUSED])
+def test_create_or_merge_task_skips_non_scheduled_overlap_targets(loom: Path, target_status: TaskStatus) -> None:
+    from loom.repository import load_task
+    from loom.services import create_or_merge_task, create_task, pause_task, transition_task
+
+    existing_task, _ = create_task(
+        loom,
+        thread_name="backend",
+        title="Need OAuth login",
+        acceptance="- [ ] ready",
+        priority=40,
+    )
+    if target_status == TaskStatus.REVIEWING:
+        transition_task(loom, existing_task.id, TaskStatus.REVIEWING)
+    else:
+        pause_task(loom, existing_task.id, question="Need direction?")
+
+    result = create_or_merge_task(
+        loom,
+        thread_name="backend",
+        title="Need OAuth login",
+        acceptance="- [ ] ready",
+        priority=80,
+        created_from=["RQ-001"],
+    )
+
+    assert result.created is True
+    assert result.task.id == "backend-002"
+    assert result.task.status == TaskStatus.SCHEDULED
+    assert result.task.priority == 80
+    assert result.task.created_from == ["RQ-001"]
+
+    _task_path, untouched_task = load_task(loom, existing_task.id)
+    assert untouched_task.status == target_status
+    assert untouched_task.priority == 40
+    assert untouched_task.created_from == []
+
+
 def test_status_summary_marks_stale_owned_thread(loom: Path) -> None:
     from loom.frontmatter import write_model
     from loom.scheduler import get_status_summary

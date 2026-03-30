@@ -3,22 +3,20 @@
 from __future__ import annotations
 
 import shutil
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 from .frontmatter import read_raw, write_model
 from .ids import canonical_thread_name, task_filename, task_id
-from .models import Claim, RequestResolution, RequestStatus, TaskStatus
+from .models import Claim, RequestResolution, RequestStatus, TaskStatus, ThreadWorktree
 from .repository import (
     agents_dir,
     load_agent,
     load_inbox_item,
     load_task,
+    load_worktree,
     worker_agents_dir,
 )
 from .scheduler import load_all_inbox_items, load_all_tasks, load_all_threads
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def _ensure_inbox_alias(loom: Path, requests_root: Path) -> None:
@@ -47,6 +45,11 @@ def ensure_request_storage(loom: Path) -> None:
 
     requests_root.mkdir(parents=True, exist_ok=True)
     _ensure_inbox_alias(loom, requests_root)
+
+
+def ensure_routine_storage(loom: Path) -> None:
+    """Ensure the routine storage directory exists."""
+    (loom / "routines").mkdir(parents=True, exist_ok=True)
 
 
 def ensure_name_based_threads(loom: Path) -> None:
@@ -140,7 +143,7 @@ def ensure_name_based_threads(loom: Path) -> None:
     agents_root = agents_dir(loom)
     if agents_root.exists():
         for entry in agents_root.iterdir():
-            if not entry.is_dir() or entry.name == "workers":
+            if not entry.is_dir() or entry.name in {"workers", "manager"}:
                 continue
             agent_dirs.append(entry)
     workers_root = worker_agents_dir(loom)
@@ -170,7 +173,7 @@ def ensure_worker_agent_subtree(loom: Path) -> None:
     for entry in sorted(agents_root.iterdir()):
         if not entry.is_dir():
             continue
-        if entry.name == "workers":
+        if entry.name in {"workers", "manager"}:
             continue
         record_path = entry / "_agent.md"
         if not record_path.exists():
@@ -187,6 +190,28 @@ def ensure_worker_agent_subtree(loom: Path) -> None:
                 entry.rmdir()
             continue
         entry.rename(target_dir)
+
+
+def ensure_manager_agent_subtree(loom: Path) -> None:
+    """Move the manager singleton record into `.loom/agents/manager/_agent.md`."""
+    agents_root = agents_dir(loom)
+    if not agents_root.exists():
+        return
+
+    manager_root = agents_root / "manager"
+    manager_root.mkdir(parents=True, exist_ok=True)
+
+    legacy_path = agents_root / "_manager.md"
+    preferred_path = manager_root / "_agent.md"
+    if preferred_path.exists():
+        if legacy_path.exists() and preferred_path.read_text(encoding="utf-8") == legacy_path.read_text(
+            encoding="utf-8"
+        ):
+            legacy_path.unlink()
+        return
+
+    if legacy_path.exists():
+        legacy_path.rename(preferred_path)
 
 
 def ensure_thread_ownership_metadata(loom: Path) -> None:
@@ -259,3 +284,62 @@ def ensure_thread_ownership_metadata(loom: Path) -> None:
         path, latest = load_task(loom, task.id)
         updated_task = latest.model_copy(update=updates)
         write_model(path, updated_task)
+
+
+def ensure_thread_worktree_metadata(loom: Path) -> None:
+    """Backfill thread-owned worktree history from legacy worker-local attachments."""
+    threads = load_all_threads(loom)
+    workers_root = worker_agents_dir(loom)
+    if not threads or not workers_root.exists():
+        return
+
+    for worker_dir in sorted(workers_root.iterdir()):
+        if not worker_dir.is_dir():
+            continue
+        worktrees_dir = worker_dir / "worktrees"
+        if not worktrees_dir.exists():
+            continue
+
+        for record_path in sorted(worktrees_dir.glob("*.md")):
+            _, record = load_worktree(loom, worker_dir.name, record_path.stem)
+            if not record.thread:
+                continue
+
+            thread_name = canonical_thread_name(record.thread)
+            thread = threads.get(thread_name)
+            if thread is None:
+                msg = (
+                    f"cannot migrate worktree '{record.name}' for worker '{record.worker}': "
+                    f"missing thread '{thread_name}'"
+                )
+                raise ValueError(msg)
+
+            resolved_path = str(Path(record.path).resolve())
+            already_present = any(
+                item.removed_at is None
+                and item.name == record.name
+                and item.worker == record.worker
+                and str(Path(item.path).resolve()) == resolved_path
+                for item in thread.worktrees
+            )
+            if already_present:
+                continue
+
+            thread_path = loom / "threads" / thread_name / "_thread.md"
+            updated_thread = thread.model_copy(
+                update={
+                    "worktrees": [
+                        *thread.worktrees,
+                        ThreadWorktree(
+                            name=record.name,
+                            worker=record.worker,
+                            path=resolved_path,
+                            branch=record.branch,
+                            status=record.status,
+                            created_at=record.created_at,
+                        ),
+                    ]
+                }
+            )
+            write_model(thread_path, updated_thread)
+            threads[thread_name] = updated_thread

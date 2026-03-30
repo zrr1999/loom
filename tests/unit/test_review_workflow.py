@@ -7,7 +7,16 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from loom.models import ReviewEntry, Task, TaskStatus
+from loom.models import (
+    DeliveryContract,
+    ReviewEntry,
+    Task,
+    TaskStatus,
+    Thread,
+    ThreadPR,
+    ThreadWorktree,
+    WorktreeStatus,
+)
 
 if TYPE_CHECKING:
     from typer.testing import CliRunner
@@ -140,6 +149,69 @@ def test_format_review_summary_falls_back_to_rejection_note():
     assert "review_history:" not in text
 
 
+def test_format_review_summary_includes_thread_prs_and_worktrees():
+    from loom.services import format_review_summary
+
+    task = Task(
+        id="backend-001",
+        thread="backend",
+        seq=1,
+        title="Token refresh",
+        status=TaskStatus.REVIEWING,
+        acceptance="- [ ] ok",
+    )
+    thread = Thread(
+        name="backend",
+        worktrees=[
+            ThreadWorktree(
+                name="feature-a",
+                worker="aaap",
+                path="/workspace/feature-a",
+                branch="feat/worktree-a",
+                status=WorktreeStatus.ACTIVE,
+            )
+        ],
+        pr_artifacts=[
+            ThreadPR(
+                url="https://github.com/acme/loom/pull/42",
+                branch="feat/worktree-a",
+                task_ids=["backend-001"],
+            )
+        ],
+    )
+
+    text = "\n".join(format_review_summary(task, thread=thread))
+    assert "thread_prs:" in text
+    assert "https://github.com/acme/loom/pull/42" in text
+    assert "thread_worktrees:" in text
+    assert "feature-a [active]" in text
+
+
+def test_format_review_summary_includes_delivery_contract():
+    from loom.services import format_review_summary
+
+    task = Task(
+        id="backend-001",
+        thread="backend",
+        seq=1,
+        title="Token refresh",
+        status=TaskStatus.REVIEWING,
+        acceptance="- [ ] ok",
+        output="handoff note",
+        delivery=DeliveryContract(
+            ready=True,
+            artifacts=[".loom/products/reports/backend-001.md"],
+            pr_urls=["https://github.com/acme/loom/pull/42"],
+        ),
+    )
+
+    text = "\n".join(format_review_summary(task))
+    assert "delivery:" in text
+    assert "ready: yes" in text
+    assert ".loom/products/reports/backend-001.md" in text
+    assert "https://github.com/acme/loom/pull/42" in text
+
+
 # ---------------------------------------------------------------------------
 # Integration tests: repeated rejection flow (services layer)
 # ---------------------------------------------------------------------------
@@ -216,6 +288,32 @@ def test_accept_appends_to_review_history(_loom_project: Path):
     assert len(task.review_history) == 1
     assert task.review_history[0].kind == "accept"
     assert task.review_history[0].note == "Looks good"
+
+
+def test_complete_task_accepts_explicit_delivery_contract(_loom_project: Path):
+    from loom.services import complete_task, reject_task
+
+    loom = _loom_project
+    task_id = _make_reviewing_task(loom)
+    reject_task(loom, task_id, "Back to implementation")
+
+    _, updated, blockers = complete_task(
+        loom,
+        task_id,
+        output="proposal-only summary\nTODO: finish tests",
+        delivery=DeliveryContract(
+            ready=True,
+            artifacts=["reports/review.txt"],
+            pr_urls=["https://github.com/acme/loom/pull/42"],
+        ),
+    )
+
+    assert blockers == []
+    assert updated.status == TaskStatus.REVIEWING
+    assert updated.delivery is not None
+    assert updated.delivery.ready is True
+    assert updated.delivery.artifacts == [".loom/products/reports/review.txt"]
+    assert updated.delivery.pr_urls == ["https://github.com/acme/loom/pull/42"]
 
 
 def test_repeated_rejection_preserves_full_history(_loom_project: Path):

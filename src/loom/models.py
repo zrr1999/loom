@@ -10,6 +10,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .duration import normalize_interval
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -42,6 +44,20 @@ class RequestResolution(StrEnum):
     REJECTED = "rejected"
 
 
+class RoutineStatus(StrEnum):
+    ACTIVE = "active"
+    PAUSED = "paused"
+    DISABLED = "disabled"
+
+
+class RoutineResult(StrEnum):
+    OK = "ok"
+    QUESTION = "question"
+    TASK_PROPOSED = "task_proposed"
+    NO_CHANGE = "no_change"
+    FAILED = "failed"
+
+
 class AgentRole(StrEnum):
     DIRECTOR = "director"
     MANAGER = "manager"
@@ -63,6 +79,7 @@ class WorktreeStatus(StrEnum):
 
 class MessageType(StrEnum):
     TASK_ASSIGNMENT = "task_assignment"
+    ROUTINE_TRIGGER = "routine_trigger"
     QUESTION = "question"
     ANSWER = "answer"
     INFO = "info"
@@ -103,6 +120,12 @@ REQUEST_TRANSITIONS: dict[RequestStatus, set[RequestStatus]] = {
     RequestStatus.DONE: set(),
 }
 
+ROUTINE_TRANSITIONS: dict[RoutineStatus, set[RoutineStatus]] = {
+    RoutineStatus.ACTIVE: {RoutineStatus.PAUSED, RoutineStatus.DISABLED},
+    RoutineStatus.PAUSED: {RoutineStatus.ACTIVE, RoutineStatus.DISABLED},
+    RoutineStatus.DISABLED: {RoutineStatus.ACTIVE, RoutineStatus.PAUSED},
+}
+
 
 # ---------------------------------------------------------------------------
 # Decision (embedded in task when paused)
@@ -131,6 +154,27 @@ class ReviewEntry(BaseModel):
     source: str = "cli"
 
 
+class DeliveryContract(BaseModel):
+    """Explicit handoff metadata for worker -> review transitions."""
+
+    ready: bool = False
+    summary: str | None = None
+    artifacts: list[str] = Field(default_factory=list)
+    pr_urls: list[str] = Field(default_factory=list)
+
+    @field_validator("artifacts", "pr_urls", mode="before")
+    @classmethod
+    def _coerce_string_lists(cls, value: object) -> list[str]:
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, Iterable):
+            return [str(item) for item in value]
+        msg = "delivery contract values must be a string or iterable of strings"
+        raise TypeError(msg)
+
+
 class Claim(BaseModel):
     """Legacy task-level claim — kept for backward-compat reads only."""
 
@@ -151,7 +195,18 @@ class Thread(BaseModel):
     owned_at: str | None = None
     owner_heartbeat_at: str | None = None
     owner_lease_expires_at: str | None = None
+    worktrees: list[ThreadWorktree] = Field(default_factory=list)
+    pr_artifacts: list[ThreadPR] = Field(default_factory=list)
     body: str = ""
+
+    @field_validator("worktrees", "pr_artifacts", mode="before")
+    @classmethod
+    def _coerce_embedded_lists(cls, value: object) -> list[object]:
+        if value is None or value == "":
+            return []
+        if isinstance(value, list):
+            return list(value)
+        return [value]
 
 
 # ---------------------------------------------------------------------------
@@ -167,10 +222,12 @@ class Task(BaseModel):
     kind: TaskKind = TaskKind.IMPLEMENTATION
     status: TaskStatus = TaskStatus.DRAFT
     priority: int = 50
+    persistent: bool | None = None
     depends_on: list[str] = Field(default_factory=list)
     created_from: list[str] = Field(default_factory=list)
     created: date = Field(default_factory=date.today)
     output: str | None = None
+    delivery: DeliveryContract | None = None
     claim: Claim | dict[str, Any] | None = None  # deprecated: kept for backward-compat reads
     decision: Decision | dict[str, Any] | None = None
     rejection_note: str | None = None
@@ -202,6 +259,13 @@ class Task(BaseModel):
         msg = "created_from must be a string or iterable of strings"
         raise TypeError(msg)
 
+    @field_validator("delivery", mode="before")
+    @classmethod
+    def _coerce_delivery(cls, value: object) -> object:
+        if value is None or value == "":
+            return None
+        return value
+
     @model_validator(mode="after")
     def _validate_status_requirements(self) -> Task:
         if self.status == TaskStatus.SCHEDULED and not (self.acceptance and self.acceptance.strip()):
@@ -213,6 +277,9 @@ class Task(BaseModel):
             raise ValueError(msg)
 
         if self.status == TaskStatus.REVIEWING:
+            if self.delivery is not None and not self.delivery.ready:
+                msg = "Reviewing task delivery contract must mark the handoff as ready"
+                raise ValueError(msg)
             blockers = find_review_blockers(self)
             if blockers:
                 msg = f"Reviewing task must not include incomplete work markers: {', '.join(blockers)}"
@@ -222,6 +289,9 @@ class Task(BaseModel):
 
 
 def find_review_blockers(task: Task, *, output: str | None = None) -> list[str]:
+    if task.delivery is not None and task.delivery.ready:
+        return []
+
     combined_text = output if output is not None else (task.output or "")
 
     blockers: list[str] = []
@@ -311,6 +381,48 @@ class RequestItem(BaseModel):
 InboxItem = RequestItem
 
 
+class Routine(BaseModel):
+    id: str
+    title: str
+    status: RoutineStatus = RoutineStatus.ACTIVE
+    interval: str
+    assigned_to: str | None = None
+    created_from: list[str] = Field(default_factory=list)
+    last_run: str | None = None
+    last_result: RoutineResult | None = None
+    body: str = ""
+
+    @field_validator("interval", mode="before")
+    @classmethod
+    def _normalize_interval(cls, value: object) -> str:
+        if not isinstance(value, str):
+            msg = "interval must be a string"
+            raise TypeError(msg)
+        return normalize_interval(value)
+
+    @field_validator("created_from", mode="before")
+    @classmethod
+    def _coerce_created_from(cls, value: object) -> list[str]:
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, Iterable):
+            return [str(item) for item in value]
+        msg = "created_from must be a string or iterable of strings"
+        raise TypeError(msg)
+
+    @model_validator(mode="after")
+    def _validate_body_sections(self) -> Routine:
+        if "## Responsibilities" not in self.body:
+            msg = "Routine body must include a '## Responsibilities' section"
+            raise ValueError(msg)
+        if "## Run Log" not in self.body:
+            msg = "Routine body must include a '## Run Log' section"
+            raise ValueError(msg)
+        return self
+
+
 class AgentRecord(BaseModel):
     id: str
     role: AgentRole = AgentRole.WORKER
@@ -360,3 +472,26 @@ class WorktreeRecord(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     body: str = ""
+
+
+class ThreadWorktree(BaseModel):
+    name: str
+    worker: str
+    path: str
+    branch: str
+    status: WorktreeStatus = WorktreeStatus.REGISTERED
+    created_at: str | None = None
+    removed_at: str | None = None
+
+
+class ThreadPR(BaseModel):
+    url: str
+    provider: str = "github"
+    repository: str | None = None
+    number: int | None = None
+    branch: str | None = None
+    worker: str | None = None
+    worktree: str | None = None
+    task_ids: list[str] = Field(default_factory=list)
+    recorded_at: str | None = None
+    updated_at: str | None = None

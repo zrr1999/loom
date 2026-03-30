@@ -14,41 +14,50 @@ from loguru import logger
 from .agent import app as agent_app
 from .agent import spawn_worker_runtime
 from .agent import start as agent_start
-from .config import ensure_settings
+from .config import ensure_hook_registry, ensure_settings
 from .history import read_events
 from .migration import (
+    ensure_manager_agent_subtree,
     ensure_name_based_threads,
     ensure_request_storage,
+    ensure_routine_storage,
     ensure_thread_ownership_metadata,
+    ensure_thread_worktree_metadata,
     ensure_worker_agent_subtree,
 )
-from .models import AgentRole, Decision, RequestItem, RequestStatus, Task, TaskKind, TaskStatus, Thread
+from .models import AgentRole, Decision, RequestItem, RequestStatus, RoutineStatus, Task, TaskKind, TaskStatus, Thread
 from .prompting import select, text
-from .repository import load_inbox_item, load_task, requests_dir, require_loom, root_config_path
+from .repository import load_inbox_item, load_routine, load_task, requests_dir, require_loom, root_config_path
 from .runtime import global_root, set_root
 from .scheduler import (
+    get_due_routines,
     get_interaction_queue,
     get_pending_inbox_items,
     get_status_summary,
+    load_all_routines,
     load_all_tasks,
     load_all_threads,
     sort_key,
 )
 from .services import (
+    AmbiguousRequestRoutingError,
     accept_task,
     adjust_task_priority,
     adjust_thread_priority,
     assign_thread,
+    create_or_merge_task,
     create_request_item,
-    create_task,
     create_thread,
     decide_task,
     ensure_agent_layout,
+    extract_routine_log,
     format_review_summary,
     plan_inbox_item,
     reject_task,
     release_claim,
     release_thread,
+    set_routine_status,
+    trigger_routine,
 )
 from .state import InvalidTransitionError
 
@@ -64,6 +73,8 @@ request_app = typer.Typer(help="Request commands.")
 app.add_typer(request_app, name="request")
 inbox_app = typer.Typer(help="Inbox commands.")
 app.add_typer(inbox_app, name="inbox")
+routine_app = typer.Typer(help="Routine commands.")
+app.add_typer(routine_app, name="routine")
 manage_app = typer.Typer(help="Manager commands.", invoke_without_command=True)
 app.add_typer(manage_app, name="manage")
 review_app = typer.Typer(help="Review and approval commands.", invoke_without_command=True)
@@ -74,9 +85,12 @@ def _resolve_loom() -> Path:
     try:
         loom = require_loom()
         ensure_request_storage(loom)
+        ensure_routine_storage(loom)
+        ensure_manager_agent_subtree(loom)
         ensure_worker_agent_subtree(loom)
         ensure_name_based_threads(loom)
         ensure_thread_ownership_metadata(loom)
+        ensure_thread_worktree_metadata(loom)
         return loom
     except FileNotFoundError as exc:
         typer.echo(f"Error: {exc}", err=True)
@@ -140,19 +154,26 @@ def init(
     project: str = typer.Option("", help="Project name."),
     global_mode: bool = typer.Option(False, "-g", help="Use the home-level loom directory."),
 ) -> None:
-    """Initialize .loom/ and ensure root loom.toml exists."""
+    """Initialize .loom/ and ensure root config files exist."""
     set_root(global_root() if global_mode else None)
     root = global_root() if global_mode else Path.cwd()
     loom = root / ".loom"
     loom.mkdir(exist_ok=True)
     (loom / "threads").mkdir(exist_ok=True)
     ensure_request_storage(loom)
+    ensure_routine_storage(loom)
+    ensure_manager_agent_subtree(loom)
     ensure_agent_layout(loom)
 
     project_name = project or root.name
-    _, created = ensure_settings(root, project_name)
-    action = "Created" if created else "Using existing"
-    typer.echo(f"{action} {root_config_path(loom).name} and ensured .loom/ structure for '{project_name}'.")
+    _, created_settings = ensure_settings(root, project_name)
+    _, created_registry = ensure_hook_registry(root)
+    config_action = "Created" if created_settings else "Using existing"
+    registry_action = "created" if created_registry else "using existing"
+    typer.echo(
+        f"{config_action} {root_config_path(loom).name}, {registry_action} loom-hooks.toml, "
+        f"and ensured .loom/ structure for '{project_name}'."
+    )
 
 
 def _add_request(description: str) -> None:
@@ -236,6 +257,106 @@ def inbox_list(
     _list_requests(pending_only=pending)
 
 
+def _format_routine_due_phrase(routine_summary: dict[str, Any]) -> str:
+    next_due = cast("dict[str, str] | None", routine_summary.get("next_due"))
+    if not next_due:
+        return "none due"
+    if next_due["when"] == "now":
+        return f"next due now ({next_due['id']})"
+    return f"next due in {next_due['when']} ({next_due['id']})"
+
+
+@routine_app.command("ls")
+@routine_app.command("list")
+def routine_list() -> None:
+    """List routines and their due/run status."""
+    loom = _resolve_loom()
+    routines = load_all_routines(loom)
+    if not routines:
+        typer.echo("No routines.")
+        return
+
+    due_ids = {routine.id for routine in get_due_routines(loom, limit=0)}
+    for routine in routines:
+        typer.echo(f"{routine.id}  {routine.status.value}  {routine.title}")
+        typer.echo(f"  interval      : {routine.interval}")
+        typer.echo(f"  assigned_to   : {routine.assigned_to or '-'}")
+        typer.echo(f"  due           : {'now' if routine.id in due_ids else '-'}")
+        typer.echo(f"  last_run      : {routine.last_run or '-'}")
+        typer.echo(f"  last_result   : {routine.last_result.value if routine.last_result else '-'}")
+        typer.echo(f"  file          : {loom / 'routines' / f'{routine.id}.md'}")
+
+
+@routine_app.command("pause")
+def routine_pause(routine_id: str) -> None:
+    """Pause an active routine."""
+    _require_non_worker_manage_context("routine pause")
+    loom = _resolve_loom()
+    try:
+        path, routine = set_routine_status(loom, routine_id, target_status=RoutineStatus.PAUSED)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"PAUSED routine {routine.id}\n  status        : {routine.status.value}\n  file          : {path}")
+
+
+@routine_app.command("resume")
+def routine_resume(routine_id: str) -> None:
+    """Resume a paused or disabled routine."""
+    _require_non_worker_manage_context("routine resume")
+    loom = _resolve_loom()
+    try:
+        path, routine = set_routine_status(loom, routine_id, target_status=RoutineStatus.ACTIVE)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"RESUMED routine {routine.id}\n  status        : {routine.status.value}\n  file          : {path}")
+
+
+@routine_app.command("run")
+def routine_run(routine_id: str) -> None:
+    """Force-trigger a routine through the routine_trigger message path."""
+    _require_non_worker_manage_context("routine run")
+    loom = _resolve_loom()
+    try:
+        result = trigger_routine(loom, routine_id, forced=True)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    routine = cast("Any", result["routine"])
+    message = cast("dict[str, Any]", result["message"])
+    typer.echo(
+        "\n".join(
+            [
+                f"TRIGGERED routine {routine.id}",
+                f"  assigned_to   : {routine.assigned_to or '-'}",
+                f"  message       : {message['id']}",
+                f"  type          : {message['type']}",
+            ]
+        )
+    )
+
+
+@routine_app.command("log")
+def routine_log(routine_id: str) -> None:
+    """Show the append-only run log for a routine."""
+    loom = _resolve_loom()
+    try:
+        _path, routine = load_routine(loom, routine_id)
+    except FileNotFoundError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"RUN LOG {routine.id}")
+    log_text = extract_routine_log(routine.body)
+    if not log_text or log_text == "<!-- append-only notes -->":
+        typer.echo("  (empty)")
+        return
+    for line in log_text.splitlines():
+        typer.echo(f"  {line}")
+
+
 @app.command()
 def status() -> None:
     """Show project progress overview."""
@@ -253,6 +374,16 @@ def status() -> None:
     typer.echo(f"Inbox:   {inbox['pending']} pending / {inbox['total']} total")
     for status_name, count in sorted(cast("dict[str, int]", inbox["by_status"]).items()):
         typer.echo(f"  inbox.{status_name}: {count}")
+
+    routines = cast("dict[str, Any]", summary["routines"])
+    routine_statuses = cast("dict[str, int]", routines["by_status"])
+    typer.echo(
+        "Routines: "
+        f"{routine_statuses.get(RoutineStatus.ACTIVE.value, 0)} active · "
+        f"{routine_statuses.get(RoutineStatus.PAUSED.value, 0)} paused · "
+        f"{routine_statuses.get(RoutineStatus.DISABLED.value, 0)} disabled · "
+        f"{_format_routine_due_phrase(routines)}"
+    )
 
     queue = cast("list[dict[str, Any]]", summary["queue"])
     if queue:
@@ -272,6 +403,20 @@ def status() -> None:
             follow_up = capability.get("implementation_follow_up")
             if isinstance(follow_up, dict):
                 typer.echo(f"    implementation follow-up: {follow_up['id']} [{follow_up['status']}]")
+            latest_pr = capability.get("latest_pr")
+            if isinstance(latest_pr, dict):
+                pr_line = f"    latest pr: {latest_pr['url']}"
+                if latest_pr.get("branch"):
+                    pr_line += f" [{latest_pr['branch']}]"
+                typer.echo(pr_line)
+
+    worktree_issues = cast("dict[str, list[str]]", summary.get("worktree_issues", {}))
+    if worktree_issues:
+        typer.echo("Worktree issues:")
+        for thread_name, issues in sorted(worktree_issues.items()):
+            typer.echo(f"  {thread_name}:")
+            for issue in issues:
+                typer.echo(f"    - {issue}")
 
 
 @manage_app.callback()
@@ -388,6 +533,7 @@ def manage_new_task(
     depends_on: str = typer.Option("", help="Comma-separated dependency IDs."),
     after: str = typer.Option("", "--after", help="Sugar for --depends-on: single task ID this task comes after."),
     created_from: str = typer.Option("", help="Comma-separated source inbox RQ IDs."),
+    persistent: bool = typer.Option(False, "--persistent", help="Keep the task scheduled after each completion."),
     background: str = typer.Option("", help="Task background section content."),
     implementation_direction: str = typer.Option("", help="Implementation direction section content."),
 ) -> None:
@@ -396,7 +542,7 @@ def manage_new_task(
     loom = _resolve_loom()
     merged_deps = ",".join(filter(None, [depends_on, after]))
     try:
-        task, path = create_task(
+        result = create_or_merge_task(
             loom,
             thread_name=thread,
             title=title,
@@ -405,6 +551,7 @@ def manage_new_task(
             acceptance=acceptance,
             depends_on=merged_deps,
             created_from=created_from,
+            persistent=persistent,
             background=background,
             implementation_direction=implementation_direction,
         )
@@ -412,26 +559,36 @@ def manage_new_task(
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
 
+    task = result.task
+    path = result.path
+    heading = "CREATED" if result.created else "MERGED"
     lines = [
-        f"CREATED task {task.id}",
+        f"{heading} task {task.id}",
         f"  kind   : {task.kind.value}",
         f"  status : {task.status.value}",
         f"  thread : {task.thread}",
         f"  file   : {path}",
     ]
+    if task.persistent:
+        lines.append("  persistent : true")
+    if not result.created and result.merge_reason:
+        lines.append(f"  merged  : {result.merge_reason}")
+        if result.priority_changed:
+            lines.append(f"  priority: elevated to {task.priority}")
     typer.echo("\n".join(lines))
 
 
 @manage_app.command("plan")
 def manage_plan(
     rq_id: str = typer.Argument(..., help="Request id to plan."),
+    thread: str = typer.Option("", "--thread", help="Explicit target thread when inference is ambiguous."),
 ) -> None:
     """Plan a pending request into the next task."""
     _require_non_worker_manage_context("manage plan")
     loom = _resolve_loom()
     try:
-        planned = plan_inbox_item(loom, rq_id)
-    except (FileNotFoundError, ValueError, InvalidTransitionError) as exc:
+        planned = plan_inbox_item(loom, rq_id, thread_name=thread or None)
+    except (FileNotFoundError, ValueError, InvalidTransitionError, AmbiguousRequestRoutingError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
 
@@ -440,6 +597,9 @@ def manage_plan(
         f"  resolved_as : {planned['resolved_as']}",
         f"  resolved_to : {', '.join(cast('list[str]', planned['resolved_to']))}",
     ]
+    resolution_note = cast("str | None", planned.get("resolution_note"))
+    if resolution_note:
+        lines.append(f"  note        : {resolution_note}")
     created_thread = cast("str | None", planned.get("created_thread"))
     if created_thread:
         lines.append(f"  created_thread : {created_thread}")
@@ -481,7 +641,7 @@ def _list_review_queue() -> None:
         return
 
     for task in tasks:
-        for line in format_review_summary(task):
+        for line in format_review_summary(task, thread=load_all_threads(loom).get(task.thread)):
             typer.echo(line)
         typer.echo('  next: use `loom review accept <id>` or `loom review reject <id> "reason"`')
 
@@ -611,7 +771,7 @@ def release(
     target: str = typer.Argument(..., help="Thread name or task ID to release ownership of."),
     note: str = typer.Argument(..., help="Reason for releasing."),
 ) -> None:
-    """Release thread ownership (or a legacy task claim) back to the pool."""
+    """Release stale thread ownership back to the pool."""
     loom = _resolve_loom()
     try:
         from .scheduler import load_all_threads
