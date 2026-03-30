@@ -67,7 +67,7 @@ The human surface owns approval and attention management.
 | `loom reject <task-id> "<note>"` | reject reviewing work | implemented |
 | `loom decide <task-id> <option>` | answer a paused decision with a predefined option | implemented |
 | `loom decide <task-id> --text "<body>"` | answer a paused decision with free text | partial / design target |
-| `loom release <task-id> "<reason>"` | release a stuck claimed task | implemented |
+| `loom release <id> "<reason>"` | release stale thread ownership so work can be reassigned | implemented |
 
 ### Agent surface: `loom agent`
 
@@ -79,9 +79,9 @@ The agent surface owns planning, execution, and coordination.
 | `loom agent start` | print the manager bootstrap loop | implemented |
 | `loom agent new-thread --name <name>` | create a thread | implemented |
 | `loom agent new-task --thread <id> --title "<title>"` | create a task | implemented |
-| `loom agent done <task-id>` | move claimed work to reviewing | implemented |
-| `loom agent pause <task-id> --question "<q>"` | pause claimed work and request a decision | implemented |
-| `loom agent checkpoint --phase <phase> "<summary>"` | persist executor progress context | implemented for executors; manager support currently deferred |
+| `loom agent done <task-id>` | mark completed work review-ready | implemented |
+| `loom agent pause <task-id> --question "<q>"` | pause work and request a decision | implemented |
+| `loom agent checkpoint --phase <phase> "<summary>"` | persist runtime progress context | implemented for workers and manager; director/reviewer remain read-only |
 | `loom agent resume` | print stored executor checkpoint body | implemented |
 | `loom agent status` | manager-facing project and worker status | implemented |
 | `loom agent spawn [--threads <ids>]` | register / prepare an executor | implemented |
@@ -109,7 +109,7 @@ loom accept <task-id>
 loom reject <task-id> "<rejection note>"
 loom decide <task-id> <option-id>
 loom decide <task-id> --text "<freeform answer>"
-loom release <task-id> "<reason>"
+loom release <id> "<reason>"
 ```
 
 ### `loom agent`
@@ -119,7 +119,7 @@ loom agent next [--thread <id>] [--wait-seconds <seconds>] [--retries <n>] [--ma
 loom agent start
 loom agent new-thread --name <name> [--priority <n>] --manager
 loom agent new-task --thread <id> --title "<title>" [--priority <n>] [--acceptance "<text>"] [--depends-on "<id1,id2>"] [--after <task-id>] --manager
-loom agent done <task-id> [--output <path-or-url>]
+loom agent done <task-id> [--output <.loom/products/...|url>]
 loom agent pause <task-id> --question "<question>" [--options "<json>"]
 loom agent checkpoint --phase <planning|implementing|reviewing|blocked|idle> "<summary>"
 loom agent resume
@@ -165,7 +165,7 @@ The CLI should use compact action picks with a visible default, not long verb ph
 $ loom
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[ 2 / 5 ]  review  backend-003-login-page  ·  x7k2  ·  14:32
+[ 2 / 5 ]  review  backend-003  ·  x7k2  ·  14:32
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   output
@@ -226,22 +226,34 @@ The human surface should prefer:
 The agent surface should prefer labeled blocks and stable headings:
 
 ```text
-ACTION  task
+<!-- BEGIN: worker-agent-next-text-example -->
+ACTION  pickup
 COUNT   1
 ACTOR   x7k2
+THREAD  backend
 
-CLAIMED TASKS
-  TASK  backend-003-login-page
+ASSIGNED TASKS
+  TASK  backend-003
     title      : Build login page
+    kind       : implementation
     thread     : backend
-    status     : claimed
+    status     : scheduled
     priority   : 50
-    file       : .loom/threads/backend/backend-003-login-page.md
+    file       : .loom/threads/backend/003.md
+    acceptance :
+      - [ ] Render the login form
+
+When finished with each task:
+  loom agent done <task-id> [--output <.loom/products/...|url>]
+
+If blocked and need a decision:
+  loom agent pause <task-id> --question '<question>'
+<!-- END: worker-agent-next-text-example -->
 ```
 
 Contract decisions:
 
-- headings such as `ACTION`, `COUNT`, `ACTOR`, `READY TASKS`, and `CLAIMED TASKS` are part of the textual contract
+- headings such as `ACTION`, `COUNT`, `ACTOR`, `READY TASKS`, and `ASSIGNED TASKS` are part of the textual contract
 - outputs should avoid trailing sentinel noise like `none: true` / `none: false`
 - mutating commands should always make side effects explicit
 - task ids should always be printed in full
@@ -273,23 +285,27 @@ Reasons:
 When `loom agent next --json` eventually lands, its payload should mirror the text action kind instead of inventing a second model:
 
 ```json
+<!-- BEGIN: worker-agent-next-json-example -->
 {
-  "action": "task",
+  "action": "pickup",
   "count": 1,
   "actor": "x7k2",
+  "threads": ["backend"],
   "tasks": [
     {
-      "id": "backend-003-login-page",
+      "id": "backend-003",
       "thread": "backend",
       "title": "Build login page",
-      "status": "claimed",
+      "kind": "implementation",
+      "status": "scheduled",
       "priority": 50,
       "depends_on": [],
-      "acceptance": "- [ ] ...",
-      "file": ".loom/threads/backend/backend-003-login-page.md"
+      "acceptance": "- [ ] Render the login form",
+      "file": ".loom/threads/backend/003.md"
     }
   ]
 }
+<!-- END: worker-agent-next-json-example -->
 ```
 
 The idle payload should carry a structured waiting summary rather than a boolean `none` flag.

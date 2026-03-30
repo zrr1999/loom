@@ -26,7 +26,7 @@ def _setup_loom(tmp_path: Path) -> Path:
     # Minimal loom.toml
     (tmp_path / "loom.toml").write_text(
         '[project]\nname = "test"\n\n[agent]\ninbox_plan_batch = 10\ntask_batch = 1\n'
-        'executor_command = ""\noffline_after_minutes = 30\nnext_wait_seconds = 0.0\nnext_retries = 0\n\n'
+        'executor_command = ""\noffline_after_minutes = 30\nnext_wait_seconds = 60.0\nnext_retries = 5\n\n'
         "[threads]\ndefault_priority = 50\n",
         encoding="utf-8",
     )

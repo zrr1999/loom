@@ -1,0 +1,18 @@
+# Repo-local Loom hook definitions.
+# `loom.toml` decides which hooks are active and in what order.
+# Built-in hook ids do not need to be repeated here.
+
+# [hooks.repo-next-reminder]
+# points = ["next"]
+#
+# [hooks.repo-next-reminder.before]
+# worker = "Run the focused tests before handing off."
+#
+# [hooks.repo-next-reminder.after]
+# manager = "Keep the next handoff mailbox-first."
+#
+# [hooks.repo-done-summary]
+# points = ["done"]
+#
+# [hooks.repo-done-summary.after]
+# worker = "Double-check the handoff summary after `loom agent done`."

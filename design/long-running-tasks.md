@@ -1,22 +1,27 @@
 # Long-Running Task Support
 
+> Historical design note: this document describes the original lease proposal that kept
+> task-level `claimed` status. The implemented model moved claiming to thread ownership in
+> `.loom/threads/<thread-name>/_thread.md` via `owner`, `owned_at`, `owner_heartbeat_at`,
+> and `owner_lease_expires_at`; legacy `claimed` tasks are migrated to `scheduled`.
+
 ## Goal
 
 Support executor work that spans more than one short session without adding hidden runtime state or a separate control plane. Task progress should remain visible in `.loom/` files and recoverable through existing agent records.
 
-## Current Baseline
+## Historical Baseline
 
 Today, Loom already provides the core pieces:
 
-- task states: `draft | scheduled | claimed | reviewing | paused | done`
+- task states at proposal time: `draft | scheduled | claimed | reviewing | paused | done`
 - readiness rule: a task is ready only when it is `scheduled` and all `depends_on` tasks are `done`
-- `loom agent next` claims ready tasks immediately
-- `loom agent checkpoint` updates the executor `_agent.md`
+- `loom agent next` claimed ready tasks immediately
+- `loom agent checkpoint` updated the executor `_agent.md`
 - `loom agent resume` prints the stored checkpoint body
-- a claim is released only by `done`, `pause`, or `loom release`
-- there is currently **no automatic timeout on claimed tasks**
+- a claim was released only by `done`, `pause`, or `loom release`
+- there was **no automatic timeout on claimed tasks**
 
-That makes long-running work possible, but not yet safe to recover automatically when an executor disappears.
+That made long-running work possible, but not yet safe to recover automatically when an executor disappeared.
 
 ## Design: keep `claimed`, add a lease
 

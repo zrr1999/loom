@@ -1,7 +1,7 @@
 ---
 name: loom-manager
 description: Use when pending inbox work must be planned or Loom routes manager-owned work.
-role: primary
+role: all
 
 model:
   tier: reasoning
@@ -13,7 +13,6 @@ capabilities:
   - read
   - write
   - bash:
-    - "uvx --from agent-loom loom agent *"
     - "loom agent *"
   - delegate
 ---

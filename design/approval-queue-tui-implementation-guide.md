@@ -163,28 +163,34 @@ HOW TO ADD "loom tui":
 
 FILE: /workspace/loom/src/loom/models.py
 
-TaskStatus enum [line 18-24]:
+<!-- BEGIN: task-status-guide -->
+TaskStatus enum:
   DRAFT = "draft" ← not in interactive queue
-  SCHEDULED = "scheduled" ← next for agent
-  CLAIMED = "claimed" ← agent is working
+  SCHEDULED = "scheduled" ← next for an agent; active ownership lives on the thread
+  CLAIMED = "claimed" ← deprecated legacy task status; read only for backward-compat migration
   PAUSED = "paused" ← QUEUE: awaiting human decision
   REVIEWING = "reviewing" ← QUEUE: awaiting human approval
   DONE = "done" ← terminal
+<!-- END: task-status-guide -->
 
-Task model [line 125-183]:
+Task model [current implementation]:
   id: str                    ← e.g., "backend-003"
   thread: str                ← thread name
-  seq: int ← sequence in thread
+  seq: int                   ← sequence in thread
   title: str
+  kind: TaskKind = implementation
   status: TaskStatus
-  priority: int = 50 ← higher = earlier in queue
+  priority: int = 50         ← higher = earlier in queue
+  persistent: bool | None    ← optional long-running rescheduling flag
   depends_on: list[str] = [] ← task ID dependencies
   created_from: list[str] = []
   created: date
   output: str | None         ← agent's deliverable path/URL
-  claim: Claim | dict | None ← agent claiming info
+  delivery: DeliveryContract | None ← explicit review handoff contract
+  claim: Claim | dict | None ← legacy task-level claim data; backward-compat reads only
   decision: Decision | dict | None  ← FOR PAUSED: human needs to choose
-  rejection_note: str | None ← FOR REVIEWING: why rejected
+  rejection_note: str | None ← latest rejection-note compatibility mirror
+  review_history: list[ReviewEntry] = [] ← append-only accept/reject events
   acceptance: str | None     ← acceptance criteria (required for scheduled)
   body: str = ""
 
@@ -194,13 +200,15 @@ Decision model [line 96-100]:
     DecisionOption: id, label, note (optional)
   decided: str | None        ← filled AFTER human chooses
 
-TASK STATE MACHINE (TASK_TRANSITIONS): [line 57-64]
+<!-- BEGIN: task-transition-guide -->
+TASK STATE MACHINE (TASK_TRANSITIONS):
   DRAFT → SCHEDULED
-  SCHEDULED → CLAIMED
-  CLAIMED → {REVIEWING, PAUSED, SCHEDULED}
+  SCHEDULED → {REVIEWING, PAUSED}
+  CLAIMED → {REVIEWING, PAUSED, SCHEDULED} ← backward-compat reads only; new tasks use thread ownership instead
   REVIEWING → {DONE, SCHEDULED}
   PAUSED → SCHEDULED
   DONE → SCHEDULED
+<!-- END: task-transition-guide -->
 
 Invariants:
 
@@ -352,7 +360,7 @@ DESIGN/CLI-DESIGN.MD (human surface styling):
   Lines 160-184: Interactive mockup shows desired UX:
 
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    [ 2 / 5 ]  review  backend-003-login-page  ·  x7k2  ·  14:32
+    [ 2 / 5 ]  review  backend-003  ·  x7k2  ·  14:32
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
       output
@@ -396,14 +404,14 @@ DESIGN/REVIEW-WORKFLOW.MD (future context):
     Current Phase 1: single-task operations only
     Batch operations: accept, reject with same note across multiple tasks
 
-  Lines 59-75: Future review_notes append-only model (DEFER)
-    Not Phase 1 — current rejection_note field is stable
-    Future: append-only history, per-task notes
+  Lines 59-75: Current review_history append-only model
+    review_history already stores append-only accept/reject events
+    rejection_note remains the latest-note compatibility mirror
 
   IMPORTANT: Phase 1 TUI should use CURRENT models, not future ones
 
-- Single rejection_note field only
-- No review_notes append-only field yet
+- review_history append-only field is available
+- rejection_note remains only as the latest-note compatibility mirror
 - No follow-up/continue flows yet
 
 ### 7. ACTIONABLE IMPLEMENTATION CHECKLIST

@@ -106,6 +106,7 @@ When a new request appears, manager decides one of four outcomes:
 Important behavior:
 
 - manager should ask a human question instead of guessing when the request is ambiguous
+- manager-facing planning commands should stop instead of falling back to the highest-priority unrelated thread when thread inference is ambiguous
 - `resolved_as` and `resolved_to` must make the triage decision inspectable after the fact
 
 ### `processing` transition timing
@@ -399,6 +400,90 @@ Tests will need updates for:
 - new routine status output
 - manager `next` output when a due routine exists
 - message-type handling for `routine_trigger`
+
+## Request / inbox file-count growth strategy
+
+The requests transition should solve the older inbox file-count problem without giving up
+filesystem-first auditability.
+
+### Core strategy
+
+Use a two-tier layout:
+
+1. **active working set stays shallow**
+   - keep mutable requests directly under `.loom/requests/` (or `.loom/inbox/` during compatibility)
+   - only `pending` and short-lived `processing` requests stay in that hot path by default
+2. **resolved requests move into an immutable archive tree**
+   - move `done` requests into `.loom/requests/archive/YYYY/MM/RQ-xxx.md`
+   - during the compatibility window, use the same shape under `.loom/inbox/archive/YYYY/MM/`
+   - archived files keep the exact markdown body/frontmatter, so review and grep stay simple
+
+This keeps the day-to-day directory small for humans and the manager loop while preserving one
+file per request for long-term history.
+
+### Why archive instead of compaction
+
+- **auditability stays obvious**: each request remains a readable markdown record
+- **migration risk stays low**: active readers still operate on ordinary files instead of a new
+  database or bundle format
+- **performance improves where it matters**: manager planning and `loom request ls` primarily need
+  the open working set, not every historical request ever created
+
+Compaction or opaque index files can remain future optimizations, but they should not be the first
+solution to file-count growth.
+
+### Reader rules
+
+- default request/inbox reads should scan the active root only
+- commands that need history (`loom request ls --all`, request lookup by id, audit/report flows)
+  should also scan `archive/`
+- archive traversal must be recursive, but the hot-path scan for active work stays shallow and
+  predictable
+- routines keep their existing flat `.loom/routines/` layout for now because they are long-lived,
+  manager-owned records rather than high-churn intake items
+
+### Backward compatibility
+
+Support these workspace shapes during migration:
+
+1. legacy flat `.loom/inbox/RQ-xxx.md`
+2. mixed inbox workspace with `.loom/inbox/archive/YYYY/MM/RQ-xxx.md`
+3. new requests workspace with `.loom/requests/RQ-xxx.md`
+4. new requests workspace with `.loom/requests/archive/YYYY/MM/RQ-xxx.md`
+
+Rules:
+
+- if `.loom/requests/` exists, treat it as the canonical intake root
+- otherwise keep using `.loom/inbox/` as the compatibility root
+- archived requests keep the same `RQ-xxx` ids, so links from tasks/routines do not change
+- migration should be path-only; request frontmatter does not need a second archival state
+
+### Agent inbox / mailbox follow-up
+
+The same pattern can later be applied to high-volume mailbox trees:
+
+- keep `pending/` flat for current actionable messages
+- move replied or resolved messages into `archive/YYYY/MM/` under the existing mailbox subtree
+
+That follow-up should happen only after request archival lands, because request/inbox intake growth
+is the immediate pain point and the manager-owned routine flow depends on keeping request scans fast.
+
+### Smallest safe implementation slices
+
+1. **archive-aware readers**
+   - teach repository helpers to read active roots plus optional `archive/` trees
+   - keep default list/status commands focused on active requests unless explicitly asked for
+2. **manual archival command**
+   - add a manager/human command to move old `done` requests from the active root into the archive
+   - preserve filenames/ids and print the destination path for auditability
+3. **status/reporting polish**
+   - surface active vs archived counts where useful
+   - add targeted tests for mixed legacy/new layouts and archived lookups
+4. **optional policy automation**
+   - only after the manual flow is trusted, add threshold- or age-based archival helpers
+
+This sequence preserves compatibility, avoids touching routine scheduling semantics, and keeps the
+manager-owned routine/request flow stable while the intake history grows.
 
 ## Explicit deferrals
 

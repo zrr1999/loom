@@ -14,10 +14,10 @@ Current Loom claims work at the task level. RQ-011 asks to move ownership up one
 1. Manager plans and never claims work.
 2. Executor claims a thread.
 3. Executor works tasks inside the claimed thread.
-4. Canonical artifacts live under `.loom/agents/<agent-id>/assets/`.
-5. Selected outputs are linked into `.loom/threads/<THREAD>/outputs/`.
+4. Canonical local artifacts live under `.loom/products/`.
+5. Threads/tasks link to those shared product paths for review.
 6. Human review remains task-based.
-7. Manager curates global outputs under `.loom/outputs/`.
+7. Manager can curate subfolders such as `.loom/products/reports/`.
 
 ## Filesystem layout changes
 
@@ -26,11 +26,8 @@ Current Loom claims work at the task level. RQ-011 asks to move ownership up one
   threads/
     AK/
       _thread.md
-      outputs/
-  agents/
-    aaaa/
-      assets/
-  outputs/
+  products/
+    reports/
     curated/
     daily/
 ```

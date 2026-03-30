@@ -7,10 +7,15 @@
 - `loom request ls`
 - `loom inbox add "..."`
 - `loom inbox`
+- `loom routine ls`
+- `loom routine pause <id>`
+- `loom routine resume <id>`
+- `loom routine run <id>`
+- `loom routine log <id>`
 - `loom manage`
 - `loom manage new-thread --name backend`
 - `loom manage new-task --thread backend`
-- `loom manage plan <rq-id>`
+- `loom manage plan <rq-id> [--thread <name>]`
 - `loom manage assign --thread backend --worker worker-123`
 - `loom status`
 - `loom manage priority [--task <id> | --thread <name>] [--set <n>]`
@@ -84,22 +89,39 @@ This keeps the human review flow focused on what was delivered and how prior rev
 
 `loom init` ensures both `.loom/` and root `loom.toml` exist. It is idempotent. Pass `-g` to use the home-level loom workspace.
 
+### `loom routine`
+
+`loom routine` is the stable manager/human surface for recurring work stored under
+`.loom/routines/`.
+
+- `loom routine ls`: list each routine's lifecycle (`active`, `paused`, `disabled`), interval, due state, latest run, latest result, and backing file
+- `loom routine pause <id>`: move an active routine to `paused`
+- `loom routine resume <id>`: move a paused or disabled routine back to `active`
+- `loom routine run <id>`: force-trigger the routine by sending a `routine_trigger` message to its assigned worker; Loom does not run the routine inline from the manager CLI
+- `loom routine log <id>`: show the routine's append-only `## Run Log` section
+
+`loom status` summarizes routine counts plus the next due routine. Manager
+`loom agent next --role manager` checks pending request planning work first, then ready
+tasks, and only then surfaces due routines with `ACTION  trigger`.
+
 ### `loom agent worktree`
 
-`loom agent worktree` is a worker-only helper around worker-local worktree metadata.
-It fails unless `LOOM_WORKER_ID` is set, and it only reads records from the current worker subtree.
+`loom agent worktree` is a worker-only helper around worker-local worktree records plus
+thread-owned worktree linkage/history. It fails unless `LOOM_WORKER_ID` is set, and it
+only reads records from the current worker subtree.
 
 - `loom agent worktree add`: register a worktree directory under `.loom/agents/workers/<id>/worktrees/`
-- `loom agent worktree attach`: record advisory `thread` / `status` metadata for that worker-local checkout
+- `loom agent worktree attach`: link or unlink that checkout from thread-owned metadata
 - `loom agent worktree list`: show only the current worker's worktrees plus path, branch, status, worker, and thread
-- `loom agent worktree remove`: delete only the worker-local Loom record; the checkout on disk must still be removed separately when safe
+- `loom agent worktree remove`: delete the worker-local Loom record, remove the checkout directory, and preserve thread-visible history
 
 Current guardrails:
 
 - every `loom agent worktree ...` command requires `LOOM_WORKER_ID`
 - a worker can only see and manage worktrees inside its own `.loom/agents/workers/<id>/worktrees/` subtree
+- nested or overlapping worktree paths are rejected
 - removing an attached worktree record requires `loom agent worktree attach <name> --clear` first, unless `--force` is passed
-- worktree metadata is intentionally non-authoritative; task and worker truth stays in `.loom/threads/` and `.loom/agents/`
+- thread metadata is authoritative for worktree linkage/history and PR artifacts; worker-local records remain convenience indexes
 
 Secondary-checkout runtime notes:
 
@@ -130,26 +152,46 @@ loom agent next
 - `loom agent mailbox-read <msg-id>`
 - `loom agent send <to> "..."`
 - `loom agent reply <msg-id> "..."`
-- `loom agent done <id> --output path`
+- `loom agent done <id> --output <.loom/products/...|url>`
 - `loom agent pause <id> --question ... --options ...`
 - `loom agent status`
 
-Legacy compatibility aliases still exist for `loom agent new-thread`, `loom agent new-task`, and `loom agent plan`, but the canonical manager-facing locations are now under `loom manage`.
+`loom agent new-task` remains available for autonomous worker/agent task creation inside an active runtime. Human-facing planning should still prefer `loom manage new-task`.
+
+Managers can also run `loom agent checkpoint ... --role manager` and `loom agent resume --role manager`; those commands update/read the singleton record at `.loom/agents/manager/_agent.md`.
+
+Legacy compatibility aliases still exist for `loom agent new-thread` and `loom agent plan`, but the canonical manager-facing locations are now under `loom manage`.
 
 Terminology note: `loom inbox` / `.loom/requests/` is the project request inbox, while `loom agent mailbox` is the per-agent message queue. Legacy `loom agent inbox` and `loom agent inbox-read` aliases still work for compatibility.
 
 If `loom agent pause` is called without `--question`, it falls back to a small terminal wizard.
 
-`loom agent done` only sends work to `reviewing` when the task looks review-ready. If the task body or output still contains TODO markers, proposal-only output, or explicit follow-up-improvement notes, the command pauses the task instead and generates a decision block for the human queue.
+`loom agent done` now supports an explicit delivery contract:
 
-`loom agent next` first returns pending requests that should be planned into tasks, then returns ready tasks.
+- `--ready`: declare that this handoff is intentionally review-ready even if the freeform output contains words like `TODO`
+- `--artifact <path>`: attach structured delivery artifacts; repeatable, and local relative paths normalize under `.loom/products/...`
+- `--pr-url <url>`: attach structured PR URLs without relying on URL scraping from `--output`
+
+Without an explicit delivery contract, `loom agent done` still uses the legacy safety heuristics: if the task body or output contains TODO markers, proposal-only output, or explicit follow-up-improvement notes, the command pauses the task instead and generates a decision block for the human queue.
+
+If the task has `persistent: true`, `loom agent done` records the latest output/delivery metadata but keeps the task in `scheduled` so it can be picked up again in a future session without human review.
+
+When `--output` is a relative local path, Loom stores it under `.loom/products/...` so
+review handoffs reference a shared products tree. The default human-review report
+convention is `.loom/products/reports/<task-id>.md`, and legacy
+`.loom/agents/workers/<id>/outputs/...` paths are rewritten into that shared
+`reports/` subtree. URLs and freeform multiline summaries are preserved as-is.
+
+`loom agent next` checks pending requests before ready tasks. For manager role, it now auto-plans pending requests when routing is clear, then continues to the next manager action. Worker/director flows still surface planning as an upstream dependency.
+
+Auto-planning also de-duplicates obvious overlap: when a new request matches an existing scheduled task in the target thread, Loom resolves the request as `merged`, links it to the existing task, and raises that task's priority instead of creating a duplicate.
 
 - thread arguments still use human-facing thread names like `backend`
 - task ids shown in CLI output use the readable name-based form like `backend-001`
 
 - planning batch size comes from `agent.inbox_plan_batch` and defaults to `10`
 - ready-task batch size comes from `agent.task_batch` and defaults to `1`
-- idle wait/retry defaults come from `agent.next_wait_seconds` (`0.0`) and `agent.next_retries` (`0`)
+- idle wait/retry defaults come from `agent.next_wait_seconds` (`60.0`) and `agent.next_retries` (`5`)
 - planning output may imply both `new-thread` and `new-task`
 
 `loom agent next` supports idle polling controls:
@@ -157,39 +199,65 @@ If `loom agent pause` is called without `--question`, it falls back to a small t
 - `--wait-seconds <n>`: seconds to sleep between idle retries
 - `--retries <n>`: retry count when the action is idle
 
-By default (`0.0` seconds, `0` retries), behavior is unchanged: a single immediate check.
-Each retry re-checks both pending request planning work and ready tasks before the command finally returns `ACTION  idle`.
+By default, Loom waits `60.0` seconds between idle checks and retries `5` times before returning the final wait/idle action.
+Each retry re-checks both pending request planning work and ready tasks before the command finally returns the role-specific wait/idle action.
 
-Important: `loom agent next` is no longer read-only for task execution. Worker calls claim the returned thread(s) for the current worker, but the command still does not perform request-to-task planning for you.
+Important: `loom agent next` is no longer read-only for task execution. Worker calls claim the returned thread(s) for the current worker, and manager calls may also plan pending requests as part of the same loop. `ACTION  plan` now means Loom needs an explicit manager routing choice rather than a generic reminder to do manual planning.
 
 Claimed thread ownership now carries a visible lease in `_thread.md`. `loom agent checkpoint` refreshes that lease for every thread currently owned by the worker, and stale ownership becomes reclaimable by another worker once the stored lease expires. The default lease window matches `agent.offline_after_minutes`.
 
-`loom agent next` can also append role-specific **soft hooks** from `loom.toml`. These are advisory reminders only: they never block the command, mutate task state, or gate completion.
+`loom agent next` can also append role-specific **soft hooks**. These are advisory reminders only: they never block the command, mutate task state, or gate completion. `loom.toml` selects ordered hooks with `[[hooks]]`; each entry declares its own `points`; repo-local definitions live in `loom-hooks.toml`; built-ins use `builtin = "..."`. Loom renders every selected hook `before` phase in definition order and every `after` phase in reverse order.
 
 ```toml
-[hooks.next]
-all = "Shared reminder shown to every role."
+[[hooks]]
+id = "reminders"
+points = ["next"]
+
+[[hooks]]
+builtin = "commit-message-policy"
+points = ["next"]
+```
+
+```toml
+[hooks.reminders]
+points = ["next"]
+
+[hooks.reminders.before]
+all = "Shared reminder shown before the next output."
 worker = """
 Run the focused tests before `loom agent done`.
 Double-check any generated output before handing off.
 """
+
+[hooks.reminders.after]
 manager = "Keep task handoffs mailbox-first."
-examples = ["commit-message-policy"]
 ```
 
 - supported per-role keys: `all`, `manager`, `worker`, `director`, `reviewer`
-- supported built-in examples today: `commit-message-policy`
-- worker output with `examples = ["commit-message-policy"]` includes a ready-made reminder about the repo's commit message format
-- the hook block is appended as a clearly labeled `SOFT HOOKS` section on `plan`, `task`, and `idle` output
+- supported built-in hook ids today: `commit-message-policy`
+- worker output with `builtin = "commit-message-policy"` includes a ready-made reminder about the repo's commit message format
+- `loom agent next` can render both `SOFT HOOKS  next/before` and `SOFT HOOKS  next/after` sections around role-specific actions such as `pickup`, `assign`, `wake`, `escalate`, and `wait`
 
-`loom agent done` now supports matching lifecycle hook points before and after the completion attempt. These reminders stay advisory even when `loom agent done` routes the task to `paused` instead of `reviewing`.
+`loom agent done` uses the same lifecycle model. Each named hook entry can contribute a `before` phase, an `after` phase, or both. These reminders stay advisory even when `loom agent done` routes the task to `paused` instead of `reviewing`.
 
 ```toml
-[hooks.done.before]
-examples = ["worker-done-review"]
+[[hooks]]
+builtin = "worker-done-review"
+points = ["done"]
+
+[[hooks]]
+id = "review-pass"
+points = ["done"]
+```
+
+```toml
+[hooks.review-pass]
+points = ["done"]
+
+[hooks.review-pass.before]
 worker = "Optional repo-specific reminder layered on top of the built-in review checklist."
 
-[hooks.done.after]
+[hooks.review-pass.after]
 worker = """
 If this paused, summarize the blocker and ask for a decision quickly.
 If this is reviewing, make sure the handoff names the tests you ran and the output path.
@@ -197,21 +265,20 @@ If this is reviewing, make sure the handoff names the tests you ran and the outp
 ```
 
 - supported per-role keys: `all`, `manager`, `worker`, `director`, `reviewer`
-- supported built-in `hooks.done.before.examples` today: `worker-done-review`
+- supported built-in done hook ids today: `worker-done-review`
 - `worker-done-review` asks the worker to inspect the diff, question whether any code growth earns its keep, look for simplifications, and confirm checkpoint/tests before finishing
-- `before` hooks print before Loom validates/submits `loom agent done`
-- `after` hooks print after the result block so workers can sanity-check the handoff they just produced
+- legacy `hooks.done.before` / `hooks.done.after` config is no longer accepted
+- `before` phases print before Loom validates/submits `loom agent done`
+- `after` phases print after the result block so workers can sanity-check the handoff they just produced
 - when no done hooks are configured, `loom agent done` output stays unchanged apart from the normal result block
 
-Current behavior note: worker-safe `loom agent` commands infer the acting worker from `LOOM_WORKER_ID`. If that environment variable is missing, the command fails with guidance to use `--role manager`, `--role director`, or `--role reviewer`, or to set `LOOM_WORKER_ID`. Read-only commands like `loom agent status` and bootstrap guidance such as `loom agent start` do not require a worker id.
+Current behavior note: worker-safe `loom agent` commands infer the acting worker from `LOOM_WORKER_ID`. If that environment variable is missing, the command fails with guidance to use `--role manager`, `--role director`, or `--role reviewer`, or to set `LOOM_WORKER_ID`. `loom agent start` now also requires an explicit `--role` outside a worker shell; only shells that already set `LOOM_WORKER_ID` may omit `--role` and fall back to the worker bootstrap.
 
-Role-scoped `loom agent next` output is intentionally narrow for singleton roles: reviewer `next` only reports review-ready queue state and does not dump pending request or execution-task details, while director `next` stays focused on orchestration steps rather than acting like a worker claim path.
+Role-scoped `loom agent next` output is intentionally narrow for singleton roles: reviewer `next` only reports review-ready queue state and does not dump pending request or execution-task details, director `next` stays orchestration-only, and manager `next` no longer tells the manager to execute implementation work directly.
 
 `loom spawn` always allocates a fresh worker id; it does not auto-reuse existing workers. To avoid silent worker-count growth, Loom refuses to spawn once the configured active/idle worker caps are reached unless `--force` is passed. The default caps are `[agent].spawn_limit_active_workers = 8` and `[agent].spawn_limit_idle_workers = 2`; set either value to `0` to disable that cap.
 
-`loom agent start` returns a concise manager bootstrap prompt describing the expected loop around `loom agent next`, `done`, and `pause`.
-
-That prompt includes a current-state summary, the practical command set for managers, and explicitly states that `loom agent done` and `loom agent pause` always require a specific task id.
+`loom agent start` is static bootstrap guidance: role contract, loop, guardrails, and action vocabulary. Outside a worker shell, pass `--role <manager|director|reviewer|worker>` explicitly. Inside a worker shell, plain `loom agent start` still resolves to the worker bootstrap. `loom agent next` is the dynamic single-step chooser to re-run after each state change.
 
 ## Repo hook policy
 
@@ -222,7 +289,14 @@ That prompt includes a current-state summary, the practical command set for mana
 
 Global workspace guidance (`-g`) is only shown in `loom agent start` when global mode is currently active.
 
-Dedicated manager loop role definition lives at `roles/loom-manager.md`.
+Canonical role files live at:
+
+- `roles/loom-director.md`
+- `roles/loom-manager.md`
+- `roles/loom-reviewer.md`
+- `roles/loom-worker.md`
+
+Use `loom agent start --role <director|manager|reviewer|worker>` as the runtime source of truth for the next action for that role.
 
 ### Manager command contract
 
@@ -230,9 +304,10 @@ Dedicated manager loop role definition lives at `roles/loom-manager.md`.
 - Bootstrap the manager loop: `loom manage`
 - Fetch the next action: `loom agent next --role manager`
 - Create a planning thread: `loom manage new-thread --name <name> [--priority <n>]`
-- Create a planned task: `loom manage new-task --thread <id> --title '<title>' --acceptance '<criteria>'`
-- Plan a pending request directly: `loom manage plan <rq-id>`
-- Finish completed manager-owned work: `loom agent done <task-id> --output <path-or-url> --role manager`
+- Create a planned task: `loom manage new-task --thread <id> --title '<title>' --acceptance '<criteria>' [--persistent]`
+- Plan a pending request directly: `loom manage plan <rq-id> [--thread <name>]`
+  - If Loom cannot clearly infer the target thread, the command exits non-zero and tells the manager to rerun it with `--thread` or create a new thread first.
+- Finish completed manager-owned work: `loom agent done <task-id> --output <.loom/products/...|url> --role manager`
 - Pause for a human decision: `loom agent pause <task-id> --question '<question>' --role manager`
 - Assign a thread to a worker: `loom manage assign --thread <name> --worker <agent-id>`
 - Inspect or adjust task/thread priority: `loom manage priority [--task <id> | --thread <name>] [--set <n>]`
@@ -244,8 +319,9 @@ Dedicated manager loop role definition lives at `roles/loom-manager.md`.
 
 <!-- BEGIN: manager-command-access -->
 - Worker-safe `loom agent` commands default to the worker role and require `LOOM_WORKER_ID`.
+  - `loom agent new-task --thread <id> --title '<title>' --acceptance '<criteria>' [--persistent]`
   - `loom agent next`
-  - `loom agent done <id> --output path`
+  - `loom agent done <id> --output <.loom/products/...|url>`
   - `loom agent pause <id> --question ... --options ...`
   - `loom agent checkpoint "..."`
   - `loom agent resume`
@@ -269,7 +345,7 @@ Dedicated manager loop role definition lives at `roles/loom-manager.md`.
   - `loom manage`
   - `loom manage new-thread --name <name> [--priority <n>]`
   - `loom manage new-task --thread <id> --title '<title>' --acceptance '<criteria>'`
-  - `loom manage plan <rq-id>`
+  - `loom manage plan <rq-id> [--thread <name>]`
   - `loom manage assign --thread <name> --worker <agent-id>`
   - `loom manage priority [--task <id> | --thread <name>] [--set <n>]`
 - Human/director worker-launch entrypoint: `loom spawn [--threads <backend,frontend>] [--force]`
@@ -279,8 +355,6 @@ Dedicated manager loop role definition lives at `roles/loom-manager.md`.
   - `loom review reject <id> "reason"`
   - `loom review decide <id> <option>`
 <!-- END: manager-command-access -->
-
-The reviewer role definition lives at `roles/loom-reviewer.md`.
 
 Role generation/discovery settings for this repo live in `roles.toml`.
 

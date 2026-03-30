@@ -56,12 +56,12 @@ That is workable, but it loses history and makes iterative review awkward.
 
 ### Add
 
-Add a new append-only `review_notes` field to task frontmatter.
+Use the current append-only `review_history` field in task frontmatter.
 
 Recommended shape:
 
 ```yaml
-review_notes:
+review_history:
   - kind: reject
     actor: human
     created: "2026-03-18T08:42:11Z"
@@ -156,7 +156,7 @@ Recommended new frontmatter on the created task:
 
 ```yaml
 created_from_review:
-  task: backend-003-login-page
+  task: backend-003
   mode: followup
 ```
 
@@ -200,9 +200,9 @@ Single-task detail mode should compose:
 Recommended detail layout:
 
 ```text
-$ loom review backend-003-login-page
+$ loom review backend-003
 
-TASK      backend-003-login-page
+TASK      backend-003
 THREAD    backend
 STATUS    reviewing
 
@@ -222,8 +222,8 @@ REVIEW HISTORY
   2026-03-18 08:42 reject  Validation copy is still English.
 
 NEXT ACTIONS
-  loom accept backend-003-login-page
-  loom reject backend-003-login-page "reason"
+  loom accept backend-003
+  loom reject backend-003 "reason"
 ```
 
 ### Interactive queue `detail`
@@ -289,7 +289,7 @@ Recommended rules:
 
 - batch accept / reject only operates on tasks already in `reviewing`
 - print one failure per invalid task id, then abort without partial mutation unless an explicit `--best-effort` flag is added later
-- write the event log and `review_notes` for each task individually
+- write the event log and `review_history` for each task individually
 
 Example:
 
@@ -306,9 +306,9 @@ ACCEPTED 3 tasks
 
 ### Stage 1: additive data model
 
-- add `review_notes`
+- keep `review_history` as the append-only review event log
 - keep writing `rejection_note` as the latest reject note for compatibility
-- update detail surfaces to read from `review_notes` first
+- update detail surfaces to read from `review_history` first
 
 ### Stage 2: richer command ergonomics
 
@@ -332,7 +332,7 @@ ACCEPTED 3 tasks
 Implementation will need updates across:
 
 - e2e CLI tests for new command signatures and output text
-- task frontmatter tests for `review_notes`
+- task frontmatter tests for `review_history`
 - review/detail tests for output previews and history rendering
 - follow-up creation tests for created task metadata and dependencies
 

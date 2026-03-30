@@ -14,10 +14,9 @@ offline_after_minutes = 30
 [threads]
 default_priority = 50
 
-[hooks.next]
-# all = "Shared reminder shown to every role."
-# worker = "Run tests before `loom agent done`."
-# examples = ["commit-message-policy"]
+[[hooks]]
+builtin = "worker-done-review"
+points = ["done"]
 
-[hooks.done.before]
-examples = ["worker-done-review"]
+# Hook definitions live in `loom-hooks.toml`.
+# Use `builtin = "..."` for built-ins or `id = "..."` for repo-local hook ids.

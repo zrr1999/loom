@@ -13,6 +13,16 @@ See `docs/reference/cli.md` for commands and `docs/reference/data-model.md` for 
 
 `docs/` is reserved for stable product and user-facing documentation. Design notes, proposals, and other evolving planning material should live under `design/` so the reference docs stay focused on the current contract.
 
+## Developer workflow
+
+The standard local validation flow lives in `justfile`:
+
+- `just format` updates generated docs and formats code
+- `just check` runs documentation, lint, and type checks
+- `just quality-check` runs `uvx lizard src/` for code complexity visibility
+- `just test` runs the test suite
+- `just ci` runs the full validation stack
+
 Additional design notes live under `design/`:
 
 - `design/workflow-optimization.md`

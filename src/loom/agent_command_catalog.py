@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 DEFAULT_COMMAND_PREFIX = "loom"
-README_COMMAND_PREFIX = "uvx --from git+https://github.com/zrr1999/loom loom"
+README_COMMAND_PREFIX = DEFAULT_COMMAND_PREFIX
 
 
 def _command(prefix: str, suffix: str) -> str:
@@ -23,15 +23,18 @@ def manager_new_thread_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
 
 
 def manager_new_task_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
-    return _command(prefix, "manage new-task --thread <id> --title '<title>' --acceptance '<criteria>'")
+    return _command(
+        prefix,
+        "manage new-task --thread <id> --title '<title>' --acceptance '<criteria>' [--persistent]",
+    )
 
 
 def manager_plan_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
-    return _command(prefix, "manage plan <rq-id>")
+    return _command(prefix, "manage plan <rq-id> [--thread <name>]")
 
 
 def manager_done_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
-    return _command(prefix, "agent done <task-id> --output <path-or-url> --role manager")
+    return _command(prefix, "agent done <task-id> --output <.loom/products/...|url> --role manager")
 
 
 def manager_priority_command(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
@@ -65,6 +68,13 @@ def render_manager_command_contract(prefix: str = DEFAULT_COMMAND_PREFIX) -> str
         f"- Create a planning thread: `{manager_new_thread_command(prefix)}`",
         f"- Create a planned task: `{manager_new_task_command(prefix)}`",
         f"- Plan a pending request directly: `{manager_plan_command(prefix)}`",
+        (
+            "  - If Loom cannot clearly infer the target thread, the command exits non-zero and "
+            "tells the manager to rerun it with `--thread` or create a new thread first."
+            if prefix == DEFAULT_COMMAND_PREFIX
+            else "  - If Loom cannot clearly match the request to an existing thread, it stops and "
+            "asks the manager to choose `--thread` explicitly or create a new thread first."
+        ),
         f"- Finish completed manager-owned work: `{manager_done_command(prefix)}`",
         f"- Pause for a human decision: `{manager_pause_command(prefix)}`",
         f"- Assign a thread to a worker: `{manager_assign_command(prefix)}`",
@@ -77,8 +87,9 @@ def render_manager_command_contract(prefix: str = DEFAULT_COMMAND_PREFIX) -> str
 
 def render_manager_command_access(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
     worker_safe = [
+        "agent new-task --thread <id> --title '<title>' --acceptance '<criteria>' [--persistent]",
         "agent next",
-        "agent done <id> --output path",
+        "agent done <id> --output <.loom/products/...|url>",
         "agent pause <id> --question ... --options ...",
         'agent checkpoint "..."',
         "agent resume",
@@ -97,7 +108,7 @@ def render_manager_command_access(prefix: str = DEFAULT_COMMAND_PREFIX) -> str:
         "manage",
         "manage new-thread --name <name> [--priority <n>]",
         "manage new-task --thread <id> --title '<title>' --acceptance '<criteria>'",
-        "manage plan <rq-id>",
+        "manage plan <rq-id> [--thread <name>]",
         "manage assign --thread <name> --worker <agent-id>",
         "manage priority [--task <id> | --thread <name>] [--set <n>]",
     ]

@@ -1,7 +1,7 @@
 ---
 name: loom-reviewer
 description: Use when a task is already in `reviewing` or a human-queue decision needs help.
-role: supporting
+role: all
 
 model:
   tier: reasoning
@@ -13,9 +13,6 @@ capabilities:
   - read
   - write
   - bash:
-    - "uvx --from agent-loom loom agent start --role reviewer"
-    - "uvx --from agent-loom loom agent next --role reviewer"
-    - "uvx --from agent-loom loom review*"
     - "loom agent start --role reviewer"
     - "loom agent next --role reviewer"
     - "loom review*"

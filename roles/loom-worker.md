@@ -13,7 +13,6 @@ capabilities:
   - read
   - write
   - bash:
-    - "uvx --from agent-loom loom agent*"
     - "loom agent *"
   - delegate
 ---
