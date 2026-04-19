@@ -12,6 +12,7 @@ __pycache__/
 .loom/
 
 .claude/
+.cursor/
 .agents/
 .opencode/
 .github/agents/
