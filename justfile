@@ -5,7 +5,7 @@ default:
 # Install dependencies in development mode
 install:
     uv sync --all-groups
-    uvx prek install --hook-type pre-commit --hook-type commit-msg
+    uvx prek install
 
 # Format all code
 format:

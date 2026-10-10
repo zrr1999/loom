@@ -282,7 +282,7 @@ Role-scoped `loom agent next` output is intentionally narrow for singleton roles
 
 ## Repo hook policy
 
-- run `uvx prek install --hook-type pre-commit --hook-type commit-msg` after syncing dependencies
+- run `uvx prek install` after syncing dependencies
 - the repo's `commit-msg` hook expects `<emoji> <type>(<scope>)?: <subject>`
 - example: `✨ feat: add more functionality`
 - auto-generated `Merge ...`, `Revert ...`, `fixup! ...`, and `squash! ...` messages are allowed
