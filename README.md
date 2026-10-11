@@ -270,3 +270,7 @@ loom --help
 Managers can also use `loom agent checkpoint ... --role manager` and `loom agent resume --role manager` to maintain the singleton checkpoint stored at `.loom/agents/manager/_agent.md`.
 
 Terminology note: `.loom/requests/` / `loom inbox` is the project request inbox, while `loom agent mailbox` is the per-agent message queue for handoffs, questions, and replies. Legacy `loom agent inbox` / `inbox-read` aliases still work for compatibility.
+
+## Project evolution
+
+[EVOLUTION.md](EVOLUTION.md) preserves the project origin and changes in direction. Append real dates with `### 触发`, `### 变化`, and `### 理由`, consolidate same-day entries, and run `zendev evolution check` after editing. Historical status does not replace current implementation or acceptance evidence.
